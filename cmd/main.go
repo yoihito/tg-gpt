@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -18,12 +19,23 @@ import (
 func main() {
 	err := godotenv.Load()
 	if err != nil {
-		log.Default().Println("Error loading .env file")
+		log.Println("Error loading .env file")
 	}
 	client := openai.NewClient(os.Getenv("OPENAI_API_KEY"))
 	messagesRepo := repositories.NewMessagesRepo()
-	userRepo := repositories.NewUserRepo()
-	textHandler := handlers.TextHandler{Client: client, MessagesRepo: messagesRepo, UsersRepo: userRepo}
+	allowedUserId, err := strconv.ParseInt(os.Getenv("ALLOWED_USER_ID"), 10, 0)
+	userRepo := repositories.NewUserRepo(allowedUserId)
+	dialogTimeout, err := strconv.ParseInt(os.Getenv("DIALOG_TIMEOUT"), 10, 0)
+	if err != nil {
+		log.Fatal(err)
+		return
+	}
+	textHandler := handlers.TextHandler{
+		Client:        client,
+		MessagesRepo:  messagesRepo,
+		UsersRepo:     userRepo,
+		DialogTimeout: dialogTimeout,
+	}
 	voiceHandler := handlers.VoiceHandler{TextHandler: textHandler, Client: client}
 
 	pref := tele.Settings{

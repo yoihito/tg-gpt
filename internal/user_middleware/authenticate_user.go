@@ -28,10 +28,13 @@ func AuthenticateUser(userRepo UserRepo) tele.MiddlewareFunc {
 			} else {
 				user, _ = userRepo.GetUser(c.Sender().ID)
 			}
-
 			l.Printf("User: %+v\n", user)
-			c.Set("user", user)
-			return next(c)
+			if user.Active {
+				c.Set("user", user)
+				return next(c)
+			}
+			c.Send("You are not registered. Please contact the administrator.")
+			return nil
 		}
 	}
 }

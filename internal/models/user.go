@@ -13,6 +13,7 @@ type User struct {
 	NumberOfOutputTokens int64
 	CurrentDialogId      int64
 	LastInteraction      int64
+	Active               bool
 }
 
 func (u *User) StartNewDialog() {

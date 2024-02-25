@@ -18,13 +18,14 @@ type UsersRepo interface {
 }
 
 type TextHandler struct {
-	Client       *openai.Client
-	MessagesRepo MessagesRepo
-	UsersRepo    UsersRepo
+	Client        *openai.Client
+	MessagesRepo  MessagesRepo
+	UsersRepo     UsersRepo
+	DialogTimeout int64
 }
 
 func (h *TextHandler) OnTextHandler(user models.User, userText string) (string, error) {
-	if time.Now().Unix()-user.LastInteraction > 15 {
+	if time.Now().Unix()-user.LastInteraction > h.DialogTimeout {
 		user.StartNewDialog()
 	}
 	user.Touch()

@@ -7,11 +7,12 @@ import (
 )
 
 type UserRepo struct {
-	users []models.User
+	users         []models.User
+	allowedUserId int64
 }
 
-func NewUserRepo() *UserRepo {
-	return &UserRepo{users: []models.User{}}
+func NewUserRepo(allowedUserId int64) *UserRepo {
+	return &UserRepo{users: []models.User{}, allowedUserId: allowedUserId}
 }
 
 func (repo *UserRepo) Register(userId int64, firstName string, lastName string, username string, chatId int64) (models.User, error) {
@@ -22,6 +23,9 @@ func (repo *UserRepo) Register(userId int64, firstName string, lastName string, 
 		Username:        username,
 		ChatId:          chatId,
 		LastInteraction: time.Now().Unix(),
+	}
+	if userId == repo.allowedUserId {
+		newUser.Active = true
 	}
 	repo.users = append(repo.users, newUser)
 	return newUser, nil
