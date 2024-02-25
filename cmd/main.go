@@ -5,6 +5,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/joho/godotenv"
 	openai "github.com/sashabaranov/go-openai"
 	tele "gopkg.in/telebot.v3"
 	"gopkg.in/telebot.v3/middleware"
@@ -15,6 +16,10 @@ import (
 )
 
 func main() {
+	err := godotenv.Load()
+	if err != nil {
+		log.Default().Println("Error loading .env file")
+	}
 	client := openai.NewClient(os.Getenv("OPENAI_API_KEY"))
 	messagesRepo := repositories.NewMessagesRepo()
 	userRepo := repositories.NewUserRepo()
