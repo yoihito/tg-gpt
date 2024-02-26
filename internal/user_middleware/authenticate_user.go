@@ -8,12 +8,12 @@ import (
 )
 
 type UserRepo interface {
-	Register(int64, string, string, string, int64) (models.User, error)
+	Register(int64, string, string, string, int64, bool) (models.User, error)
 	CheckIfUserExists(int64) bool
 	GetUser(int64) (models.User, error)
 }
 
-func AuthenticateUser(userRepo UserRepo) tele.MiddlewareFunc {
+func AuthenticateUser(userRepo UserRepo, allowedUserId int64) tele.MiddlewareFunc {
 	l := log.Default()
 	return func(next tele.HandlerFunc) tele.HandlerFunc {
 		return func(c tele.Context) error {
@@ -24,7 +24,7 @@ func AuthenticateUser(userRepo UserRepo) tele.MiddlewareFunc {
 				lastName := c.Sender().LastName
 				username := c.Sender().Username
 				chatId := c.Update().Message.Chat.ID
-				user, _ = userRepo.Register(userId, firstName, lastName, username, chatId)
+				user, _ = userRepo.Register(userId, firstName, lastName, username, chatId, userId == allowedUserId)
 			} else {
 				user, _ = userRepo.GetUser(c.Sender().ID)
 			}

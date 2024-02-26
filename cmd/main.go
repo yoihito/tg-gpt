@@ -24,7 +24,11 @@ func main() {
 	client := openai.NewClient(os.Getenv("OPENAI_API_KEY"))
 	messagesRepo := repositories.NewMessagesRepo()
 	allowedUserId, err := strconv.ParseInt(os.Getenv("ALLOWED_USER_ID"), 10, 0)
-	userRepo := repositories.NewUserRepo(allowedUserId)
+	if err != nil {
+		log.Fatal(err)
+		return
+	}
+	userRepo := repositories.NewUserRepo()
 	dialogTimeout, err := strconv.ParseInt(os.Getenv("DIALOG_TIMEOUT"), 10, 0)
 	if err != nil {
 		log.Fatal(err)
@@ -49,7 +53,7 @@ func main() {
 		return
 	}
 	b.Use(middleware.Logger())
-	b.Use(user_middleware.AuthenticateUser(userRepo))
+	b.Use(user_middleware.AuthenticateUser(userRepo, allowedUserId))
 
 	b.Handle("/start", func(c tele.Context) error {
 		return c.Send("Hello! I'm a bot that can talk to you. Just send me a voice message or text and I will respond to you.")
