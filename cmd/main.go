@@ -82,7 +82,15 @@ func main() {
 		}
 
 		user := c.Get("user").(models.User)
-		interaction := messagesRepo.PopLatestInteraction(user)
+		interaction, err := messagesRepo.PopLatestInteraction(user)
+		if err != nil {
+			_, err = c.Bot().Edit(placeholderMessage, "No messages found")
+			if err != nil {
+				return err
+			}
+			return nil
+		}
+
 		gptResponse, err := textHandler.OnTextHandler(user, interaction.UserMessage)
 		if err != nil {
 			return err
@@ -93,6 +101,16 @@ func main() {
 			return err
 		}
 		return nil
+	})
+
+	b.Handle("/reset", func(c tele.Context) error {
+		user := c.Get("user").(models.User)
+		user.StartNewDialog()
+		err := userRepo.UpdateUser(user)
+		if err != nil {
+			return err
+		}
+		return c.Send("New dialog started")
 	})
 
 	b.Handle(tele.OnVoice, func(c tele.Context) error {

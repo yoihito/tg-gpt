@@ -16,7 +16,7 @@ func (r *RateLimiter) Middleware() tele.MiddlewareFunc {
 	return func(next tele.HandlerFunc) tele.HandlerFunc {
 		return func(c tele.Context) error {
 			user := c.Get("user").(models.User)
-			userLock, _ := r.Locks.LoadOrStore(user.Id, make(chan struct{}, 1))
+			userLock, _ := r.Locks.LoadOrStore(user.Id, make(chan struct{}, r.MaxConcurrentRequests))
 			userChan := userLock.(chan struct{})
 
 			select {

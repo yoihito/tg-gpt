@@ -1,6 +1,7 @@
 package repositories
 
 import (
+	"errors"
 	"sync"
 
 	"vadimgribanov.com/tg-gpt/internal/models"
@@ -35,7 +36,7 @@ func (repo *MessagesRepo) GetCurrentDialogForUser(user models.User) []models.Int
 	return currentDialog
 }
 
-func (repo *MessagesRepo) PopLatestInteraction(user models.User) models.Interaction {
+func (repo *MessagesRepo) PopLatestInteraction(user models.User) (models.Interaction, error) {
 	repo.lock.Lock()
 	defer repo.lock.Unlock()
 
@@ -46,11 +47,11 @@ func (repo *MessagesRepo) PopLatestInteraction(user models.User) models.Interact
 		}
 	}
 	if index == -1 {
-		return models.Interaction{}
+		return models.Interaction{}, errors.New("no messages found")
 	}
 
 	latestInteraction := repo.messages[index]
 	repo.messages = append(repo.messages[:index], repo.messages[index+1:]...)
 
-	return latestInteraction
+	return latestInteraction, nil
 }
