@@ -69,16 +69,17 @@ func main() {
 	b.Use(middleware.Logger())
 	b.Use(authenticator.Middleware())
 	b.Use(rateLimiter.Middleware())
+	limitedGroup := b.Group()
 
-	b.Handle("/start", func(c tele.Context) error {
+	limitedGroup.Handle("/start", func(c tele.Context) error {
 		return c.Send("Hello! I'm a bot that can talk to you. Just send me a voice message or text and I will respond to you.")
 	})
 
-	b.Handle("/ping", func(c tele.Context) error {
+	limitedGroup.Handle("/ping", func(c tele.Context) error {
 		return c.Send("pong")
 	})
 
-	b.Handle("/retry", func(c tele.Context) error {
+	limitedGroup.Handle("/retry", func(c tele.Context) error {
 		placeholderMessage, err := c.Bot().Send(c.Recipient(), "...")
 		if err != nil {
 			return err
@@ -110,7 +111,7 @@ func main() {
 		return nil
 	})
 
-	b.Handle("/reset", func(c tele.Context) error {
+	limitedGroup.Handle("/reset", func(c tele.Context) error {
 		user := c.Get("user").(models.User)
 		user.StartNewDialog()
 		err := userRepo.UpdateUser(user)
@@ -120,7 +121,7 @@ func main() {
 		return c.Send("New dialog started")
 	})
 
-	b.Handle(tele.OnVoice, func(c tele.Context) error {
+	limitedGroup.Handle(tele.OnVoice, func(c tele.Context) error {
 		voiceFile := c.Message().Voice
 
 		reader, err := c.Bot().File(&voiceFile.File)
@@ -145,7 +146,7 @@ func main() {
 		return nil
 	})
 
-	b.Handle(tele.OnText, func(c tele.Context) error {
+	limitedGroup.Handle(tele.OnText, func(c tele.Context) error {
 		user := c.Get("user").(models.User)
 
 		placeholderMessage, err := c.Bot().Send(c.Recipient(), "...")
