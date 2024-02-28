@@ -1,4 +1,4 @@
-package user_middleware
+package middleware
 
 import (
 	"log"
@@ -13,20 +13,25 @@ type UserRepo interface {
 	GetUser(int64) (models.User, error)
 }
 
-func AuthenticateUser(userRepo UserRepo, allowedUserId int64) tele.MiddlewareFunc {
+type UserAuthenticator struct {
+	UserRepo      UserRepo
+	AllowedUserId int64
+}
+
+func (u *UserAuthenticator) Middleware() tele.MiddlewareFunc {
 	l := log.Default()
 	return func(next tele.HandlerFunc) tele.HandlerFunc {
 		return func(c tele.Context) error {
 			user := models.User{}
-			if !userRepo.CheckIfUserExists(c.Sender().ID) {
+			if !u.UserRepo.CheckIfUserExists(c.Sender().ID) {
 				userId := c.Sender().ID
 				firstName := c.Sender().FirstName
 				lastName := c.Sender().LastName
 				username := c.Sender().Username
 				chatId := c.Update().Message.Chat.ID
-				user, _ = userRepo.Register(userId, firstName, lastName, username, chatId, userId == allowedUserId)
+				user, _ = u.UserRepo.Register(userId, firstName, lastName, username, chatId, u.AllowedUserId == userId)
 			} else {
-				user, _ = userRepo.GetUser(c.Sender().ID)
+				user, _ = u.UserRepo.GetUser(c.Sender().ID)
 			}
 			l.Printf("User: %+v\n", user)
 			if user.Active {

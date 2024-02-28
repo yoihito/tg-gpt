@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/sashabaranov/go-openai"
@@ -37,7 +38,7 @@ func (h *TextHandler) OnTextHandler(user models.User, userText string) (string, 
 	messages := []openai.ChatCompletionMessage{
 		{
 			Role:    openai.ChatMessageRoleSystem,
-			Content: "You are a helpful assistant. Your name is Johhny. Give short concise answers.",
+			Content: fmt.Sprintf("You are a helpful assistant. Your name is Johhny. Today is %s. Give short concise answers.", time.Now().Format(time.RFC3339)),
 		},
 	}
 	for _, message := range history {

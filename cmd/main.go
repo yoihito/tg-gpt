@@ -11,9 +11,9 @@ import (
 	tele "gopkg.in/telebot.v3"
 	"gopkg.in/telebot.v3/middleware"
 	"vadimgribanov.com/tg-gpt/internal/handlers"
+	internal_middleware "vadimgribanov.com/tg-gpt/internal/middleware"
 	"vadimgribanov.com/tg-gpt/internal/models"
 	"vadimgribanov.com/tg-gpt/internal/repositories"
-	"vadimgribanov.com/tg-gpt/internal/user_middleware"
 )
 
 func main() {
@@ -34,6 +34,13 @@ func main() {
 		log.Fatal(err)
 		return
 	}
+	maxConcurrentRequests, err := strconv.Atoi(os.Getenv("MAX_CONCURRENT_REQUESTS"))
+	if err != nil {
+		log.Fatal(err)
+		return
+	}
+	rateLimiter := internal_middleware.RateLimiter{MaxConcurrentRequests: maxConcurrentRequests}
+	authenticator := internal_middleware.UserAuthenticator{UserRepo: userRepo, AllowedUserId: allowedUserId}
 	textHandler := handlers.TextHandler{
 		Client:        client,
 		MessagesRepo:  messagesRepo,
@@ -53,7 +60,8 @@ func main() {
 		return
 	}
 	b.Use(middleware.Logger())
-	b.Use(user_middleware.AuthenticateUser(userRepo, allowedUserId))
+	b.Use(authenticator.Middleware())
+	b.Use(rateLimiter.Middleware())
 
 	b.Handle("/start", func(c tele.Context) error {
 		return c.Send("Hello! I'm a bot that can talk to you. Just send me a voice message or text and I will respond to you.")
@@ -113,6 +121,8 @@ func main() {
 	})
 
 	b.Handle(tele.OnText, func(c tele.Context) error {
+		user := c.Get("user").(models.User)
+
 		placeholderMessage, err := c.Bot().Send(c.Recipient(), "...")
 		if err != nil {
 			return err
@@ -122,7 +132,6 @@ func main() {
 			return err
 		}
 		userInput := c.Message().Text
-		user := c.Get("user").(models.User)
 		gptResponse, err := textHandler.OnTextHandler(user, userInput)
 		if err != nil {
 			return err
