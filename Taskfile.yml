@@ -1,0 +1,5 @@
+version: "3"
+tasks:
+    build:
+        cmds:
+            - GOOS=linux GOARCH=amd64 go build -o bin/tg-bot ./cmd/main.go

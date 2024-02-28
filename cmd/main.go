@@ -4,6 +4,7 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -23,10 +24,16 @@ func main() {
 	}
 	client := openai.NewClient(os.Getenv("OPENAI_API_KEY"))
 	messagesRepo := repositories.NewMessagesRepo()
-	allowedUserId, err := strconv.ParseInt(os.Getenv("ALLOWED_USER_ID"), 10, 0)
-	if err != nil {
-		log.Fatal(err)
-		return
+
+	allowedUserIDsStr := os.Getenv("ALLOWED_USER_ID")
+	allowedUserIDs := make([]int64, 0)
+	for _, idStr := range strings.Split(allowedUserIDsStr, ",") {
+		id, err := strconv.ParseInt(idStr, 10, 0)
+		if err != nil {
+			log.Fatal(err)
+			return
+		}
+		allowedUserIDs = append(allowedUserIDs, id)
 	}
 	userRepo := repositories.NewUserRepo()
 	dialogTimeout, err := strconv.ParseInt(os.Getenv("DIALOG_TIMEOUT"), 10, 0)
@@ -40,7 +47,7 @@ func main() {
 		return
 	}
 	rateLimiter := internal_middleware.RateLimiter{MaxConcurrentRequests: maxConcurrentRequests}
-	authenticator := internal_middleware.UserAuthenticator{UserRepo: userRepo, AllowedUserId: allowedUserId}
+	authenticator := internal_middleware.UserAuthenticator{UserRepo: userRepo, AllowedUserIds: allowedUserIDs}
 	textHandler := handlers.TextHandler{
 		Client:        client,
 		MessagesRepo:  messagesRepo,

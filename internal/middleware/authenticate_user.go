@@ -3,6 +3,8 @@ package middleware
 import (
 	"log"
 
+	"golang.org/x/exp/slices"
+
 	tele "gopkg.in/telebot.v3"
 	"vadimgribanov.com/tg-gpt/internal/models"
 )
@@ -14,8 +16,8 @@ type UserRepo interface {
 }
 
 type UserAuthenticator struct {
-	UserRepo      UserRepo
-	AllowedUserId int64
+	UserRepo       UserRepo
+	AllowedUserIds []int64
 }
 
 func (u *UserAuthenticator) Middleware() tele.MiddlewareFunc {
@@ -29,7 +31,7 @@ func (u *UserAuthenticator) Middleware() tele.MiddlewareFunc {
 				lastName := c.Sender().LastName
 				username := c.Sender().Username
 				chatId := c.Update().Message.Chat.ID
-				user, _ = u.UserRepo.Register(userId, firstName, lastName, username, chatId, u.AllowedUserId == userId)
+				user, _ = u.UserRepo.Register(userId, firstName, lastName, username, chatId, slices.Contains(u.AllowedUserIds, userId))
 			} else {
 				user, _ = u.UserRepo.GetUser(c.Sender().ID)
 			}
