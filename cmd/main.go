@@ -73,8 +73,14 @@ func main() {
 	}
 	b.Use(tele_middleware.Logger())
 	b.Use(authenticator.Middleware())
-	b.Use(rateLimiter.Middleware())
+	b.Handle("/cancel", func(c tele.Context) error {
+		rateLimiter.CancelRequest(c.Get("user").(models.User))
+		return nil
+	})
+
 	limitedGroup := b.Group()
+
+	limitedGroup.Use(rateLimiter.Middleware())
 
 	limitedGroup.Handle("/start", func(c tele.Context) error {
 		return c.Send("Hello! I'm a bot that can talk to you. Just send me a voice message or text and I will respond to you.")
@@ -84,7 +90,19 @@ func main() {
 		return c.Send("pong")
 	})
 
+	limitedGroup.Handle("/reset", func(c tele.Context) error {
+		user := c.Get("user").(models.User)
+		user.StartNewDialog()
+		err := userRepo.UpdateUser(user)
+		if err != nil {
+			return err
+		}
+		return c.Send("New dialog started")
+	})
+
 	limitedGroup.Handle("/retry", func(c tele.Context) error {
+		ctx := c.Get("requestContext").(context.Context)
+
 		err = c.Notify(tele.Typing)
 		if err != nil {
 			return err
@@ -102,7 +120,7 @@ func main() {
 
 		log.Printf("Interaction: %+v\n", interaction)
 		textHandler := textHandlerFactory.NewTextHandler(user, interaction.TgUserMessageId)
-		chunksCh := textHandler.OnStreamableTextHandler(context.Background(), interaction.UserMessage)
+		chunksCh := textHandler.OnStreamableTextHandler(ctx, interaction.UserMessage)
 
 		return telegram_utils.SendStream(c, &tele.Message{
 			ID:   int(interaction.TgUserMessageId),
@@ -110,17 +128,8 @@ func main() {
 		}, chunksCh)
 	})
 
-	limitedGroup.Handle("/reset", func(c tele.Context) error {
-		user := c.Get("user").(models.User)
-		user.StartNewDialog()
-		err := userRepo.UpdateUser(user)
-		if err != nil {
-			return err
-		}
-		return c.Send("New dialog started")
-	})
-
 	limitedGroup.Handle(tele.OnVoice, func(c tele.Context) error {
+		ctx := c.Get("requestContext").(context.Context)
 		voiceFile := c.Message().Voice
 
 		reader, err := c.Bot().File(&voiceFile.File)
@@ -130,7 +139,7 @@ func main() {
 		defer reader.Close()
 
 		user := c.Get("user").(models.User)
-		transcriptionText, err := voiceHandler.OnVoiceHandler(context.Background(), reader)
+		transcriptionText, err := voiceHandler.OnVoiceHandler(ctx, reader)
 		if err != nil {
 			c.Reply("Failed to transcribe voice message")
 			return err
@@ -144,13 +153,13 @@ func main() {
 		}
 
 		textHandler := textHandlerFactory.NewTextHandler(user, int64(c.Message().ID))
-		chunksCh := textHandler.OnStreamableTextHandler(context.Background(), transcriptionText)
+		chunksCh := textHandler.OnStreamableTextHandler(ctx, transcriptionText)
 
 		return telegram_utils.SendStream(c, c.Message(), chunksCh)
 	})
 
 	limitedGroup.Handle(tele.OnText, func(c tele.Context) error {
-		ctx, _ := context.WithCancel(context.Background())
+		ctx := c.Get("requestContext").(context.Context)
 		user := c.Get("user").(models.User)
 
 		err = c.Notify(tele.Typing)
