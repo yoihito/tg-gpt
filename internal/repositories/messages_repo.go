@@ -44,6 +44,7 @@ func (repo *MessagesRepo) PopLatestInteraction(user models.User) (models.Interac
 	for i := len(repo.messages) - 1; i >= 0; i-- {
 		if repo.messages[i].AuthorId == user.Id {
 			index = i
+			break
 		}
 	}
 	if index == -1 {
