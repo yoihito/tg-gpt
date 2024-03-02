@@ -12,9 +12,9 @@ import (
 	"github.com/joho/godotenv"
 	openai "github.com/sashabaranov/go-openai"
 	tele "gopkg.in/telebot.v3"
-	"gopkg.in/telebot.v3/middleware"
+	tele_middleware "gopkg.in/telebot.v3/middleware"
 	"vadimgribanov.com/tg-gpt/internal/handlers"
-	internal_middleware "vadimgribanov.com/tg-gpt/internal/middleware"
+	"vadimgribanov.com/tg-gpt/internal/middleware"
 	"vadimgribanov.com/tg-gpt/internal/models"
 	"vadimgribanov.com/tg-gpt/internal/repositories"
 	"vadimgribanov.com/tg-gpt/internal/telegram_utils"
@@ -49,8 +49,8 @@ func main() {
 		log.Fatal(err)
 		return
 	}
-	rateLimiter := internal_middleware.RateLimiter{MaxConcurrentRequests: maxConcurrentRequests}
-	authenticator := internal_middleware.UserAuthenticator{UserRepo: userRepo, AllowedUserIds: allowedUserIDs}
+	rateLimiter := middleware.RateLimiter{MaxConcurrentRequests: maxConcurrentRequests}
+	authenticator := middleware.UserAuthenticator{UserRepo: userRepo, AllowedUserIds: allowedUserIDs}
 	textHandlerFactory := handlers.TextHandlerFactory{
 		Client:        client,
 		MessagesRepo:  messagesRepo,
@@ -62,9 +62,8 @@ func main() {
 	}
 
 	pref := tele.Settings{
-		Token:     os.Getenv("TOKEN"),
-		Poller:    &tele.LongPoller{Timeout: 10 * time.Second},
-		ParseMode: tele.ModeMarkdown,
+		Token:  os.Getenv("TOKEN"),
+		Poller: &tele.LongPoller{Timeout: 10 * time.Second},
 	}
 
 	b, err := tele.NewBot(pref)
@@ -72,7 +71,7 @@ func main() {
 		log.Fatal(err)
 		return
 	}
-	b.Use(middleware.Logger())
+	b.Use(tele_middleware.Logger())
 	b.Use(authenticator.Middleware())
 	b.Use(rateLimiter.Middleware())
 	limitedGroup := b.Group()
@@ -137,7 +136,9 @@ func main() {
 			return err
 		}
 
-		err = c.Reply(fmt.Sprintf("Transcription: _%s_", transcriptionText))
+		err = c.Reply(fmt.Sprintf("Transcription: _%s_", transcriptionText), &tele.SendOptions{
+			ParseMode: tele.ModeMarkdown,
+		})
 		if err != nil {
 			return err
 		}

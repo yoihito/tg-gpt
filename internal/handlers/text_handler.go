@@ -80,12 +80,9 @@ func (h *TextHandler) OnTextHandler(ctx context.Context, userText string) (strin
 		Content: userText,
 	})
 
-	seed := 0
 	response, err := h.client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
-		Model:       openai.GPT4TurboPreview,
-		Temperature: 0.0,
-		Seed:        &seed,
-		Messages:    messages,
+		Model:    openai.GPT4TurboPreview,
+		Messages: messages,
 	})
 	if err != nil {
 		return "", err
@@ -146,14 +143,12 @@ func (h *TextHandler) OnStreamableTextHandler(ctx context.Context, userText stri
 			Content: userText,
 		})
 
-		seed := 0
 		stream, err := h.client.CreateChatCompletionStream(ctx, openai.ChatCompletionRequest{
-			Model:       openai.GPT4TurboPreview,
-			Messages:    messages,
-			Temperature: 0.0,
-			Seed:        &seed,
+			Model:    openai.GPT4TurboPreview,
+			Messages: messages,
 		})
 		if err != nil {
+			log.Println(err)
 			resultsCh <- Result{Err: err}
 			return
 		}
@@ -172,6 +167,7 @@ func (h *TextHandler) OnStreamableTextHandler(ctx context.Context, userText stri
 					break streamLoop
 				}
 				if err != nil {
+					log.Println(err)
 					resultsCh <- Result{Err: err}
 					return
 				}
@@ -182,6 +178,7 @@ func (h *TextHandler) OnStreamableTextHandler(ctx context.Context, userText stri
 
 		encoder, err := tiktoken.GetEncoding("cl100k_base")
 		if err != nil {
+			log.Println(err)
 			resultsCh <- Result{Err: err}
 			return
 		}

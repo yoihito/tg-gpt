@@ -25,6 +25,7 @@ func ShapeStream(messagesCh <-chan handlers.Result) <-chan Commands {
 		editing := false
 		for message := range messagesCh {
 			if message.Err != nil {
+				log.Println(message.Err)
 				commandsCh <- Commands{Err: message.Err}
 				return
 			}
@@ -60,14 +61,24 @@ func SendStream(c tele.Context, replyTo *tele.Message, chunksCh <-chan handlers.
 	for command := range commandsCh {
 		log.Printf("Command: %+v\n", command)
 		if command.Err != nil {
+			log.Println(command.Err)
 			return command.Err
 		}
 		if command.Command == "start" {
-			currentMessage, err = c.Bot().Reply(replyTo, command.Content)
+			currentMessage, err = c.Bot().Reply(replyTo, command.Content, &tele.SendOptions{ParseMode: tele.ModeMarkdown})
+			if err != nil {
+				currentMessage, err = c.Bot().Reply(replyTo, command.Content, &tele.SendOptions{ParseMode: tele.ModeDefault})
+				log.Println("Retry error", err)
+			}
 		} else if command.Command == "edit" {
-			_, err = c.Bot().Edit(currentMessage, command.Content)
+			_, err = c.Bot().Edit(currentMessage, command.Content, &tele.SendOptions{ParseMode: tele.ModeMarkdown})
+			if err != nil {
+				_, err = c.Bot().Edit(currentMessage, command.Content, &tele.SendOptions{ParseMode: tele.ModeDefault})
+				log.Println("Retry error", err)
+			}
 		}
 		if err != nil {
+			log.Println("Error stream:", err)
 			return err
 		}
 	}
