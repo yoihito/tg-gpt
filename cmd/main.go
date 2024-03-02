@@ -17,6 +17,7 @@ import (
 	internal_middleware "vadimgribanov.com/tg-gpt/internal/middleware"
 	"vadimgribanov.com/tg-gpt/internal/models"
 	"vadimgribanov.com/tg-gpt/internal/repositories"
+	"vadimgribanov.com/tg-gpt/internal/telegram_utils"
 )
 
 func main() {
@@ -61,8 +62,9 @@ func main() {
 	}
 
 	pref := tele.Settings{
-		Token:  os.Getenv("TOKEN"),
-		Poller: &tele.LongPoller{Timeout: 10 * time.Second},
+		Token:     os.Getenv("TOKEN"),
+		Poller:    &tele.LongPoller{Timeout: 10 * time.Second},
+		ParseMode: tele.ModeMarkdown,
 	}
 
 	b, err := tele.NewBot(pref)
@@ -109,7 +111,7 @@ func main() {
 		_, err = c.Bot().Reply(&tele.Message{
 			ID:   int(interaction.TgUserMessageId),
 			Chat: c.Chat(),
-		}, gptResponse, &tele.SendOptions{ParseMode: tele.ModeMarkdown})
+		}, gptResponse)
 		if err != nil {
 			return err
 		}
@@ -142,7 +144,7 @@ func main() {
 			return err
 		}
 
-		err = c.Reply(fmt.Sprintf("Transcription: _%s_", transcriptionText), &tele.SendOptions{ParseMode: tele.ModeMarkdown})
+		err = c.Reply(fmt.Sprintf("Transcription: _%s_", transcriptionText))
 		if err != nil {
 			return err
 		}
@@ -154,10 +156,11 @@ func main() {
 			return err
 		}
 
-		return c.Reply(botResponse, &tele.SendOptions{ParseMode: tele.ModeMarkdown})
+		return c.Reply(botResponse)
 	})
 
 	limitedGroup.Handle(tele.OnText, func(c tele.Context) error {
+		ctx, _ := context.WithCancel(context.Background())
 		user := c.Get("user").(models.User)
 
 		err = c.Notify(tele.Typing)
@@ -166,14 +169,23 @@ func main() {
 		}
 		userInput := c.Message().Text
 		textHandler := textHandlerFactory.NewTextHandler(user, int64(c.Message().ID))
-		gptResponse, err := textHandler.OnTextHandler(userInput)
-		if err != nil {
-			return err
-		}
 
-		err = c.Reply(gptResponse, &tele.SendOptions{ParseMode: tele.ModeMarkdown})
-		if err != nil {
-			return err
+		chunksCh := textHandler.OnStreamableTextHandler(ctx, userInput)
+		commandsCh := telegram_utils.ShapeStream(chunksCh)
+		var currentMessage *tele.Message
+		for command := range commandsCh {
+			log.Printf("Command: %+v\n", command)
+			if command.Err != nil {
+				return command.Err
+			}
+			if command.Command == "start" {
+				currentMessage, err = c.Bot().Reply(c.Message(), command.Content)
+			} else if command.Command == "edit" {
+				_, err = c.Bot().Edit(currentMessage, command.Content)
+			}
+			if err != nil {
+				return err
+			}
 		}
 		return nil
 	})
