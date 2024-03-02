@@ -1,5 +1,14 @@
 version: "3"
+dotenv: ['.env']
 tasks:
     build:
         cmds:
-            - GOOS=linux GOARCH=amd64 go build -o bin/tg-bot ./cmd/main.go
+            - go build -o bin/tg-bot ./cmd/main.go
+        env:
+            GOOS: linux
+            GOARCH: amd64
+    deploy:
+        cmds:
+            - task: build
+            - rsync -avz  bin/tg-bot root@$REMOTE_HOST:/home/bot
+            - ssh root@$REMOTE_HOST "sudo supervisorctl restart mytgbot"
