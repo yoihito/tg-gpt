@@ -5,4 +5,5 @@ type Interaction struct {
 	AssistantMessage string
 	AuthorId         int64
 	DialogId         int64
+	TgUserMessageId  int64
 }

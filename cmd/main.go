@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"log"
 	"os"
 	"strconv"
@@ -48,13 +50,15 @@ func main() {
 	}
 	rateLimiter := internal_middleware.RateLimiter{MaxConcurrentRequests: maxConcurrentRequests}
 	authenticator := internal_middleware.UserAuthenticator{UserRepo: userRepo, AllowedUserIds: allowedUserIDs}
-	textHandler := handlers.TextHandler{
+	textHandlerFactory := handlers.TextHandlerFactory{
 		Client:        client,
 		MessagesRepo:  messagesRepo,
 		UsersRepo:     userRepo,
 		DialogTimeout: dialogTimeout,
 	}
-	voiceHandler := handlers.VoiceHandler{TextHandler: textHandler, Client: client}
+	voiceHandler := handlers.VoiceHandler{
+		Client: client,
+	}
 
 	pref := tele.Settings{
 		Token:  os.Getenv("TOKEN"),
@@ -80,10 +84,6 @@ func main() {
 	})
 
 	limitedGroup.Handle("/retry", func(c tele.Context) error {
-		placeholderMessage, err := c.Bot().Send(c.Recipient(), "...")
-		if err != nil {
-			return err
-		}
 		err = c.Notify(tele.Typing)
 		if err != nil {
 			return err
@@ -92,19 +92,24 @@ func main() {
 		user := c.Get("user").(models.User)
 		interaction, err := messagesRepo.PopLatestInteraction(user)
 		if err != nil {
-			_, err = c.Bot().Edit(placeholderMessage, "No messages found")
+			err = c.Send("No messages found")
 			if err != nil {
 				return err
 			}
 			return nil
 		}
 
-		gptResponse, err := textHandler.OnTextHandler(user, interaction.UserMessage)
+		log.Printf("Interaction: %+v\n", interaction)
+		textHandler := textHandlerFactory.NewTextHandler(user, interaction.TgUserMessageId)
+		gptResponse, err := textHandler.OnTextHandler(interaction.UserMessage)
 		if err != nil {
 			return err
 		}
 
-		_, err = c.Bot().Edit(placeholderMessage, gptResponse, &tele.SendOptions{ParseMode: tele.ModeMarkdown})
+		_, err = c.Bot().Reply(&tele.Message{
+			ID:   int(interaction.TgUserMessageId),
+			Chat: c.Chat(),
+		}, gptResponse, &tele.SendOptions{ParseMode: tele.ModeMarkdown})
 		if err != nil {
 			return err
 		}
@@ -131,39 +136,42 @@ func main() {
 		defer reader.Close()
 
 		user := c.Get("user").(models.User)
-		responseMessages, cancel := voiceHandler.OnVoiceHandler(user, reader)
-		defer cancel()
-
-		for message := range responseMessages {
-			if message.Err != nil {
-				return message.Err
-			}
-			err = c.Send(message.Text, &tele.SendOptions{ParseMode: tele.ModeMarkdown})
-			if err != nil {
-				return err
-			}
+		transcriptionText, err := voiceHandler.OnVoiceHandler(context.Background(), reader)
+		if err != nil {
+			c.Reply("Failed to transcribe voice message")
+			return err
 		}
-		return nil
+
+		err = c.Reply(fmt.Sprintf("Transcription: _%s_", transcriptionText), &tele.SendOptions{ParseMode: tele.ModeMarkdown})
+		if err != nil {
+			return err
+		}
+
+		textHandler := textHandlerFactory.NewTextHandler(user, int64(c.Message().ID))
+		botResponse, err := textHandler.OnTextHandler(transcriptionText)
+
+		if err != nil {
+			return err
+		}
+
+		return c.Reply(botResponse, &tele.SendOptions{ParseMode: tele.ModeMarkdown})
 	})
 
 	limitedGroup.Handle(tele.OnText, func(c tele.Context) error {
 		user := c.Get("user").(models.User)
 
-		placeholderMessage, err := c.Bot().Send(c.Recipient(), "...")
-		if err != nil {
-			return err
-		}
 		err = c.Notify(tele.Typing)
 		if err != nil {
 			return err
 		}
 		userInput := c.Message().Text
-		gptResponse, err := textHandler.OnTextHandler(user, userInput)
+		textHandler := textHandlerFactory.NewTextHandler(user, int64(c.Message().ID))
+		gptResponse, err := textHandler.OnTextHandler(userInput)
 		if err != nil {
 			return err
 		}
 
-		_, err = c.Bot().Edit(placeholderMessage, gptResponse, &tele.SendOptions{ParseMode: tele.ModeMarkdown})
+		err = c.Reply(gptResponse, &tele.SendOptions{ParseMode: tele.ModeMarkdown})
 		if err != nil {
 			return err
 		}

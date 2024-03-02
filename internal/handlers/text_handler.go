@@ -9,6 +9,33 @@ import (
 	"vadimgribanov.com/tg-gpt/internal/models"
 )
 
+type TextHandlerFactory struct {
+	Client        *openai.Client
+	MessagesRepo  MessagesRepo
+	UsersRepo     UsersRepo
+	DialogTimeout int64
+}
+
+func (f *TextHandlerFactory) NewTextHandler(user models.User, tgUserMessageId int64) *TextHandler {
+	return &TextHandler{
+		client:          f.Client,
+		messagesRepo:    f.MessagesRepo,
+		usersRepo:       f.UsersRepo,
+		dialogTimeout:   f.DialogTimeout,
+		user:            user,
+		tgUserMessageId: tgUserMessageId,
+	}
+}
+
+type TextHandler struct {
+	client          *openai.Client
+	messagesRepo    MessagesRepo
+	usersRepo       UsersRepo
+	dialogTimeout   int64
+	user            models.User
+	tgUserMessageId int64
+}
+
 type MessagesRepo interface {
 	AddMessage(message models.Interaction)
 	GetCurrentDialogForUser(user models.User) []models.Interaction
@@ -18,23 +45,16 @@ type UsersRepo interface {
 	UpdateUser(user models.User) error
 }
 
-type TextHandler struct {
-	Client        *openai.Client
-	MessagesRepo  MessagesRepo
-	UsersRepo     UsersRepo
-	DialogTimeout int64
-}
-
-func (h *TextHandler) OnTextHandler(user models.User, userText string) (string, error) {
-	if time.Now().Unix()-user.LastInteraction > h.DialogTimeout {
-		user.StartNewDialog()
+func (h *TextHandler) OnTextHandler(userText string) (string, error) {
+	if time.Now().Unix()-h.user.LastInteraction > h.dialogTimeout {
+		h.user.StartNewDialog()
 	}
-	user.Touch()
-	err := h.UsersRepo.UpdateUser(user)
+	h.user.Touch()
+	err := h.usersRepo.UpdateUser(h.user)
 	if err != nil {
 		return "", err
 	}
-	history := h.MessagesRepo.GetCurrentDialogForUser(user)
+	history := h.messagesRepo.GetCurrentDialogForUser(h.user)
 	messages := []openai.ChatCompletionMessage{
 		{
 			Role:    openai.ChatMessageRoleSystem,
@@ -55,7 +75,7 @@ func (h *TextHandler) OnTextHandler(user models.User, userText string) (string, 
 		Content: userText,
 	})
 
-	response, err := h.Client.CreateChatCompletion(context.Background(), openai.ChatCompletionRequest{
+	response, err := h.client.CreateChatCompletion(context.Background(), openai.ChatCompletionRequest{
 		Model:    openai.GPT4TurboPreview,
 		Messages: messages,
 	})
@@ -63,14 +83,15 @@ func (h *TextHandler) OnTextHandler(user models.User, userText string) (string, 
 		return "", err
 	}
 	assistantResponse := response.Choices[0].Message.Content
-	user.NumberOfInputTokens += int64(response.Usage.PromptTokens)
-	user.NumberOfOutputTokens += int64(response.Usage.CompletionTokens)
-	h.UsersRepo.UpdateUser(user)
-	h.MessagesRepo.AddMessage(models.Interaction{
+	h.user.NumberOfInputTokens += int64(response.Usage.PromptTokens)
+	h.user.NumberOfOutputTokens += int64(response.Usage.CompletionTokens)
+	h.usersRepo.UpdateUser(h.user)
+	h.messagesRepo.AddMessage(models.Interaction{
 		UserMessage:      userText,
 		AssistantMessage: assistantResponse,
-		AuthorId:         user.Id,
-		DialogId:         user.CurrentDialogId,
+		AuthorId:         h.user.Id,
+		DialogId:         h.user.CurrentDialogId,
+		TgUserMessageId:  h.tgUserMessageId,
 	})
 	return assistantResponse, nil
 }
