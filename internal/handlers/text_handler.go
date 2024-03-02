@@ -5,8 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
+	"strings"
 	"time"
 
+	"github.com/pkoukk/tiktoken-go"
 	"github.com/sashabaranov/go-openai"
 	"vadimgribanov.com/tg-gpt/internal/models"
 )
@@ -47,7 +50,7 @@ type UsersRepo interface {
 	UpdateUser(user models.User) error
 }
 
-func (h *TextHandler) OnTextHandler(userText string) (string, error) {
+func (h *TextHandler) OnTextHandler(ctx context.Context, userText string) (string, error) {
 	if time.Now().Unix()-h.user.LastInteraction > h.dialogTimeout {
 		h.user.StartNewDialog()
 	}
@@ -77,9 +80,12 @@ func (h *TextHandler) OnTextHandler(userText string) (string, error) {
 		Content: userText,
 	})
 
-	response, err := h.client.CreateChatCompletion(context.Background(), openai.ChatCompletionRequest{
-		Model:    openai.GPT4TurboPreview,
-		Messages: messages,
+	seed := 0
+	response, err := h.client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
+		Model:       openai.GPT4TurboPreview,
+		Temperature: 0.0,
+		Seed:        &seed,
+		Messages:    messages,
 	})
 	if err != nil {
 		return "", err
@@ -140,30 +146,47 @@ func (h *TextHandler) OnStreamableTextHandler(ctx context.Context, userText stri
 			Content: userText,
 		})
 
+		seed := 0
 		stream, err := h.client.CreateChatCompletionStream(ctx, openai.ChatCompletionRequest{
-			Model:    openai.GPT4TurboPreview,
-			Messages: messages,
+			Model:       openai.GPT4TurboPreview,
+			Messages:    messages,
+			Temperature: 0.0,
+			Seed:        &seed,
 		})
 		if err != nil {
 			resultsCh <- Result{Err: err}
 			return
 		}
 		defer stream.Close()
+
 		assistantResponse := ""
+	streamLoop:
 		for {
-			response, err := stream.Recv()
-			if errors.Is(err, io.EOF) {
-				resultsCh <- Result{Status: EOF_STATUS}
-				break
-			}
-			if err != nil {
-				resultsCh <- Result{Err: err}
+			select {
+			case <-ctx.Done():
 				return
+			default:
+				response, err := stream.Recv()
+				if errors.Is(err, io.EOF) {
+					resultsCh <- Result{Status: EOF_STATUS}
+					break streamLoop
+				}
+				if err != nil {
+					resultsCh <- Result{Err: err}
+					return
+				}
+				assistantResponse = assistantResponse + response.Choices[0].Delta.Content
+				resultsCh <- Result{TextChunk: response.Choices[0].Delta.Content}
 			}
-			assistantResponse = assistantResponse + response.Choices[0].Delta.Content
-			resultsCh <- Result{TextChunk: response.Choices[0].Delta.Content}
 		}
 
+		encoder, err := tiktoken.GetEncoding("cl100k_base")
+		if err != nil {
+			resultsCh <- Result{Err: err}
+			return
+		}
+		h.user.NumberOfInputTokens += int64(NumTokensFromMessages(messages, openai.GPT4TurboPreview))
+		h.user.NumberOfOutputTokens += int64(len(encoder.Encode(assistantResponse, nil, nil)))
 		h.usersRepo.UpdateUser(h.user)
 		h.messagesRepo.AddMessage(models.Interaction{
 			UserMessage:      userText,
@@ -174,4 +197,53 @@ func (h *TextHandler) OnStreamableTextHandler(ctx context.Context, userText stri
 		})
 	}()
 	return resultsCh
+}
+
+// OpenAI Cookbook: https://github.com/openai/openai-cookbook/blob/main/examples/How_to_count_tokens_with_tiktoken.ipynb
+func NumTokensFromMessages(messages []openai.ChatCompletionMessage, model string) (numTokens int) {
+	tkm, err := tiktoken.EncodingForModel(model)
+	if err != nil {
+		err = fmt.Errorf("encoding for model: %v", err)
+		log.Println(err)
+		return
+	}
+
+	var tokensPerMessage, tokensPerName int
+	switch model {
+	case "gpt-3.5-turbo-0613",
+		"gpt-3.5-turbo-16k-0613",
+		"gpt-4-0314",
+		"gpt-4-32k-0314",
+		"gpt-4-0613",
+		"gpt-4-32k-0613":
+		tokensPerMessage = 3
+		tokensPerName = 1
+	case "gpt-3.5-turbo-0301":
+		tokensPerMessage = 4 // every message follows <|start|>{role/name}\n{content}<|end|>\n
+		tokensPerName = -1   // if there's a name, the role is omitted
+	default:
+		if strings.Contains(model, "gpt-3.5-turbo") {
+			log.Println("warning: gpt-3.5-turbo may update over time. Returning num tokens assuming gpt-3.5-turbo-0613.")
+			return NumTokensFromMessages(messages, "gpt-3.5-turbo-0613")
+		} else if strings.Contains(model, "gpt-4") {
+			log.Println("warning: gpt-4 may update over time. Returning num tokens assuming gpt-4-0613.")
+			return NumTokensFromMessages(messages, "gpt-4-0613")
+		} else {
+			err = fmt.Errorf("num_tokens_from_messages() is not implemented for model %s. See https://github.com/openai/openai-python/blob/main/chatml.md for information on how messages are converted to tokens.", model)
+			log.Println(err)
+			return
+		}
+	}
+
+	for _, message := range messages {
+		numTokens += tokensPerMessage
+		numTokens += len(tkm.Encode(message.Content, nil, nil))
+		numTokens += len(tkm.Encode(message.Role, nil, nil))
+		numTokens += len(tkm.Encode(message.Name, nil, nil))
+		if message.Name != "" {
+			numTokens += tokensPerName
+		}
+	}
+	numTokens += 3 // every reply is primed with <|start|>assistant<|message|>
+	return numTokens
 }

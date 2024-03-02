@@ -1,6 +1,11 @@
 package telegram_utils
 
-import "vadimgribanov.com/tg-gpt/internal/handlers"
+import (
+	"log"
+
+	tele "gopkg.in/telebot.v3"
+	"vadimgribanov.com/tg-gpt/internal/handlers"
+)
 
 const MAX_TELEGRAM_MESSAGE_LENGTH = 4096
 const STREAMING_INTERVAL = 200
@@ -46,4 +51,25 @@ func ShapeStream(messagesCh <-chan handlers.Result) <-chan Commands {
 		}
 	}()
 	return commandsCh
+}
+
+func SendStream(c tele.Context, replyTo *tele.Message, chunksCh <-chan handlers.Result) error {
+	commandsCh := ShapeStream(chunksCh)
+	var currentMessage *tele.Message
+	var err error
+	for command := range commandsCh {
+		log.Printf("Command: %+v\n", command)
+		if command.Err != nil {
+			return command.Err
+		}
+		if command.Command == "start" {
+			currentMessage, err = c.Bot().Reply(replyTo, command.Content)
+		} else if command.Command == "edit" {
+			_, err = c.Bot().Edit(currentMessage, command.Content)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }

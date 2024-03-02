@@ -103,19 +103,12 @@ func main() {
 
 		log.Printf("Interaction: %+v\n", interaction)
 		textHandler := textHandlerFactory.NewTextHandler(user, interaction.TgUserMessageId)
-		gptResponse, err := textHandler.OnTextHandler(interaction.UserMessage)
-		if err != nil {
-			return err
-		}
+		chunksCh := textHandler.OnStreamableTextHandler(context.Background(), interaction.UserMessage)
 
-		_, err = c.Bot().Reply(&tele.Message{
+		return telegram_utils.SendStream(c, &tele.Message{
 			ID:   int(interaction.TgUserMessageId),
 			Chat: c.Chat(),
-		}, gptResponse)
-		if err != nil {
-			return err
-		}
-		return nil
+		}, chunksCh)
 	})
 
 	limitedGroup.Handle("/reset", func(c tele.Context) error {
@@ -150,13 +143,9 @@ func main() {
 		}
 
 		textHandler := textHandlerFactory.NewTextHandler(user, int64(c.Message().ID))
-		botResponse, err := textHandler.OnTextHandler(transcriptionText)
+		chunksCh := textHandler.OnStreamableTextHandler(context.Background(), transcriptionText)
 
-		if err != nil {
-			return err
-		}
-
-		return c.Reply(botResponse)
+		return telegram_utils.SendStream(c, c.Message(), chunksCh)
 	})
 
 	limitedGroup.Handle(tele.OnText, func(c tele.Context) error {
@@ -171,23 +160,7 @@ func main() {
 		textHandler := textHandlerFactory.NewTextHandler(user, int64(c.Message().ID))
 
 		chunksCh := textHandler.OnStreamableTextHandler(ctx, userInput)
-		commandsCh := telegram_utils.ShapeStream(chunksCh)
-		var currentMessage *tele.Message
-		for command := range commandsCh {
-			log.Printf("Command: %+v\n", command)
-			if command.Err != nil {
-				return command.Err
-			}
-			if command.Command == "start" {
-				currentMessage, err = c.Bot().Reply(c.Message(), command.Content)
-			} else if command.Command == "edit" {
-				_, err = c.Bot().Edit(currentMessage, command.Content)
-			}
-			if err != nil {
-				return err
-			}
-		}
-		return nil
+		return telegram_utils.SendStream(c, c.Message(), chunksCh)
 	})
 
 	b.Start()
