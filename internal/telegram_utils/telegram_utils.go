@@ -2,6 +2,7 @@ package telegram_utils
 
 import (
 	"log"
+	"strings"
 
 	tele "gopkg.in/telebot.v3"
 	"vadimgribanov.com/tg-gpt/internal/handlers"
@@ -65,13 +66,13 @@ func SendStream(c tele.Context, replyTo *tele.Message, chunksCh <-chan handlers.
 			return command.Err
 		}
 		if command.Command == "start" {
-			currentMessage, err = c.Bot().Reply(replyTo, command.Content, &tele.SendOptions{ParseMode: tele.ModeMarkdown})
+			currentMessage, err = c.Bot().Reply(replyTo, FixMarkdown(command.Content), &tele.SendOptions{ParseMode: tele.ModeMarkdown})
 			if err != nil {
 				currentMessage, err = c.Bot().Reply(replyTo, command.Content, &tele.SendOptions{ParseMode: tele.ModeDefault})
 				log.Println("Retry error", err)
 			}
 		} else if command.Command == "edit" {
-			_, err = c.Bot().Edit(currentMessage, command.Content, &tele.SendOptions{ParseMode: tele.ModeMarkdown})
+			_, err = c.Bot().Edit(currentMessage, FixMarkdown(command.Content), &tele.SendOptions{ParseMode: tele.ModeMarkdown})
 			if err != nil {
 				_, err = c.Bot().Edit(currentMessage, command.Content, &tele.SendOptions{ParseMode: tele.ModeDefault})
 				log.Println("Retry error", err)
@@ -83,4 +84,58 @@ func SendStream(c tele.Context, replyTo *tele.Message, chunksCh <-chan handlers.
 		}
 	}
 	return nil
+}
+
+func GetUnclosedTag(markdown string) string {
+	// order is important!
+	var tags = []string{
+		"```",
+		"`",
+		"*",
+		"_",
+	}
+	var currentTag = ""
+
+	markdownRunes := []rune(markdown)
+
+	var i = 0
+outer:
+	for i < len(markdownRunes) {
+		// skip escaped characters (only outside tags)
+		if markdownRunes[i] == '\\' && currentTag == "" {
+			i += 2
+			continue
+		}
+		if currentTag != "" {
+			if strings.HasPrefix(string(markdownRunes[i:]), currentTag) {
+				// turn a tag off
+				i += len(currentTag)
+				currentTag = ""
+				continue
+			}
+		} else {
+			for _, tag := range tags {
+				if strings.HasPrefix(string(markdownRunes[i:]), tag) {
+					// turn a tag on
+					currentTag = tag
+					i += len(currentTag)
+					continue outer
+				}
+			}
+		}
+		i++
+	}
+
+	return currentTag
+}
+func IsValid(markdown string) bool {
+	return GetUnclosedTag(markdown) == ""
+}
+
+func FixMarkdown(markdown string) string {
+	tag := GetUnclosedTag(markdown)
+	if tag == "" {
+		return markdown
+	}
+	return markdown + tag
 }
