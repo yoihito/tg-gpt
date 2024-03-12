@@ -13,11 +13,13 @@ import (
 	openai "github.com/sashabaranov/go-openai"
 	tele "gopkg.in/telebot.v3"
 	tele_middleware "gopkg.in/telebot.v3/middleware"
+	"vadimgribanov.com/tg-gpt/internal/adapters"
 	"vadimgribanov.com/tg-gpt/internal/handlers"
 	"vadimgribanov.com/tg-gpt/internal/middleware"
 	"vadimgribanov.com/tg-gpt/internal/models"
 	"vadimgribanov.com/tg-gpt/internal/repositories"
 	"vadimgribanov.com/tg-gpt/internal/telegram_utils"
+	"vadimgribanov.com/tg-gpt/internal/vendors/anthropic"
 )
 
 func main() {
@@ -26,6 +28,7 @@ func main() {
 		log.Println("Error loading .env file")
 	}
 	client := openai.NewClient(os.Getenv("OPENAI_API_KEY"))
+	anthropicClient := anthropic.NewClient(os.Getenv("ANTHROPIC_API_KEY"))
 	messagesRepo := repositories.NewMessagesRepo()
 
 	allowedUserIDsStr := os.Getenv("ALLOWED_USER_ID")
@@ -51,8 +54,10 @@ func main() {
 	}
 	rateLimiter := middleware.RateLimiter{MaxConcurrentRequests: maxConcurrentRequests}
 	authenticator := middleware.UserAuthenticator{UserRepo: userRepo, AllowedUserIds: allowedUserIDs}
+	// openAiAdapter := adapters.NewOpenaiAdapter(client)
+	anthropicAdapter := adapters.NewAnthropicAdapter(anthropicClient)
 	textHandlerFactory := handlers.TextHandlerFactory{
-		Client:        client,
+		Client:        anthropicAdapter,
 		MessagesRepo:  messagesRepo,
 		UsersRepo:     userRepo,
 		DialogTimeout: dialogTimeout,
@@ -159,6 +164,7 @@ func main() {
 	})
 
 	limitedGroup.Handle(tele.OnText, func(c tele.Context) error {
+		log.Println("Got text message")
 		ctx := c.Get("requestContext").(context.Context)
 		user := c.Get("user").(models.User)
 
@@ -173,5 +179,6 @@ func main() {
 		return telegram_utils.SendStream(c, c.Message(), chunksCh)
 	})
 
+	log.Println("Listening...")
 	b.Start()
 }
