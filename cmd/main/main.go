@@ -54,10 +54,11 @@ func main() {
 	}
 	rateLimiter := middleware.RateLimiter{MaxConcurrentRequests: maxConcurrentRequests}
 	authenticator := middleware.UserAuthenticator{UserRepo: userRepo, AllowedUserIds: allowedUserIDs}
-	// openAiAdapter := adapters.NewOpenaiAdapter(client)
-	anthropicAdapter := adapters.NewAnthropicAdapter(anthropicClient)
+	llmClientFactory := handlers.NewLLMClientFactory()
+	llmClientFactory.RegisterClient("openai", adapters.NewOpenaiAdapter(client))
+	llmClientFactory.RegisterClient("anthropic", adapters.NewAnthropicAdapter(anthropicClient))
 	textHandlerFactory := handlers.TextHandlerFactory{
-		Client:        anthropicAdapter,
+		ClientFactory: llmClientFactory,
 		MessagesRepo:  messagesRepo,
 		UsersRepo:     userRepo,
 		DialogTimeout: dialogTimeout,
@@ -124,13 +125,26 @@ func main() {
 		}
 
 		log.Printf("Interaction: %+v\n", interaction)
-		textHandler := textHandlerFactory.NewTextHandler(user, interaction.TgUserMessageId)
+		textHandler, err := textHandlerFactory.NewTextHandler(user, interaction.TgUserMessageId)
+		if err != nil {
+			return err
+		}
 		chunksCh := textHandler.OnStreamableTextHandler(ctx, interaction.UserMessage)
 
 		return telegram_utils.SendStream(c, &tele.Message{
 			ID:   int(interaction.TgUserMessageId),
 			Chat: c.Chat(),
 		}, chunksCh)
+	})
+
+	limitedGroup.Handle("/change_model", func(c tele.Context) error {
+		user := c.Get("user").(models.User)
+		user.CurrentModel = c.Args()[0]
+		err := userRepo.UpdateUser(user)
+		if err != nil {
+			return err
+		}
+		return c.Send(fmt.Sprintf("Model changed to %s", c.Args()[0]))
 	})
 
 	limitedGroup.Handle(tele.OnVoice, func(c tele.Context) error {
@@ -157,7 +171,10 @@ func main() {
 			return err
 		}
 
-		textHandler := textHandlerFactory.NewTextHandler(user, int64(c.Message().ID))
+		textHandler, err := textHandlerFactory.NewTextHandler(user, int64(c.Message().ID))
+		if err != nil {
+			return err
+		}
 		chunksCh := textHandler.OnStreamableTextHandler(ctx, transcriptionText)
 
 		return telegram_utils.SendStream(c, c.Message(), chunksCh)
@@ -173,8 +190,10 @@ func main() {
 			return err
 		}
 		userInput := c.Message().Text
-		textHandler := textHandlerFactory.NewTextHandler(user, int64(c.Message().ID))
-
+		textHandler, err := textHandlerFactory.NewTextHandler(user, int64(c.Message().ID))
+		if err != nil {
+			return err
+		}
 		chunksCh := textHandler.OnStreamableTextHandler(ctx, userInput)
 		return telegram_utils.SendStream(c, c.Message(), chunksCh)
 	})

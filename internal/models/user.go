@@ -14,6 +14,7 @@ type User struct {
 	CurrentDialogId      int64
 	LastInteraction      int64
 	Active               bool
+	CurrentModel         string
 }
 
 func (u *User) StartNewDialog() {

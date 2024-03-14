@@ -27,6 +27,7 @@ func (repo *UserRepo) Register(userId int64, firstName string, lastName string, 
 		ChatId:          chatId,
 		LastInteraction: time.Now().Unix(),
 		Active:          active,
+		CurrentModel:    "openai",
 	}
 	repo.users = append(repo.users, newUser)
 	return newUser, nil

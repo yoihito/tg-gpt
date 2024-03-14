@@ -14,21 +14,26 @@ import (
 )
 
 type TextHandlerFactory struct {
-	Client        LLMClient
+	ClientFactory *LLMClientFactory
 	MessagesRepo  MessagesRepo
 	UsersRepo     UsersRepo
 	DialogTimeout int64
 }
 
-func (f *TextHandlerFactory) NewTextHandler(user models.User, tgUserMessageId int64) *TextHandler {
+func (f *TextHandlerFactory) NewTextHandler(user models.User, tgUserMessageId int64) (*TextHandler, error) {
+	client, err := f.ClientFactory.GetClient(user.CurrentModel)
+	if err != nil {
+		return nil, err
+	}
+
 	return &TextHandler{
-		client:          f.Client,
+		client:          client,
 		messagesRepo:    f.MessagesRepo,
 		usersRepo:       f.UsersRepo,
 		dialogTimeout:   f.DialogTimeout,
 		user:            user,
 		tgUserMessageId: tgUserMessageId,
-	}
+	}, nil
 }
 
 type TextHandler struct {
