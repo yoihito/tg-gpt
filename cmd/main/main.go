@@ -77,6 +77,16 @@ func main() {
 		log.Fatal(err)
 		return
 	}
+	err = b.SetCommands([]tele.Command{
+		{Text: "/retry", Description: "Retry the last message"},
+		{Text: "/reset", Description: "Start a new dialog"},
+		{Text: "/change_model", Description: "Change the model"},
+		{Text: "/cancel", Description: "Cancel the current request"},
+	})
+	if err != nil {
+		log.Fatal(err)
+		return
+	}
 	b.Use(tele_middleware.Logger())
 	b.Use(authenticator.Middleware())
 	b.Handle("/cancel", func(c tele.Context) error {
