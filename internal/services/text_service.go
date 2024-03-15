@@ -1,4 +1,4 @@
-package handlers
+package services
 
 import (
 	"context"
@@ -13,20 +13,20 @@ import (
 	"vadimgribanov.com/tg-gpt/internal/models"
 )
 
-type TextHandlerFactory struct {
+type TextServiceFactory struct {
 	ClientFactory *LLMClientFactory
 	MessagesRepo  MessagesRepo
 	UsersRepo     UsersRepo
 	DialogTimeout int64
 }
 
-func (f *TextHandlerFactory) NewTextHandler(user models.User, tgUserMessageId int64) (*TextHandler, error) {
+func (f *TextServiceFactory) NewTextService(user models.User, tgUserMessageId int64) (*TextService, error) {
 	client, err := f.ClientFactory.GetClient(user.CurrentModel)
 	if err != nil {
 		return nil, err
 	}
 
-	return &TextHandler{
+	return &TextService{
 		client:          client,
 		messagesRepo:    f.MessagesRepo,
 		usersRepo:       f.UsersRepo,
@@ -36,7 +36,7 @@ func (f *TextHandlerFactory) NewTextHandler(user models.User, tgUserMessageId in
 	}, nil
 }
 
-type TextHandler struct {
+type TextService struct {
 	client          LLMClient
 	messagesRepo    MessagesRepo
 	usersRepo       UsersRepo
@@ -66,7 +66,7 @@ type Result struct {
 	Err       error
 }
 
-func (h *TextHandler) OnStreamableTextHandler(ctx context.Context, userText string) <-chan Result {
+func (h *TextService) OnStreamableTextHandler(ctx context.Context, userText string) <-chan Result {
 	resultsCh := make(chan Result)
 	go func() {
 		defer close(resultsCh)

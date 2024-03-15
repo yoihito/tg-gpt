@@ -14,10 +14,10 @@ import (
 	tele "gopkg.in/telebot.v3"
 	tele_middleware "gopkg.in/telebot.v3/middleware"
 	"vadimgribanov.com/tg-gpt/internal/adapters"
-	"vadimgribanov.com/tg-gpt/internal/handlers"
 	"vadimgribanov.com/tg-gpt/internal/middleware"
 	"vadimgribanov.com/tg-gpt/internal/models"
 	"vadimgribanov.com/tg-gpt/internal/repositories"
+	"vadimgribanov.com/tg-gpt/internal/services"
 	"vadimgribanov.com/tg-gpt/internal/telegram_utils"
 	"vadimgribanov.com/tg-gpt/internal/vendors/anthropic"
 )
@@ -54,16 +54,16 @@ func main() {
 	}
 	rateLimiter := middleware.RateLimiter{MaxConcurrentRequests: maxConcurrentRequests}
 	authenticator := middleware.UserAuthenticator{UserRepo: userRepo, AllowedUserIds: allowedUserIDs}
-	llmClientFactory := handlers.NewLLMClientFactory()
+	llmClientFactory := services.NewLLMClientFactory()
 	llmClientFactory.RegisterClient("openai", adapters.NewOpenaiAdapter(client))
 	llmClientFactory.RegisterClient("anthropic", adapters.NewAnthropicAdapter(anthropicClient))
-	textHandlerFactory := handlers.TextHandlerFactory{
+	textHandlerFactory := services.TextServiceFactory{
 		ClientFactory: llmClientFactory,
 		MessagesRepo:  messagesRepo,
 		UsersRepo:     userRepo,
 		DialogTimeout: dialogTimeout,
 	}
-	voiceHandler := handlers.VoiceHandler{
+	voiceHandler := services.VoiceHandler{
 		Client: client,
 	}
 
@@ -135,7 +135,7 @@ func main() {
 		}
 
 		log.Printf("Interaction: %+v\n", interaction)
-		textHandler, err := textHandlerFactory.NewTextHandler(user, interaction.TgUserMessageId)
+		textHandler, err := textHandlerFactory.NewTextService(user, interaction.TgUserMessageId)
 		if err != nil {
 			return err
 		}
@@ -181,7 +181,7 @@ func main() {
 			return err
 		}
 
-		textHandler, err := textHandlerFactory.NewTextHandler(user, int64(c.Message().ID))
+		textHandler, err := textHandlerFactory.NewTextService(user, int64(c.Message().ID))
 		if err != nil {
 			return err
 		}
@@ -200,7 +200,7 @@ func main() {
 			return err
 		}
 		userInput := c.Message().Text
-		textHandler, err := textHandlerFactory.NewTextHandler(user, int64(c.Message().ID))
+		textHandler, err := textHandlerFactory.NewTextService(user, int64(c.Message().ID))
 		if err != nil {
 			return err
 		}

@@ -3,7 +3,7 @@ dotenv: ['.env']
 tasks:
     build:
         cmds:
-            - go build -o bin/tg-bot ./cmd/main.go
+            - go build -o bin/tg-bot ./cmd/main
         env:
             GOOS: linux
             GOARCH: amd64

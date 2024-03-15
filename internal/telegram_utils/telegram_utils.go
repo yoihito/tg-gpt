@@ -5,7 +5,7 @@ import (
 	"strings"
 
 	tele "gopkg.in/telebot.v3"
-	"vadimgribanov.com/tg-gpt/internal/handlers"
+	"vadimgribanov.com/tg-gpt/internal/services"
 )
 
 const MAX_TELEGRAM_MESSAGE_LENGTH = 4096
@@ -17,7 +17,7 @@ type Commands struct {
 	Err     error
 }
 
-func ShapeStream(messagesCh <-chan handlers.Result) <-chan Commands {
+func ShapeStream(messagesCh <-chan services.Result) <-chan Commands {
 	commandsCh := make(chan Commands)
 	go func() {
 		defer close(commandsCh)
@@ -40,7 +40,7 @@ func ShapeStream(messagesCh <-chan handlers.Result) <-chan Commands {
 			}
 
 			accumulatedMessage += message.TextChunk
-			if len(accumulatedMessage)-prevLength < STREAMING_INTERVAL && message.Status != handlers.EOF_STATUS {
+			if len(accumulatedMessage)-prevLength < STREAMING_INTERVAL && message.Status != services.EOF_STATUS {
 				continue
 			}
 			prevLength = len(accumulatedMessage)
@@ -55,7 +55,7 @@ func ShapeStream(messagesCh <-chan handlers.Result) <-chan Commands {
 	return commandsCh
 }
 
-func SendStream(c tele.Context, replyTo *tele.Message, chunksCh <-chan handlers.Result) error {
+func SendStream(c tele.Context, replyTo *tele.Message, chunksCh <-chan services.Result) error {
 	commandsCh := ShapeStream(chunksCh)
 	var currentMessage *tele.Message
 	var err error
