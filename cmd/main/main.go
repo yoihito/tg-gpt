@@ -195,15 +195,15 @@ func main() {
 		ctx := c.Get("requestContext").(context.Context)
 		user := c.Get("user").(models.User)
 
+		textHandler, err := textHandlerFactory.NewTextService(user, int64(c.Message().ID))
+		if err != nil {
+			return err
+		}
 		err = c.Notify(tele.Typing)
 		if err != nil {
 			return err
 		}
 		userInput := c.Message().Text
-		textHandler, err := textHandlerFactory.NewTextService(user, int64(c.Message().ID))
-		if err != nil {
-			return err
-		}
 		chunksCh := textHandler.OnStreamableTextHandler(ctx, userInput)
 		return telegram_utils.SendStream(c, c.Message(), chunksCh)
 	})

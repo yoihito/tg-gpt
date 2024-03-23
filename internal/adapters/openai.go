@@ -19,7 +19,7 @@ func NewOpenaiAdapter(client *openai.Client) *OpenaiAdapter {
 }
 
 func (a *OpenaiAdapter) CreateChatCompletionStream(ctx context.Context, request openai.ChatCompletionRequest) (LLMStream, error) {
-	request.Model = openai.GPT4TurboPreview
+	request.Model = openai.GPT4VisionPreview
 	stream, err := a.client.CreateChatCompletionStream(ctx, request)
 	if err != nil {
 		return nil, err
