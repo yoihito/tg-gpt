@@ -88,16 +88,112 @@ func (h *TextService) OnStreamableTextHandler(ctx context.Context, userText stri
 		}
 		for _, message := range history {
 			messages = append(messages, openai.ChatCompletionMessage{
-				Role:    "user",
+				Role:    openai.ChatMessageRoleUser,
 				Content: message.UserMessage,
 			}, openai.ChatCompletionMessage{
-				Role:    "assistant",
+				Role:    openai.ChatMessageRoleAssistant,
 				Content: message.AssistantMessage,
 			})
 		}
 		messages = append(messages, openai.ChatCompletionMessage{
-			Role:    "user",
+			Role:    openai.ChatMessageRoleUser,
 			Content: userText,
+		})
+
+		stream, err := h.client.CreateChatCompletionStream(ctx, openai.ChatCompletionRequest{
+			Messages: messages,
+		})
+		if err != nil {
+			log.Println(err)
+			resultsCh <- Result{Err: err}
+			return
+		}
+		defer stream.Close()
+
+	streamLoop:
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				response, err := stream.Recv()
+				if errors.Is(err, io.EOF) {
+					resultsCh <- Result{Status: EOF_STATUS}
+					break streamLoop
+				}
+				if err != nil {
+					log.Println(err)
+					resultsCh <- Result{Err: err}
+					return
+				}
+				resultsCh <- Result{TextChunk: response.Choices[0].Delta.Content}
+			}
+		}
+
+		outputTokens, err := stream.OutputTokens()
+		if err != nil {
+			log.Println(err)
+			resultsCh <- Result{Err: err}
+			return
+		}
+		h.user.NumberOfInputTokens += stream.InputTokens()
+		h.user.NumberOfOutputTokens += int64(outputTokens)
+		h.usersRepo.UpdateUser(h.user)
+		h.messagesRepo.AddMessage(models.Interaction{
+			UserMessage:      userText,
+			AssistantMessage: stream.AccumulatedResponse(),
+			AuthorId:         h.user.Id,
+			DialogId:         h.user.CurrentDialogId,
+			TgUserMessageId:  h.tgUserMessageId,
+		})
+	}()
+	return resultsCh
+}
+
+func (h *TextService) OnStreamableVisionHandler(ctx context.Context, userText string, encodedImage string) <-chan Result {
+	resultsCh := make(chan Result)
+	go func() {
+		defer close(resultsCh)
+		if time.Now().Unix()-h.user.LastInteraction > h.dialogTimeout {
+			h.user.StartNewDialog()
+		}
+		h.user.Touch()
+		err := h.usersRepo.UpdateUser(h.user)
+		if err != nil {
+			resultsCh <- Result{Err: err}
+			return
+		}
+		history := h.messagesRepo.GetCurrentDialogForUser(h.user)
+		messages := []openai.ChatCompletionMessage{
+			{
+				Role:    openai.ChatMessageRoleSystem,
+				Content: fmt.Sprintf("You are a helpful assistant. Your name is Johhny. Today is %s. Give short concise answers.", time.Now().Format(time.RFC3339)),
+			},
+		}
+		for _, message := range history {
+			messages = append(messages, openai.ChatCompletionMessage{
+				Role:    openai.ChatMessageRoleUser,
+				Content: message.UserMessage,
+			}, openai.ChatCompletionMessage{
+				Role:    openai.ChatMessageRoleAssistant,
+				Content: message.AssistantMessage,
+			})
+		}
+		messages = append(messages, openai.ChatCompletionMessage{
+			Role: openai.ChatMessageRoleUser,
+			MultiContent: []openai.ChatMessagePart{
+				{
+					Type: openai.ChatMessagePartTypeText,
+					Text: userText,
+				},
+				{
+					Type: openai.ChatMessagePartTypeImageURL,
+					ImageURL: &openai.ChatMessageImageURL{
+						URL:    fmt.Sprintf("data:image/jpeg;base64,%s", encodedImage),
+						Detail: openai.ImageURLDetailLow,
+					},
+				},
+			},
 		})
 
 		stream, err := h.client.CreateChatCompletionStream(ctx, openai.ChatCompletionRequest{

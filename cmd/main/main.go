@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"strconv"
@@ -205,6 +207,37 @@ func main() {
 		}
 		userInput := c.Message().Text
 		chunksCh := textHandler.OnStreamableTextHandler(ctx, userInput)
+		return telegram_utils.SendStream(c, c.Message(), chunksCh)
+	})
+
+	limitedGroup.Handle(tele.OnPhoto, func(c tele.Context) error {
+		log.Println("Got photo message")
+		ctx := c.Get("requestContext").(context.Context)
+		user := c.Get("user").(models.User)
+
+		photoFile := c.Message().Photo
+		reader, err := c.Bot().File(&photoFile.File)
+		if err != nil {
+			return err
+		}
+		defer reader.Close()
+
+		fileContent, err := io.ReadAll(reader)
+		if err != nil {
+			return err
+		}
+		encodedStr := base64.StdEncoding.EncodeToString(fileContent)
+
+		textHandler, err := textHandlerFactory.NewTextService(user, int64(c.Message().ID))
+		if err != nil {
+			return err
+		}
+		err = c.Notify(tele.Typing)
+		if err != nil {
+			return err
+		}
+		userInput := c.Message().Caption
+		chunksCh := textHandler.OnStreamableVisionHandler(ctx, userInput, encodedStr)
 		return telegram_utils.SendStream(c, c.Message(), chunksCh)
 	})
 
