@@ -57,8 +57,11 @@ func main() {
 	rateLimiter := middleware.RateLimiter{MaxConcurrentRequests: maxConcurrentRequests}
 	authenticator := middleware.UserAuthenticator{UserRepo: userRepo, AllowedUserIds: allowedUserIDs}
 	llmClientFactory := services.NewLLMClientFactory()
-	llmClientFactory.RegisterClient("openai", adapters.NewOpenaiAdapter(client))
-	llmClientFactory.RegisterClient("anthropic", adapters.NewAnthropicAdapter(anthropicClient))
+	llmClientFactory.RegisterClient("gpt-4-turbo-2024-04-09", adapters.NewOpenaiAdapter(client, "gpt-4-turbo-2024-04-09"))
+	llmClientFactory.RegisterClient("gpt-4-turbo-preview", adapters.NewOpenaiAdapter(client, "gpt-4-turbo-preview"))
+	llmClientFactory.RegisterClient("claude-3-opus-20240229", adapters.NewAnthropicAdapter(anthropicClient, "claude-3-opus-20240229"))
+	llmClientFactory.RegisterClient("claude-3-sonnet-20240229", adapters.NewAnthropicAdapter(anthropicClient, "claude-3-opus-20240229"))
+	llmClientFactory.RegisterClient("claude-3-haiku-20240307", adapters.NewAnthropicAdapter(anthropicClient, "claude-3-opus-20240229"))
 	textHandlerFactory := services.TextServiceFactory{
 		ClientFactory: llmClientFactory,
 		MessagesRepo:  messagesRepo,
@@ -129,11 +132,7 @@ func main() {
 		user := c.Get("user").(models.User)
 		interaction, err := messagesRepo.PopLatestInteraction(user)
 		if err != nil {
-			err = c.Send("No messages found")
-			if err != nil {
-				return err
-			}
-			return nil
+			return c.Send("No messages found")
 		}
 
 		log.Printf("Interaction: %+v\n", interaction)
@@ -141,7 +140,13 @@ func main() {
 		if err != nil {
 			return err
 		}
-		chunksCh := textHandler.OnStreamableTextHandler(ctx, interaction.UserMessage)
+
+		var chunksCh <-chan services.Result
+		if len(interaction.UserChatCompletion().MultiContent) > 0 {
+			return c.Send("Cannot retry multi-content messages")
+		} else {
+			chunksCh = textHandler.OnStreamableTextHandler(ctx, interaction.UserChatCompletion().Content)
+		}
 
 		return telegram_utils.SendStream(c, &tele.Message{
 			ID:   int(interaction.TgUserMessageId),
@@ -151,6 +156,13 @@ func main() {
 
 	limitedGroup.Handle("/change_model", func(c tele.Context) error {
 		user := c.Get("user").(models.User)
+		if len(c.Args()) == 0 {
+			return c.Send("Provide model name")
+		}
+		modelName := c.Args()[0]
+		if !llmClientFactory.IsClientRegistered(modelName) {
+			return c.Send("Model not found")
+		}
 		user.CurrentModel = c.Args()[0]
 		err := userRepo.UpdateUser(user)
 		if err != nil {
@@ -237,7 +249,12 @@ func main() {
 			return err
 		}
 		userInput := c.Message().Caption
-		chunksCh := textHandler.OnStreamableVisionHandler(ctx, userInput, encodedStr)
+
+		if len(userInput) == 0 {
+			return c.Send("Provide image caption")
+		}
+
+		chunksCh := textHandler.OnStreamableVisionHandler(ctx, userInput, fmt.Sprintf("data:image/jpeg;base64,%s", encodedStr))
 		return telegram_utils.SendStream(c, c.Message(), chunksCh)
 	})
 
