@@ -7,25 +7,12 @@ import (
 	"vadimgribanov.com/tg-gpt/internal/vendors/anthropic"
 )
 
-type AnthropicAdapterFactory struct {
+type AnthropicAdapter struct {
 	client *anthropic.Client
 }
 
-func NewAnthropicAdapterFactory(client *anthropic.Client) *AnthropicAdapterFactory {
-	return &AnthropicAdapterFactory{client: client}
-}
-
-func (f *AnthropicAdapterFactory) CreateAdapter(modelName string) *AnthropicAdapter {
-	return &AnthropicAdapter{client: f.client, modelName: modelName}
-}
-
-type AnthropicAdapter struct {
-	client    *anthropic.Client
-	modelName string
-}
-
-func NewAnthropicAdapter(client *anthropic.Client, modelName string) *AnthropicAdapter {
-	return &AnthropicAdapter{client: client, modelName: modelName}
+func NewAnthropicAdapter(client *anthropic.Client) *AnthropicAdapter {
+	return &AnthropicAdapter{client: client}
 }
 
 func (a *AnthropicAdapter) CreateChatCompletionStream(ctx context.Context, request openai.ChatCompletionRequest) (LLMStream, error) {
@@ -44,7 +31,7 @@ func (a *AnthropicAdapter) CreateChatCompletionStream(ctx context.Context, reque
 
 	stream, err := a.client.CreateMessagesStream(ctx, anthropic.CreateMessageRequest{
 		System:    systemPrompt,
-		Model:     a.modelName,
+		Model:     request.Model,
 		Messages:  anthropicMessages,
 		MaxTokens: 4096,
 	})

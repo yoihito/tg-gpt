@@ -11,16 +11,14 @@ import (
 )
 
 type OpenaiAdapter struct {
-	client    *openai.Client
-	modelName string
+	client *openai.Client
 }
 
-func NewOpenaiAdapter(client *openai.Client, modelName string) *OpenaiAdapter {
-	return &OpenaiAdapter{client: client, modelName: modelName}
+func NewOpenaiAdapter(client *openai.Client) *OpenaiAdapter {
+	return &OpenaiAdapter{client: client}
 }
 
 func (a *OpenaiAdapter) CreateChatCompletionStream(ctx context.Context, request openai.ChatCompletionRequest) (LLMStream, error) {
-	request.Model = a.modelName
 	stream, err := a.client.CreateChatCompletionStream(ctx, request)
 	if err != nil {
 		return nil, err

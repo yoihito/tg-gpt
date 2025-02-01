@@ -3,36 +3,39 @@ package services
 import (
 	"errors"
 	"fmt"
+
+	"vadimgribanov.com/tg-gpt/internal/config"
 )
 
-var MODEL_MAP = map[string]string{
-	"gpt-4-turbo-2024-04-09":   "openai",
-	"gpt-4-turbo-preview":      "openai",
-	"claude-3-opus-20240229":   "anthropic",
-	"claude-3-sonnet-20240229": "anthropic",
-	"claude-3-haiku-20240307":  "anthropic",
-}
-
 type LLMClientFactory struct {
-	clients map[string]LLMClient
+	supportedModels map[string]config.LLMModel
+	providers       map[string]LLMClient
 }
 
 func NewLLMClientFactory() *LLMClientFactory {
-	return &LLMClientFactory{clients: make(map[string]LLMClient)}
+	return &LLMClientFactory{supportedModels: make(map[string]config.LLMModel), providers: make(map[string]LLMClient)}
 }
 
 func (f *LLMClientFactory) IsClientRegistered(name string) bool {
-	_, ok := f.clients[name]
+	_, ok := f.supportedModels[name]
 	return ok
 }
 
-func (f *LLMClientFactory) RegisterClient(name string, client LLMClient) {
-	f.clients[name] = client
+func (f *LLMClientFactory) RegisterProvider(name string, client LLMClient) {
+	f.providers[name] = client
+}
+
+func (f *LLMClientFactory) RegisterClientUsingConfig(modelConfig config.LLMModel) {
+	f.supportedModels[modelConfig.ModelId] = modelConfig
 }
 
 func (f *LLMClientFactory) GetClient(name string) (LLMClient, error) {
-	if _, ok := f.clients[name]; !ok {
+	if _, ok := f.supportedModels[name]; !ok {
 		return nil, errors.New(fmt.Sprintf("Client with name %s not found", name))
 	}
-	return f.clients[name], nil
+	if _, ok := f.providers[f.supportedModels[name].Provider]; !ok {
+		return nil, errors.New(fmt.Sprintf("Provider with name %s not found", name))
+	}
+
+	return f.providers[f.supportedModels[name].Provider], nil
 }

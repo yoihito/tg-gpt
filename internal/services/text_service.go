@@ -127,6 +127,7 @@ func (h *TextService) handleLLMRequest(ctx context.Context, newMessage models.Me
 		})
 
 		stream, err := h.client.CreateChatCompletionStream(ctx, openai.ChatCompletionRequest{
+			Model:    h.user.CurrentModel,
 			Messages: messages,
 		})
 		if err != nil {

@@ -16,6 +16,7 @@ import (
 	tele "gopkg.in/telebot.v3"
 	tele_middleware "gopkg.in/telebot.v3/middleware"
 	"vadimgribanov.com/tg-gpt/internal/adapters"
+	"vadimgribanov.com/tg-gpt/internal/config"
 	"vadimgribanov.com/tg-gpt/internal/middleware"
 	"vadimgribanov.com/tg-gpt/internal/models"
 	"vadimgribanov.com/tg-gpt/internal/repositories"
@@ -28,6 +29,10 @@ func main() {
 	err := godotenv.Load()
 	if err != nil {
 		log.Println("Error loading .env file")
+	}
+	appConfig, err := config.LoadConfig()
+	if err != nil {
+		log.Fatal(err)
 	}
 	client := openai.NewClient(os.Getenv("OPENAI_API_KEY"))
 	anthropicClient := anthropic.NewClient(os.Getenv("ANTHROPIC_API_KEY"))
@@ -57,11 +62,11 @@ func main() {
 	rateLimiter := middleware.RateLimiter{MaxConcurrentRequests: maxConcurrentRequests}
 	authenticator := middleware.UserAuthenticator{UserRepo: userRepo, AllowedUserIds: allowedUserIDs}
 	llmClientFactory := services.NewLLMClientFactory()
-	llmClientFactory.RegisterClient("gpt-4-turbo-2024-04-09", adapters.NewOpenaiAdapter(client, "gpt-4-turbo-2024-04-09"))
-	llmClientFactory.RegisterClient("gpt-4-turbo-preview", adapters.NewOpenaiAdapter(client, "gpt-4-turbo-preview"))
-	llmClientFactory.RegisterClient("claude-3-opus-20240229", adapters.NewAnthropicAdapter(anthropicClient, "claude-3-opus-20240229"))
-	llmClientFactory.RegisterClient("claude-3-sonnet-20240229", adapters.NewAnthropicAdapter(anthropicClient, "claude-3-opus-20240229"))
-	llmClientFactory.RegisterClient("claude-3-haiku-20240307", adapters.NewAnthropicAdapter(anthropicClient, "claude-3-opus-20240229"))
+	llmClientFactory.RegisterProvider("openai", adapters.NewOpenaiAdapter(client))
+	llmClientFactory.RegisterProvider("anthropic", adapters.NewAnthropicAdapter(anthropicClient))
+	for _, model := range appConfig.Models {
+		llmClientFactory.RegisterClientUsingConfig(model)
+	}
 	textHandlerFactory := services.TextServiceFactory{
 		ClientFactory: llmClientFactory,
 		MessagesRepo:  messagesRepo,
