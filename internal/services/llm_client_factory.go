@@ -29,13 +29,13 @@ func (f *LLMClientFactory) RegisterClientUsingConfig(modelConfig config.LLMModel
 	f.supportedModels[modelConfig.ModelId] = modelConfig
 }
 
-func (f *LLMClientFactory) GetClient(name string) (LLMClient, error) {
-	if _, ok := f.supportedModels[name]; !ok {
-		return nil, errors.New(fmt.Sprintf("Client with name %s not found", name))
+func (f *LLMClientFactory) GetClient(modelId string) (LLMClient, error) {
+	if _, ok := f.supportedModels[modelId]; !ok {
+		return nil, errors.New(fmt.Sprintf("Client with modelId %s not found", modelId))
 	}
-	if _, ok := f.providers[f.supportedModels[name].Provider]; !ok {
-		return nil, errors.New(fmt.Sprintf("Provider with name %s not found", name))
+	if _, ok := f.providers[f.supportedModels[modelId].Provider]; !ok {
+		return nil, errors.New(fmt.Sprintf("Provider with name %s not found", f.supportedModels[modelId].Provider))
 	}
 
-	return f.providers[f.supportedModels[name].Provider], nil
+	return f.providers[f.supportedModels[modelId].Provider], nil
 }

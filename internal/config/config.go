@@ -16,7 +16,8 @@ type LLMModel struct {
 }
 
 type Config struct {
-	Models []LLMModel `yaml:"models"`
+	DefaultModel LLMModel   `yaml:"default_model"`
+	Models       []LLMModel `yaml:"models"`
 }
 
 func LoadConfig() (*Config, error) {

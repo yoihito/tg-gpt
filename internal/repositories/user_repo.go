@@ -16,7 +16,7 @@ func NewUserRepo() *UserRepo {
 	return &UserRepo{users: []models.User{}}
 }
 
-func (repo *UserRepo) Register(userId int64, firstName string, lastName string, username string, chatId int64, active bool) (models.User, error) {
+func (repo *UserRepo) Register(userId int64, firstName string, lastName string, username string, chatId int64, active bool, modelId string) (models.User, error) {
 	repo.lock.Lock()
 	defer repo.lock.Unlock()
 	newUser := models.User{
@@ -27,7 +27,7 @@ func (repo *UserRepo) Register(userId int64, firstName string, lastName string, 
 		ChatId:          chatId,
 		LastInteraction: time.Now().Unix(),
 		Active:          active,
-		CurrentModel:    "gpt-4-turbo-2024-04-09",
+		CurrentModel:    modelId,
 	}
 	repo.users = append(repo.users, newUser)
 	return newUser, nil

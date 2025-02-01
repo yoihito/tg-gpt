@@ -34,6 +34,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	log.Println(appConfig)
 	client := openai.NewClient(os.Getenv("OPENAI_API_KEY"))
 	anthropicClient := anthropic.NewClient(os.Getenv("ANTHROPIC_API_KEY"))
 	messagesRepo := repositories.NewMessagesRepo()
@@ -60,7 +61,7 @@ func main() {
 		return
 	}
 	rateLimiter := middleware.RateLimiter{MaxConcurrentRequests: maxConcurrentRequests}
-	authenticator := middleware.UserAuthenticator{UserRepo: userRepo, AllowedUserIds: allowedUserIDs}
+	authenticator := middleware.UserAuthenticator{UserRepo: userRepo, AllowedUserIds: allowedUserIDs, AppConfig: *appConfig}
 	llmClientFactory := services.NewLLMClientFactory()
 	llmClientFactory.RegisterProvider("openai", adapters.NewOpenaiAdapter(client))
 	llmClientFactory.RegisterProvider("anthropic", adapters.NewAnthropicAdapter(anthropicClient))
@@ -90,6 +91,7 @@ func main() {
 	err = b.SetCommands([]tele.Command{
 		{Text: "/retry", Description: "Retry the last message"},
 		{Text: "/reset", Description: "Start a new dialog"},
+		{Text: "/current_model", Description: "Currently selected model"},
 		{Text: "/change_model", Description: "Change the model"},
 		{Text: "/cancel", Description: "Cancel the current request"},
 	})
@@ -174,6 +176,12 @@ func main() {
 			return err
 		}
 		return c.Send(fmt.Sprintf("Model changed to %s", c.Args()[0]))
+	})
+
+	limitedGroup.Handle("/current_model", func(c tele.Context) error {
+		user := c.Get("user").(models.User)
+
+		return c.Send(fmt.Sprintf("Current model is %s", user.CurrentModel))
 	})
 
 	limitedGroup.Handle(tele.OnVoice, func(c tele.Context) error {

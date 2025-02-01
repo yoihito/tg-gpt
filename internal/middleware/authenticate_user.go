@@ -6,11 +6,12 @@ import (
 	"golang.org/x/exp/slices"
 
 	tele "gopkg.in/telebot.v3"
+	"vadimgribanov.com/tg-gpt/internal/config"
 	"vadimgribanov.com/tg-gpt/internal/models"
 )
 
 type UserRepo interface {
-	Register(int64, string, string, string, int64, bool) (models.User, error)
+	Register(int64, string, string, string, int64, bool, string) (models.User, error)
 	CheckIfUserExists(int64) bool
 	GetUser(int64) (models.User, error)
 }
@@ -18,6 +19,7 @@ type UserRepo interface {
 type UserAuthenticator struct {
 	UserRepo       UserRepo
 	AllowedUserIds []int64
+	AppConfig      config.Config
 }
 
 func (u *UserAuthenticator) Middleware() tele.MiddlewareFunc {
@@ -31,7 +33,15 @@ func (u *UserAuthenticator) Middleware() tele.MiddlewareFunc {
 				lastName := c.Sender().LastName
 				username := c.Sender().Username
 				chatId := c.Update().Message.Chat.ID
-				user, _ = u.UserRepo.Register(userId, firstName, lastName, username, chatId, slices.Contains(u.AllowedUserIds, userId))
+				user, _ = u.UserRepo.Register(
+					userId,
+					firstName,
+					lastName,
+					username,
+					chatId,
+					slices.Contains(u.AllowedUserIds, userId),
+					u.AppConfig.DefaultModel.ModelId,
+				)
 			} else {
 				user, _ = u.UserRepo.GetUser(c.Sender().ID)
 			}
