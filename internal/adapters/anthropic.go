@@ -15,6 +15,10 @@ func NewAnthropicAdapter(client *anthropic.Client) *AnthropicAdapter {
 	return &AnthropicAdapter{client: client}
 }
 
+func (a *AnthropicAdapter) Provider() string {
+	return "anthropic"
+}
+
 func (a *AnthropicAdapter) CreateChatCompletionStream(ctx context.Context, request openai.ChatCompletionRequest) (LLMStream, error) {
 	anthropicMessages := []anthropic.Message{}
 	systemPrompt := ""

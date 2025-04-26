@@ -1,7 +1,7 @@
 package middleware
 
 import (
-	"log"
+	"log/slog"
 
 	"golang.org/x/exp/slices"
 
@@ -23,10 +23,9 @@ type UserAuthenticator struct {
 }
 
 func (u *UserAuthenticator) Middleware() tele.MiddlewareFunc {
-	l := log.Default()
 	return func(next tele.HandlerFunc) tele.HandlerFunc {
 		return func(c tele.Context) error {
-			user := models.User{}
+			var user models.User
 			if !u.UserRepo.CheckIfUserExists(c.Sender().ID) {
 				userId := c.Sender().ID
 				firstName := c.Sender().FirstName
@@ -45,7 +44,7 @@ func (u *UserAuthenticator) Middleware() tele.MiddlewareFunc {
 			} else {
 				user, _ = u.UserRepo.GetUser(c.Sender().ID)
 			}
-			l.Printf("User: %+v\n", user)
+			slog.Debug("User authenticated", "user", user)
 			if user.Active {
 				c.Set("user", user)
 				return next(c)

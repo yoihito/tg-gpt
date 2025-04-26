@@ -7,11 +7,11 @@ import (
 	"github.com/sashabaranov/go-openai"
 )
 
-type VoiceHandler struct {
+type VoiceService struct {
 	Client *openai.Client
 }
 
-func (h *VoiceHandler) OnVoiceHandler(ctx context.Context, voiceFileReader io.ReadCloser) (string, error) {
+func (h *VoiceService) OnVoiceHandler(ctx context.Context, voiceFileReader io.ReadCloser) (string, error) {
 	response, err := h.Client.CreateTranscription(ctx, openai.AudioRequest{
 		Reader:   voiceFileReader,
 		FilePath: "voice.ogg",

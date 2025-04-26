@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"time"
 
 	"github.com/sashabaranov/go-openai"
@@ -13,27 +13,13 @@ import (
 	"vadimgribanov.com/tg-gpt/internal/models"
 )
 
-type TextServiceFactory struct {
-	ClientFactory *LLMClientFactory
-	MessagesRepo  MessagesRepo
-	UsersRepo     UsersRepo
-	DialogTimeout int64
-}
-
-func (f *TextServiceFactory) NewTextService(user models.User, tgUserMessageId int64) (*TextService, error) {
-	client, err := f.ClientFactory.GetClient(user.CurrentModel)
-	if err != nil {
-		return nil, err
-	}
-
+func NewTextService(client LLMClient, messagesRepo MessagesRepo, usersRepo UsersRepo, dialogTimeout int64) *TextService {
 	return &TextService{
-		client:          client,
-		messagesRepo:    f.MessagesRepo,
-		usersRepo:       f.UsersRepo,
-		dialogTimeout:   f.DialogTimeout,
-		user:            user,
-		tgUserMessageId: tgUserMessageId,
-	}, nil
+		client:        client,
+		messagesRepo:  messagesRepo,
+		usersRepo:     usersRepo,
+		dialogTimeout: dialogTimeout,
+	}
 }
 
 type TextService struct {
@@ -52,18 +38,19 @@ type LLMClient interface {
 type MessagesRepo interface {
 	AddMessage(message models.Interaction)
 	GetCurrentDialogForUser(user models.User) []models.Interaction
+	PopLatestInteraction(user models.User) (models.Interaction, error)
 }
 
 type UsersRepo interface {
 	UpdateUser(user models.User) error
 }
 
-const EOF_STATUS = "EOF"
+const EOFStatus = "EOF"
 
 type Result struct {
-	Status    string
-	TextChunk string
-	Err       error
+	Status        string
+	ChunkResponse openai.ChatCompletionStreamResponse
+	Err           error
 }
 
 type MessagePartType string
@@ -73,14 +60,20 @@ const (
 	MessagePartTypeImage MessagePartType = "image"
 )
 
-func (h *TextService) OnStreamableTextHandler(ctx context.Context, userText string) <-chan Result {
-	return h.handleLLMRequest(ctx, models.Message{
+func (h *TextService) RetryInteraction(ctx context.Context, user models.User, tgUserMessageId int64, interaction models.Interaction) <-chan Result {
+	return h.handleLLMRequest(ctx, user, tgUserMessageId, interaction.UserMessage)
+}
+
+func (h *TextService) OnStreamableTextHandler(ctx context.Context, user models.User, tgUserMessageId int64, userText string) <-chan Result {
+	return h.handleLLMRequest(ctx, user, tgUserMessageId, openai.ChatCompletionMessage{
+		Role:    openai.ChatMessageRoleUser,
 		Content: userText,
 	})
 }
 
-func (h *TextService) OnStreamableVisionHandler(ctx context.Context, userText string, imageUrl string) <-chan Result {
-	return h.handleLLMRequest(ctx, models.Message{
+func (h *TextService) OnStreamableVisionHandler(ctx context.Context, user models.User, tgUserMessageId int64, userText string, imageUrl string) <-chan Result {
+	return h.handleLLMRequest(ctx, user, tgUserMessageId, openai.ChatCompletionMessage{
+		Role: openai.ChatMessageRoleUser,
 		MultiContent: []openai.ChatMessagePart{
 			{
 				Type: openai.ChatMessagePartTypeText,
@@ -97,41 +90,36 @@ func (h *TextService) OnStreamableVisionHandler(ctx context.Context, userText st
 	})
 }
 
-func (h *TextService) handleLLMRequest(ctx context.Context, newMessage models.Message) <-chan Result {
+func (h *TextService) handleLLMRequest(ctx context.Context, user models.User, tgUserMessageId int64, newMessage openai.ChatCompletionMessage) <-chan Result {
 	resultsCh := make(chan Result)
 	go func() {
 		defer close(resultsCh)
-		if time.Now().Unix()-h.user.LastInteraction > h.dialogTimeout {
-			h.user.StartNewDialog()
+		if time.Now().Unix()-user.LastInteraction > h.dialogTimeout {
+			user.StartNewDialog()
 		}
-		h.user.Touch()
-		err := h.usersRepo.UpdateUser(h.user)
+		user.Touch()
+		err := h.usersRepo.UpdateUser(user)
 		if err != nil {
 			resultsCh <- Result{Err: err}
 			return
 		}
-		history := h.messagesRepo.GetCurrentDialogForUser(h.user)
-		messages := []openai.ChatCompletionMessage{
-			{
-				Role:    openai.ChatMessageRoleSystem,
-				Content: fmt.Sprintf("You are a helpful assistant. Your name is Johhny. Today is %s. Give short concise answers.", time.Now().Format(time.RFC3339)),
-			},
+
+		interactionHistory := h.messagesRepo.GetCurrentDialogForUser(user)
+		history := []openai.ChatCompletionMessage{{
+			Role:    openai.ChatMessageRoleSystem,
+			Content: fmt.Sprintf("You are a helpful assistant. Your name is Johhny. Today is %s. Give short concise answers.", time.Now().Format(time.RFC3339)),
+		}}
+		for _, interaction := range interactionHistory {
+			history = append(history, interaction.UserMessage, interaction.AssistantMessage)
 		}
-		for _, interaction := range history {
-			messages = append(messages, interaction.UserChatCompletion(), interaction.AssistantChatCompletion())
-		}
-		messages = append(messages, openai.ChatCompletionMessage{
-			Role:         openai.ChatMessageRoleUser,
-			Content:      newMessage.Content,
-			MultiContent: newMessage.MultiContent,
-		})
+		history = append(history, newMessage)
 
 		stream, err := h.client.CreateChatCompletionStream(ctx, openai.ChatCompletionRequest{
-			Model:    h.user.CurrentModel,
-			Messages: messages,
+			Model:    user.CurrentModel,
+			Messages: history,
 		})
 		if err != nil {
-			log.Println(err)
+			slog.Error("Got an error while creating chat completion stream", "error", err)
 			resultsCh <- Result{Err: err}
 			return
 		}
@@ -145,21 +133,21 @@ func (h *TextService) handleLLMRequest(ctx context.Context, newMessage models.Me
 			default:
 				response, err := stream.Recv()
 				if errors.Is(err, io.EOF) {
-					resultsCh <- Result{Status: EOF_STATUS}
+					resultsCh <- Result{Status: EOFStatus}
 					break streamLoop
 				}
 				if err != nil {
-					log.Println(err)
+					slog.Error("Got an error while receiving chat completion stream", "error", err)
 					resultsCh <- Result{Err: err}
 					return
 				}
-				resultsCh <- Result{TextChunk: response.Choices[0].Delta.Content}
+				resultsCh <- Result{ChunkResponse: response}
 			}
 		}
 
 		outputTokens, err := stream.OutputTokens()
 		if err != nil {
-			log.Println(err)
+			slog.Error("Got an error while getting output tokens", "error", err)
 			resultsCh <- Result{Err: err}
 			return
 		}
@@ -168,12 +156,13 @@ func (h *TextService) handleLLMRequest(ctx context.Context, newMessage models.Me
 		h.usersRepo.UpdateUser(h.user)
 		h.messagesRepo.AddMessage(models.Interaction{
 			UserMessage: newMessage,
-			AssistantMessage: models.Message{
+			AssistantMessage: openai.ChatCompletionMessage{
+				Role:    openai.ChatMessageRoleAssistant,
 				Content: stream.AccumulatedResponse(),
 			},
-			AuthorId:        h.user.Id,
-			DialogId:        h.user.CurrentDialogId,
-			TgUserMessageId: h.tgUserMessageId,
+			AuthorId:        user.Id,
+			DialogId:        user.CurrentDialogId,
+			TgUserMessageId: tgUserMessageId,
 		})
 	}()
 	return resultsCh

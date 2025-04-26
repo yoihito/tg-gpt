@@ -3,7 +3,7 @@ package adapters
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"strings"
 
 	"github.com/pkoukk/tiktoken-go"
@@ -16,6 +16,10 @@ type OpenaiAdapter struct {
 
 func NewOpenaiAdapter(client *openai.Client) *OpenaiAdapter {
 	return &OpenaiAdapter{client: client}
+}
+
+func (a *OpenaiAdapter) Provider() string {
+	return "openai"
 }
 
 func (a *OpenaiAdapter) CreateChatCompletionStream(ctx context.Context, request openai.ChatCompletionRequest) (LLMStream, error) {
@@ -66,7 +70,7 @@ func NumTokensFromMessages(messages []openai.ChatCompletionMessage, model string
 	tkm, err := tiktoken.EncodingForModel(model)
 	if err != nil {
 		err = fmt.Errorf("encoding for model: %v", err)
-		log.Println(err)
+		slog.Error("Got an error while getting num tokens from messages", "error", err)
 		return
 	}
 
@@ -85,14 +89,14 @@ func NumTokensFromMessages(messages []openai.ChatCompletionMessage, model string
 		tokensPerName = -1   // if there's a name, the role is omitted
 	default:
 		if strings.Contains(model, "gpt-3.5-turbo") {
-			log.Println("warning: gpt-3.5-turbo may update over time. Returning num tokens assuming gpt-3.5-turbo-0613.")
+			slog.Debug("warning: gpt-3.5-turbo may update over time. Returning num tokens assuming gpt-3.5-turbo-0613.")
 			return NumTokensFromMessages(messages, "gpt-3.5-turbo-0613")
 		} else if strings.Contains(model, "gpt-4") {
-			log.Println("warning: gpt-4 may update over time. Returning num tokens assuming gpt-4-0613.")
+			slog.Debug("warning: gpt-4 may update over time. Returning num tokens assuming gpt-4-0613.")
 			return NumTokensFromMessages(messages, "gpt-4-0613")
 		} else {
 			err = fmt.Errorf("num_tokens_from_messages() is not implemented for model %s. See https://github.com/openai/openai-python/blob/main/chatml.md for information on how messages are converted to tokens.", model)
-			log.Println(err)
+			slog.Error("Got an error while getting num tokens from messages", "error", err)
 			return
 		}
 	}

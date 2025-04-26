@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"net/http"
 )
 
@@ -31,7 +30,6 @@ func (c *Client) CreateMessagesStream(ctx context.Context, request CreateMessage
 	if err != nil {
 		return nil, err
 	}
-	log.Println("Anthropic request:", string(data))
 	response, err := c.rawRequest(ctx, data)
 	if err != nil {
 		return nil, err
