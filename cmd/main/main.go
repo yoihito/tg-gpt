@@ -49,16 +49,8 @@ func main() {
 		allowedUserIDs = append(allowedUserIDs, id)
 	}
 	userRepo := repositories.NewUserRepo()
-	dialogTimeout, err := strconv.ParseInt(os.Getenv("DIALOG_TIMEOUT"), 10, 0)
-	if err != nil {
-		slog.ErrorContext(ctx, "Error parsing dialog timeout", "error", err)
-		return
-	}
-	maxConcurrentRequests, err := strconv.Atoi(os.Getenv("MAX_CONCURRENT_REQUESTS"))
-	if err != nil {
-		slog.ErrorContext(ctx, "Error parsing max concurrent requests", "error", err)
-		return
-	}
+	dialogTimeout := int64(appConfig.DialogTimeout)
+	maxConcurrentRequests := appConfig.MaxConcurrentRequests
 	rateLimiter := middleware.RateLimiter{MaxConcurrentRequests: maxConcurrentRequests}
 	authenticator := middleware.UserAuthenticator{UserRepo: userRepo, AllowedUserIds: allowedUserIDs, AppConfig: *appConfig}
 	llmClientProxy := services.NewClientProxyFromConfig(appConfig)

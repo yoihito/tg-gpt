@@ -1,3 +1,5 @@
+dialog_timeout: 1800
+max_concurrent_requests: 1
 default_model:
   model_id: gpt-4o-2024-08-06
 models:

@@ -6,7 +6,6 @@ import (
 	"os"
 
 	"gopkg.in/yaml.v3"
-	_ "gopkg.in/yaml.v3"
 )
 
 type LLMModel struct {
@@ -16,8 +15,10 @@ type LLMModel struct {
 }
 
 type Config struct {
-	DefaultModel LLMModel   `yaml:"default_model"`
-	Models       []LLMModel `yaml:"models"`
+	DialogTimeout         int        `yaml:"dialog_timeout"`
+	MaxConcurrentRequests int        `yaml:"max_concurrent_requests"`
+	DefaultModel          LLMModel   `yaml:"default_model"`
+	Models                []LLMModel `yaml:"models"`
 }
 
 func LoadConfig() (*Config, error) {
