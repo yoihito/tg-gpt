@@ -1,6 +1,7 @@
 package telegram_utils
 
 import (
+	"context"
 	"log/slog"
 	"strings"
 
@@ -17,7 +18,7 @@ type Commands struct {
 	Err     error
 }
 
-func ShapeStream(messagesCh <-chan services.Result) <-chan Commands {
+func ShapeStream(ctx context.Context, messagesCh <-chan services.Result) <-chan Commands {
 	commandsCh := make(chan Commands)
 	go func() {
 		defer close(commandsCh)
@@ -26,12 +27,12 @@ func ShapeStream(messagesCh <-chan services.Result) <-chan Commands {
 		editing := false
 		for message := range messagesCh {
 			if message.Err != nil {
-				slog.Error("Got an error while streaming", "error", message.Err)
+				slog.ErrorContext(ctx, "Got an error while streaming", "error", message.Err)
 				commandsCh <- Commands{Err: message.Err}
 				return
 			}
 			if len(message.ChunkResponse.Choices) > 0 {
-				slog.Debug("Preview message chunk", "chunk", message.ChunkResponse)
+				slog.DebugContext(ctx, "Preview message chunk", "chunk", message.ChunkResponse)
 				textChunk := message.ChunkResponse.Choices[0].Delta.Content
 				if len(accumulatedMessage)+len(textChunk) >= MaxTelegramMessageLength {
 					if prevLength != len(accumulatedMessage) {
@@ -61,30 +62,31 @@ func ShapeStream(messagesCh <-chan services.Result) <-chan Commands {
 }
 
 func SendStream(c tele.Context, replyTo *tele.Message, chunksCh <-chan services.Result) error {
-	commandsCh := ShapeStream(chunksCh)
+	ctx := c.Get("requestContext").(context.Context)
+	commandsCh := ShapeStream(ctx, chunksCh)
 	var currentMessage *tele.Message
 	var err error
 	for command := range commandsCh {
-		slog.Debug("Streaming command", "command", command)
+		slog.DebugContext(ctx, "Streaming command", "command", command)
 		if command.Err != nil {
-			slog.Error("Got an error while streaming", "error", command.Err)
+			slog.ErrorContext(ctx, "Got an error while streaming", "error", command.Err)
 			return command.Err
 		}
 		if command.Command == "start" {
 			currentMessage, err = c.Bot().Reply(replyTo, FixMarkdown(command.Content), &tele.SendOptions{ParseMode: tele.ModeMarkdown})
 			if err != nil {
 				currentMessage, err = c.Bot().Reply(replyTo, command.Content, &tele.SendOptions{ParseMode: tele.ModeDefault})
-				slog.Error("Retry error", "error", err)
+				slog.ErrorContext(ctx, "Retry error", "error", err)
 			}
 		} else if command.Command == "edit" {
 			_, err = c.Bot().Edit(currentMessage, FixMarkdown(command.Content), &tele.SendOptions{ParseMode: tele.ModeMarkdown})
 			if err != nil {
 				_, err = c.Bot().Edit(currentMessage, command.Content, &tele.SendOptions{ParseMode: tele.ModeDefault})
-				slog.Error("Retry error", "error", err)
+				slog.ErrorContext(ctx, "Retry error", "error", err)
 			}
 		}
 		if err != nil {
-			slog.Error("Error streaming", "error", err)
+			slog.ErrorContext(ctx, "Error streaming", "error", err)
 			return err
 		}
 	}

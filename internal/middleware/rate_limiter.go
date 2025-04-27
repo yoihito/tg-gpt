@@ -22,6 +22,8 @@ type userRequestManager struct {
 func (r *RateLimiter) Middleware() tele.MiddlewareFunc {
 	return func(next tele.HandlerFunc) tele.HandlerFunc {
 		return func(c tele.Context) error {
+			ctx := c.Get("requestContext").(context.Context)
+
 			user := c.Get("user").(models.User)
 			userLock, _ := r.Locks.LoadOrStore(user.Id, &userRequestManager{
 				limiterChan: make(chan struct{}, r.MaxConcurrentRequests),
@@ -36,7 +38,7 @@ func (r *RateLimiter) Middleware() tele.MiddlewareFunc {
 					manager.cancelFunc = nil
 					manager.mu.Unlock()
 				}()
-				ctx, cancel := context.WithCancel(context.Background())
+				ctx, cancel := context.WithCancel(ctx)
 				manager.mu.Lock()
 				manager.cancelFunc = cancel
 				manager.mu.Unlock()

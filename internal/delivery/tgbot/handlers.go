@@ -15,10 +15,6 @@ import (
 	"vadimgribanov.com/tg-gpt/internal/telegram_utils"
 )
 
-func NewBot() {
-
-}
-
 func RegisterHandlers(
 	bot *tele.Bot,
 	rateLimiter *middleware.RateLimiter,
@@ -85,8 +81,8 @@ func NewBotHandler(
 }
 
 func (h *BotHandler) HandleText(c tele.Context) error {
-	slog.Debug("Got text message")
 	ctx := c.Get("requestContext").(context.Context)
+	slog.DebugContext(ctx, "Got text message")
 	user := c.Get("user").(models.User)
 
 	err := c.Notify(tele.Typing)
@@ -100,6 +96,7 @@ func (h *BotHandler) HandleText(c tele.Context) error {
 
 func (h *BotHandler) HandleVoice(c tele.Context) error {
 	ctx := c.Get("requestContext").(context.Context)
+	slog.DebugContext(ctx, "Got voice message")
 	voiceFile := c.Message().Voice
 
 	reader, err := c.Bot().File(&voiceFile.File)
@@ -133,8 +130,8 @@ func (h *BotHandler) HandleVoice(c tele.Context) error {
 }
 
 func (h *BotHandler) HandlePhoto(c tele.Context) error {
-	slog.Debug("Got photo message")
 	ctx := c.Get("requestContext").(context.Context)
+	slog.DebugContext(ctx, "Got photo message")
 	user := c.Get("user").(models.User)
 
 	photoFile := c.Message().Photo
@@ -172,7 +169,7 @@ func (h *BotHandler) HandlePhoto(c tele.Context) error {
 
 func (h *BotHandler) RetryLastMessage(c tele.Context) error {
 	ctx := c.Get("requestContext").(context.Context)
-
+	slog.DebugContext(ctx, "Retrying last message")
 	err := c.Notify(tele.Typing)
 	if err != nil {
 		return err
@@ -184,7 +181,7 @@ func (h *BotHandler) RetryLastMessage(c tele.Context) error {
 		return c.Send("No messages found")
 	}
 
-	slog.Debug("Last interaction with the user", "interaction", interaction)
+	slog.DebugContext(ctx, "Last interaction with the user", "interaction", interaction)
 
 	var chunksCh <-chan services.Result
 	if len(interaction.UserMessage.MultiContent) > 0 {
@@ -200,6 +197,8 @@ func (h *BotHandler) RetryLastMessage(c tele.Context) error {
 }
 
 func (h *BotHandler) ChangeModel(c tele.Context) error {
+	ctx := c.Get("requestContext").(context.Context)
+	slog.DebugContext(ctx, "Changing model")
 	user := c.Get("user").(models.User)
 	if len(c.Args()) == 0 {
 		return c.Send("Provide model name")
@@ -217,11 +216,16 @@ func (h *BotHandler) ChangeModel(c tele.Context) error {
 }
 
 func (h *BotHandler) GetCurrentModel(c tele.Context) error {
+	ctx := c.Get("requestContext").(context.Context)
+	slog.DebugContext(ctx, "Getting current model")
 	user := c.Get("user").(models.User)
 	return c.Send(fmt.Sprintf("Current model is %s", user.CurrentModel))
 }
 
 func (h *BotHandler) NewDialog(c tele.Context) error {
+	ctx := c.Get("requestContext").(context.Context)
+	slog.DebugContext(ctx, "Starting new dialog")
+
 	user := c.Get("user").(models.User)
 	user.StartNewDialog()
 	err := h.userRepo.UpdateUser(user)

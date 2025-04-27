@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"context"
 	"log/slog"
 
 	"golang.org/x/exp/slices"
@@ -25,6 +26,8 @@ type UserAuthenticator struct {
 func (u *UserAuthenticator) Middleware() tele.MiddlewareFunc {
 	return func(next tele.HandlerFunc) tele.HandlerFunc {
 		return func(c tele.Context) error {
+			ctx := c.Get("requestContext").(context.Context)
+
 			var user models.User
 			if !u.UserRepo.CheckIfUserExists(c.Sender().ID) {
 				userId := c.Sender().ID
@@ -44,9 +47,11 @@ func (u *UserAuthenticator) Middleware() tele.MiddlewareFunc {
 			} else {
 				user, _ = u.UserRepo.GetUser(c.Sender().ID)
 			}
-			slog.Debug("User authenticated", "user", user)
+			slog.DebugContext(ctx, "User authenticated", "user", user)
 			if user.Active {
 				c.Set("user", user)
+				ctx = context.WithValue(ctx, "user_id", user.Id)
+				c.Set("requestContext", ctx)
 				return next(c)
 			}
 			c.Send("You are not registered. Please contact the administrator.")

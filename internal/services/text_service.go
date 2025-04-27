@@ -119,7 +119,7 @@ func (h *TextService) handleLLMRequest(ctx context.Context, user models.User, tg
 			Messages: history,
 		})
 		if err != nil {
-			slog.Error("Got an error while creating chat completion stream", "error", err)
+			slog.ErrorContext(ctx, "Got an error while creating chat completion stream", "error", err)
 			resultsCh <- Result{Err: err}
 			return
 		}
@@ -137,7 +137,7 @@ func (h *TextService) handleLLMRequest(ctx context.Context, user models.User, tg
 					break streamLoop
 				}
 				if err != nil {
-					slog.Error("Got an error while receiving chat completion stream", "error", err)
+					slog.ErrorContext(ctx, "Got an error while receiving chat completion stream", "error", err)
 					resultsCh <- Result{Err: err}
 					return
 				}
@@ -147,7 +147,7 @@ func (h *TextService) handleLLMRequest(ctx context.Context, user models.User, tg
 
 		outputTokens, err := stream.OutputTokens()
 		if err != nil {
-			slog.Error("Got an error while getting output tokens", "error", err)
+			slog.ErrorContext(ctx, "Got an error while getting output tokens", "error", err)
 			resultsCh <- Result{Err: err}
 			return
 		}

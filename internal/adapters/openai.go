@@ -27,7 +27,12 @@ func (a *OpenaiAdapter) CreateChatCompletionStream(ctx context.Context, request 
 	if err != nil {
 		return nil, err
 	}
-	return &OpenaiStreamAdapter{stream: stream, accumulatedResponse: "", inputTokens: int64(NumTokensFromMessages(request.Messages, openai.GPT4TurboPreview))}, nil
+	numOfTokens, err := numTokensFromMessages(request.Messages, openai.GPT4TurboPreview)
+	if err != nil {
+		slog.ErrorContext(ctx, "Got an error while getting num tokens from messages", "error", err)
+		numOfTokens = 0
+	}
+	return &OpenaiStreamAdapter{stream: stream, accumulatedResponse: "", inputTokens: int64(numOfTokens)}, nil
 }
 
 type OpenaiStreamAdapter struct {
@@ -66,12 +71,10 @@ func (a *OpenaiStreamAdapter) Close() {
 }
 
 // OpenAI Cookbook: https://github.com/openai/openai-cookbook/blob/main/examples/How_to_count_tokens_with_tiktoken.ipynb
-func NumTokensFromMessages(messages []openai.ChatCompletionMessage, model string) (numTokens int) {
+func numTokensFromMessages(messages []openai.ChatCompletionMessage, model string) (numTokens int, err error) {
 	tkm, err := tiktoken.EncodingForModel(model)
 	if err != nil {
-		err = fmt.Errorf("encoding for model: %v", err)
-		slog.Error("Got an error while getting num tokens from messages", "error", err)
-		return
+		return 0, fmt.Errorf("encoding for model: %v", err)
 	}
 
 	var tokensPerMessage, tokensPerName int
@@ -89,15 +92,11 @@ func NumTokensFromMessages(messages []openai.ChatCompletionMessage, model string
 		tokensPerName = -1   // if there's a name, the role is omitted
 	default:
 		if strings.Contains(model, "gpt-3.5-turbo") {
-			slog.Debug("warning: gpt-3.5-turbo may update over time. Returning num tokens assuming gpt-3.5-turbo-0613.")
-			return NumTokensFromMessages(messages, "gpt-3.5-turbo-0613")
+			return numTokensFromMessages(messages, "gpt-3.5-turbo-0613")
 		} else if strings.Contains(model, "gpt-4") {
-			slog.Debug("warning: gpt-4 may update over time. Returning num tokens assuming gpt-4-0613.")
-			return NumTokensFromMessages(messages, "gpt-4-0613")
+			return numTokensFromMessages(messages, "gpt-4-0613")
 		} else {
-			err = fmt.Errorf("num_tokens_from_messages() is not implemented for model %s. See https://github.com/openai/openai-python/blob/main/chatml.md for information on how messages are converted to tokens.", model)
-			slog.Error("Got an error while getting num tokens from messages", "error", err)
-			return
+			return 0, fmt.Errorf("num_tokens_from_messages() is not implemented for model %s. See https://github.com/openai/openai-python/blob/main/chatml.md for information on how messages are converted to tokens.", model)
 		}
 	}
 
@@ -111,5 +110,5 @@ func NumTokensFromMessages(messages []openai.ChatCompletionMessage, model string
 		}
 	}
 	numTokens += 3 // every reply is primed with <|start|>assistant<|message|>
-	return numTokens
+	return numTokens, nil
 }
