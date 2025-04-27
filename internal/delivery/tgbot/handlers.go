@@ -45,12 +45,12 @@ func RegisterHandlers(
 	})
 	protected.Handle("/new_chat", handler.NewDialog)
 	protected.Handle("/retry", handler.RetryLastMessage)
-	protected.Handle("/change_model", handler.ChangeModel)
+	protected.Handle("/change_model", handler.ListModels)
 	protected.Handle("/current_model", handler.GetCurrentModel)
 	protected.Handle(tele.OnVoice, handler.HandleVoice)
 	protected.Handle(tele.OnText, handler.HandleText)
 	protected.Handle(tele.OnPhoto, handler.HandlePhoto)
-
+	protected.Handle(&tele.Btn{Unique: "model"}, handler.ChangeModel)
 }
 
 type BotHandler struct {
@@ -196,13 +196,29 @@ func (h *BotHandler) RetryLastMessage(c tele.Context) error {
 	}, chunksCh)
 }
 
+func (h *BotHandler) ListModels(c tele.Context) error {
+	ctx := c.Get("requestContext").(context.Context)
+	slog.DebugContext(ctx, "Changing model")
+
+	models := h.llmClientProxy.ListModels()
+	slog.InfoContext(ctx, "Models", "models", models)
+	selector := &tele.ReplyMarkup{}
+	rows := make([]tele.Row, 0, len(models))
+	for _, model := range models {
+		btn := selector.Data(model, "model", model)
+		rows = append(rows, selector.Row(btn))
+	}
+	selector.Inline(rows...)
+
+	return c.Send("Choose model", selector)
+}
+
 func (h *BotHandler) ChangeModel(c tele.Context) error {
 	ctx := c.Get("requestContext").(context.Context)
 	slog.DebugContext(ctx, "Changing model")
+
 	user := c.Get("user").(models.User)
-	if len(c.Args()) == 0 {
-		return c.Send("Provide model name")
-	}
+
 	modelName := c.Args()[0]
 	if !h.llmClientProxy.IsClientRegistered(modelName) {
 		return c.Send("Model not found")
@@ -212,7 +228,7 @@ func (h *BotHandler) ChangeModel(c tele.Context) error {
 	if err != nil {
 		return err
 	}
-	return c.Send(fmt.Sprintf("Model changed to %s", c.Args()[0]))
+	return c.Send(fmt.Sprintf("Model changed to %s", modelName))
 }
 
 func (h *BotHandler) GetCurrentModel(c tele.Context) error {

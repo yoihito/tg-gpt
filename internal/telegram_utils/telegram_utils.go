@@ -70,7 +70,7 @@ func SendStream(c tele.Context, replyTo *tele.Message, chunksCh <-chan services.
 		slog.DebugContext(ctx, "Streaming command", "command", command)
 		if command.Err != nil {
 			slog.ErrorContext(ctx, "Got an error while streaming", "error", command.Err)
-			return command.Err
+			return c.Send("Failed to answer the message")
 		}
 		if command.Command == "start" {
 			currentMessage, err = c.Bot().Reply(replyTo, FixMarkdown(command.Content), &tele.SendOptions{ParseMode: tele.ModeMarkdown})
@@ -87,7 +87,7 @@ func SendStream(c tele.Context, replyTo *tele.Message, chunksCh <-chan services.
 		}
 		if err != nil {
 			slog.ErrorContext(ctx, "Error streaming", "error", err)
-			return err
+			return c.Send("Failed to answer the message")
 		}
 	}
 	return nil

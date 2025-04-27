@@ -23,12 +23,10 @@ func NewTextService(client LLMClient, messagesRepo MessagesRepo, usersRepo Users
 }
 
 type TextService struct {
-	client          LLMClient
-	messagesRepo    MessagesRepo
-	usersRepo       UsersRepo
-	dialogTimeout   int64
-	user            models.User
-	tgUserMessageId int64
+	client        LLMClient
+	messagesRepo  MessagesRepo
+	usersRepo     UsersRepo
+	dialogTimeout int64
 }
 
 type LLMClient interface {
@@ -151,9 +149,9 @@ func (h *TextService) handleLLMRequest(ctx context.Context, user models.User, tg
 			resultsCh <- Result{Err: err}
 			return
 		}
-		h.user.NumberOfInputTokens += stream.InputTokens()
-		h.user.NumberOfOutputTokens += int64(outputTokens)
-		h.usersRepo.UpdateUser(h.user)
+		user.NumberOfInputTokens += stream.InputTokens()
+		user.NumberOfOutputTokens += int64(outputTokens)
+		h.usersRepo.UpdateUser(user)
 		h.messagesRepo.AddMessage(models.Interaction{
 			UserMessage: newMessage,
 			AssistantMessage: openai.ChatCompletionMessage{

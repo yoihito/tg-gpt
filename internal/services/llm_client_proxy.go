@@ -44,6 +44,14 @@ func (p *LLMClientProxy) IsClientRegistered(name string) bool {
 	return ok
 }
 
+func (p *LLMClientProxy) ListModels() []string {
+	models := make([]string, 0, len(p.supportedModels))
+	for model := range p.supportedModels {
+		models = append(models, model)
+	}
+	return models
+}
+
 func (p *LLMClientProxy) registerProvider(client ProviderClient) {
 	p.providers[client.Provider()] = client
 }
