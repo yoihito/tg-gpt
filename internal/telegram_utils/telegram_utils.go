@@ -2,95 +2,95 @@ package telegram_utils
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"strings"
 
+	"github.com/sashabaranov/go-openai"
 	tele "gopkg.in/telebot.v3"
-	"vadimgribanov.com/tg-gpt/internal/services"
 )
 
 const MaxTelegramMessageLength = 4096
 const StreamingInterval = 200
 
-type Commands struct {
-	Command string
-	Content string
-	Err     error
+type TelegramStreamer struct {
+	messages           []*tele.Message
+	currentMessage     *tele.Message
+	replyTo            *tele.Message
+	accumulatedMessage string
+	prevLength         int
+	c                  tele.Context
 }
 
-func ShapeStream(ctx context.Context, messagesCh <-chan services.Result) <-chan Commands {
-	commandsCh := make(chan Commands)
-	go func() {
-		defer close(commandsCh)
-		prevLength := 0
-		accumulatedMessage := ""
-		editing := false
-		for message := range messagesCh {
-			if message.Err != nil {
-				slog.ErrorContext(ctx, "Got an error while streaming", "error", message.Err)
-				commandsCh <- Commands{Err: message.Err}
-				return
-			}
-			if len(message.ChunkResponse.Choices) > 0 {
-				slog.DebugContext(ctx, "Preview message chunk", "chunk", message.ChunkResponse)
-				textChunk := message.ChunkResponse.Choices[0].Delta.Content
-				if len(accumulatedMessage)+len(textChunk) >= MaxTelegramMessageLength {
-					if prevLength != len(accumulatedMessage) {
-						commandsCh <- Commands{Command: "edit", Content: accumulatedMessage}
-					}
-					prevLength = 0
-					accumulatedMessage = ""
-					editing = false
+func NewTelegramStreamer(c tele.Context, replyTo *tele.Message) *TelegramStreamer {
+	return &TelegramStreamer{
+		c:        c,
+		replyTo:  replyTo,
+		messages: []*tele.Message{},
+	}
+}
+
+func (t *TelegramStreamer) SendChunk(chunk openai.ChatCompletionStreamResponse) error {
+	ctx := t.c.Get("requestContext").(context.Context)
+	slog.DebugContext(ctx, "Streaming chunk", "chunk", chunk)
+	if len(chunk.Choices) > 0 {
+		textChunk := chunk.Choices[0].Delta.Content
+		if len(t.accumulatedMessage)+len(textChunk) >= MaxTelegramMessageLength {
+			if t.prevLength != len(t.accumulatedMessage) {
+				err := t.Flush()
+				if err != nil {
+					return err
 				}
-
-				accumulatedMessage += textChunk
 			}
-
-			if len(accumulatedMessage)-prevLength < StreamingInterval && message.Status != services.EOFStatus {
-				continue
-			}
-			prevLength = len(accumulatedMessage)
-			if !editing {
-				editing = true
-				commandsCh <- Commands{Command: "start", Content: accumulatedMessage}
-			} else {
-				commandsCh <- Commands{Command: "edit", Content: accumulatedMessage}
-			}
+			t.messages = append(t.messages, t.currentMessage)
+			t.currentMessage = nil
+			t.accumulatedMessage = ""
+			t.prevLength = 0
 		}
-	}()
-	return commandsCh
-}
-
-func SendStream(c tele.Context, replyTo *tele.Message, chunksCh <-chan services.Result) error {
-	ctx := c.Get("requestContext").(context.Context)
-	commandsCh := ShapeStream(ctx, chunksCh)
-	var currentMessage *tele.Message
-	var err error
-	for command := range commandsCh {
-		slog.DebugContext(ctx, "Streaming command", "command", command)
-		if command.Err != nil {
-			slog.ErrorContext(ctx, "Got an error while streaming", "error", command.Err)
-			return c.Send("Failed to answer the message")
+		t.accumulatedMessage += chunk.Choices[0].Delta.Content
+		if len(t.accumulatedMessage)-t.prevLength < StreamingInterval {
+			return nil
 		}
-		if command.Command == "start" {
-			currentMessage, err = c.Bot().Reply(replyTo, FixMarkdown(command.Content), &tele.SendOptions{ParseMode: tele.ModeMarkdown})
-			if err != nil {
-				currentMessage, err = c.Bot().Reply(replyTo, command.Content, &tele.SendOptions{ParseMode: tele.ModeDefault})
-				slog.ErrorContext(ctx, "Retry error", "error", err)
-			}
-		} else if command.Command == "edit" {
-			_, err = c.Bot().Edit(currentMessage, FixMarkdown(command.Content), &tele.SendOptions{ParseMode: tele.ModeMarkdown})
-			if err != nil {
-				_, err = c.Bot().Edit(currentMessage, command.Content, &tele.SendOptions{ParseMode: tele.ModeDefault})
-				slog.ErrorContext(ctx, "Retry error", "error", err)
-			}
-		}
-		if err != nil {
-			slog.ErrorContext(ctx, "Error streaming", "error", err)
-			return c.Send("Failed to answer the message")
-		}
+		t.prevLength = len(t.accumulatedMessage)
+		return t.Flush()
 	}
 	return nil
+}
+
+func (t *TelegramStreamer) Flush() error {
+	ctx := t.c.Get("requestContext").(context.Context)
+	var err error
+	if t.currentMessage == nil {
+		t.currentMessage, err = t.c.Bot().Reply(t.replyTo, FixMarkdown(t.accumulatedMessage), &tele.SendOptions{ParseMode: tele.ModeMarkdown})
+		if err != nil {
+			t.currentMessage, err = t.c.Bot().Reply(t.replyTo, t.accumulatedMessage, &tele.SendOptions{ParseMode: tele.ModeDefault})
+			slog.ErrorContext(ctx, "Error sending message", "error", err)
+		}
+	} else {
+		_, err = t.c.Bot().Edit(t.currentMessage, FixMarkdown(t.accumulatedMessage), &tele.SendOptions{ParseMode: tele.ModeMarkdown})
+		if err != nil {
+			_, err = t.c.Bot().Edit(t.currentMessage, t.accumulatedMessage, &tele.SendOptions{ParseMode: tele.ModeDefault})
+			slog.ErrorContext(ctx, "Error editing message", "error", err)
+		}
+	}
+
+	if err != nil {
+		slog.ErrorContext(ctx, "Error streaming", "error", err)
+		noticeErr := t.c.Send("Failed to answer the message")
+		if noticeErr != nil {
+			slog.ErrorContext(ctx, "Error sending notice", "error", noticeErr)
+		}
+		return errors.Join(err, noticeErr)
+	}
+	return nil
+}
+
+func FixMarkdown(markdown string) string {
+	tag := GetUnclosedTag(markdown)
+	if tag == "" {
+		return markdown
+	}
+	return markdown + tag
 }
 
 func GetUnclosedTag(markdown string) string {
@@ -134,15 +134,4 @@ outer:
 	}
 
 	return currentTag
-}
-func IsValid(markdown string) bool {
-	return GetUnclosedTag(markdown) == ""
-}
-
-func FixMarkdown(markdown string) string {
-	tag := GetUnclosedTag(markdown)
-	if tag == "" {
-		return markdown
-	}
-	return markdown + tag
 }

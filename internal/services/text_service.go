@@ -11,6 +11,7 @@ import (
 	"github.com/sashabaranov/go-openai"
 	"vadimgribanov.com/tg-gpt/internal/adapters"
 	"vadimgribanov.com/tg-gpt/internal/models"
+	"vadimgribanov.com/tg-gpt/internal/telegram_utils"
 )
 
 func NewTextService(client LLMClient, messagesRepo MessagesRepo, usersRepo UsersRepo, dialogTimeout int64) *TextService {
@@ -60,18 +61,24 @@ const (
 
 type StreamedResponse struct{}
 
-func (h *TextService) RetryInteraction(ctx context.Context, user models.User, tgUserMessageId int64, interaction models.Interaction) <-chan Result {
-	return h.handleLLMRequest(ctx, user, tgUserMessageId, interaction.UserMessage)
+func (h *TextService) RetryInteraction(
+	ctx context.Context,
+	user models.User,
+	tgUserMessageId int64,
+	interaction models.Interaction,
+	streamer *telegram_utils.TelegramStreamer,
+) error {
+	return h.handleLLMRequest(ctx, user, tgUserMessageId, interaction.UserMessage, streamer)
 }
 
-func (h *TextService) OnStreamableTextHandler(ctx context.Context, user models.User, tgUserMessageId int64, userText string) <-chan Result {
+func (h *TextService) OnStreamableTextHandler(ctx context.Context, user models.User, tgUserMessageId int64, userText string, streamer *telegram_utils.TelegramStreamer) error {
 	return h.handleLLMRequest(ctx, user, tgUserMessageId, openai.ChatCompletionMessage{
 		Role:    openai.ChatMessageRoleUser,
 		Content: userText,
-	})
+	}, streamer)
 }
 
-func (h *TextService) OnStreamableVisionHandler(ctx context.Context, user models.User, tgUserMessageId int64, userText string, imageUrl string) <-chan Result {
+func (h *TextService) OnStreamableVisionHandler(ctx context.Context, user models.User, tgUserMessageId int64, userText string, imageUrl string, streamer *telegram_utils.TelegramStreamer) error {
 	return h.handleLLMRequest(ctx, user, tgUserMessageId, openai.ChatCompletionMessage{
 		Role: openai.ChatMessageRoleUser,
 		MultiContent: []openai.ChatMessagePart{
@@ -87,85 +94,75 @@ func (h *TextService) OnStreamableVisionHandler(ctx context.Context, user models
 				},
 			},
 		},
-	})
+	}, streamer)
 }
 
-func (h *TextService) handleLLMRequest(ctx context.Context, user models.User, tgUserMessageId int64, newMessage openai.ChatCompletionMessage) <-chan Result {
-	resultsCh := make(chan Result)
-	go func() {
-		defer close(resultsCh)
-		if time.Now().Unix()-user.LastInteraction > h.dialogTimeout {
-			user.StartNewDialog()
-		}
-		user.Touch()
-		err := h.usersRepo.UpdateUser(user)
+func (h *TextService) handleLLMRequest(ctx context.Context, user models.User, tgUserMessageId int64, newMessage openai.ChatCompletionMessage, streamer *telegram_utils.TelegramStreamer) error {
+	if time.Now().Unix()-user.LastInteraction > h.dialogTimeout {
+		user.StartNewDialog()
+	}
+	user.Touch()
+	err := h.usersRepo.UpdateUser(user)
+	if err != nil {
+		return err
+	}
+
+	interactionHistory := h.messagesRepo.GetCurrentDialogForUser(user)
+	history := []openai.ChatCompletionMessage{{
+		Role:    openai.ChatMessageRoleSystem,
+		Content: fmt.Sprintf("You are a helpful assistant. Your name is Johhny. Today is %s. Give short concise answers.", time.Now().Format(time.RFC3339)),
+	}}
+	for _, interaction := range interactionHistory {
+		history = append(history, interaction.UserMessage, interaction.AssistantMessage)
+	}
+	history = append(history, newMessage)
+
+	stream, err := h.client.CreateChatCompletionStream(ctx, openai.ChatCompletionRequest{
+		Model:    user.CurrentModel,
+		Messages: history,
+	})
+	if err != nil {
+		slog.ErrorContext(ctx, "Got an error while creating chat completion stream", "error", err)
+		return err
+	}
+	defer stream.Close()
+
+	accumulator := adapters.StreamAccumulator{}
+	for stream.Next() {
+		response := stream.Current()
+		accumulator.AddChunk(response)
+		err := streamer.SendChunk(response)
 		if err != nil {
-			resultsCh <- Result{Err: err}
-			return
+			slog.ErrorContext(ctx, "Got an error while sending chunk", "error", err)
+			return err
 		}
+	}
 
-		interactionHistory := h.messagesRepo.GetCurrentDialogForUser(user)
-		history := []openai.ChatCompletionMessage{{
-			Role:    openai.ChatMessageRoleSystem,
-			Content: fmt.Sprintf("You are a helpful assistant. Your name is Johhny. Today is %s. Give short concise answers.", time.Now().Format(time.RFC3339)),
-		}}
-		for _, interaction := range interactionHistory {
-			history = append(history, interaction.UserMessage, interaction.AssistantMessage)
-		}
-		history = append(history, newMessage)
-
-		stream, err := h.client.CreateChatCompletionStream(ctx, openai.ChatCompletionRequest{
-			Model:    user.CurrentModel,
-			Messages: history,
-		})
-		if err != nil {
-			slog.ErrorContext(ctx, "Got an error while creating chat completion stream", "error", err)
-			resultsCh <- Result{Err: err}
-			return
-		}
-		defer stream.Close()
-
-		accumulator := adapters.StreamAccumulator{}
-		for stream.Next() {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-				response := stream.Current()
-				accumulator.AddChunk(response)
-				resultsCh <- Result{ChunkResponse: response}
+	if err := stream.Err(); err != nil {
+		if errors.Is(err, io.EOF) {
+			err := streamer.Flush()
+			if err != nil {
+				slog.ErrorContext(ctx, "Got an error while flushing stream", "error", err)
+				return err
 			}
+		} else {
+			slog.ErrorContext(ctx, "Got an error while receiving chat completion stream", "error", err)
+			return err
 		}
+	}
 
-		if err := stream.Err(); err != nil {
-			if errors.Is(err, io.EOF) {
-				resultsCh <- Result{Status: EOFStatus}
-			} else {
-				slog.ErrorContext(ctx, "Got an error while receiving chat completion stream", "error", err)
-				resultsCh <- Result{Err: err}
-				return
-			}
-		}
-
-		outputTokens, err := accumulator.OutputTokens()
-		if err != nil {
-			slog.ErrorContext(ctx, "Got an error while getting output tokens", "error", err)
-			resultsCh <- Result{Err: err}
-			return
-		}
-		user.NumberOfInputTokens += accumulator.InputTokens()
-		user.NumberOfOutputTokens += int64(outputTokens)
-		h.usersRepo.UpdateUser(user)
-		h.messagesRepo.AddMessage(models.Interaction{
-			UserMessage: newMessage,
-			AssistantMessage: openai.ChatCompletionMessage{
-				Role:    openai.ChatMessageRoleAssistant,
-				Content: accumulator.AccumulatedResponse(),
-			},
-			AuthorId:        user.Id,
-			DialogId:        user.CurrentDialogId,
-			TgUserMessageId: tgUserMessageId,
-		})
-	}()
-	return resultsCh
+	user.NumberOfInputTokens += accumulator.InputTokens()
+	user.NumberOfOutputTokens += accumulator.OutputTokens()
+	h.usersRepo.UpdateUser(user)
+	h.messagesRepo.AddMessage(models.Interaction{
+		UserMessage: newMessage,
+		AssistantMessage: openai.ChatCompletionMessage{
+			Role:    openai.ChatMessageRoleAssistant,
+			Content: accumulator.AccumulatedResponse(),
+		},
+		AuthorId:        user.Id,
+		DialogId:        user.CurrentDialogId,
+		TgUserMessageId: tgUserMessageId,
+	})
+	return nil
 }

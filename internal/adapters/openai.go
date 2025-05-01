@@ -19,6 +19,9 @@ func (a *OpenaiAdapter) Provider() string {
 }
 
 func (a *OpenaiAdapter) CreateChatCompletionStream(ctx context.Context, request openai.ChatCompletionRequest) (LLMStream, error) {
+	request.StreamOptions = &openai.StreamOptions{
+		IncludeUsage: true,
+	}
 	stream, err := a.client.CreateChatCompletionStream(ctx, request)
 	if err != nil {
 		return nil, err

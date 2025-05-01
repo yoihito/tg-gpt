@@ -90,8 +90,21 @@ func (h *BotHandler) HandleText(c tele.Context) error {
 		return err
 	}
 	userInput := c.Message().Text
-	chunksCh := h.textService.OnStreamableTextHandler(ctx, user, int64(c.Message().ID), userInput)
-	return telegram_utils.SendStream(c, c.Message(), chunksCh)
+	streamer := telegram_utils.NewTelegramStreamer(c, c.Message())
+
+	err = h.textService.OnStreamableTextHandler(
+		ctx,
+		user,
+		int64(c.Message().ID),
+		userInput,
+		streamer,
+	)
+	if err != nil {
+		slog.ErrorContext(ctx, "Error streaming text", "error", err)
+		c.Send("Failed to answer the message")
+		return err
+	}
+	return nil
 }
 
 func (h *BotHandler) HandleVoice(c tele.Context) error {
@@ -119,14 +132,15 @@ func (h *BotHandler) HandleVoice(c tele.Context) error {
 		return err
 	}
 
-	chunksCh := h.textService.OnStreamableTextHandler(
+	streamer := telegram_utils.NewTelegramStreamer(c, c.Message())
+
+	return h.textService.OnStreamableTextHandler(
 		ctx,
 		user,
 		int64(c.Message().ID),
 		transcriptionText,
+		streamer,
 	)
-
-	return telegram_utils.SendStream(c, c.Message(), chunksCh)
 }
 
 func (h *BotHandler) HandlePhoto(c tele.Context) error {
@@ -157,14 +171,15 @@ func (h *BotHandler) HandlePhoto(c tele.Context) error {
 		return c.Send("Provide image caption")
 	}
 
-	chunksCh := h.textService.OnStreamableVisionHandler(
+	streamer := telegram_utils.NewTelegramStreamer(c, c.Message())
+	return h.textService.OnStreamableVisionHandler(
 		ctx,
 		user,
 		int64(c.Message().ID),
 		userInput,
 		fmt.Sprintf("data:image/jpeg;base64,%s", encodedStr),
+		streamer,
 	)
-	return telegram_utils.SendStream(c, c.Message(), chunksCh)
 }
 
 func (h *BotHandler) RetryLastMessage(c tele.Context) error {
@@ -183,17 +198,21 @@ func (h *BotHandler) RetryLastMessage(c tele.Context) error {
 
 	slog.DebugContext(ctx, "Last interaction with the user", "interaction", interaction)
 
-	var chunksCh <-chan services.Result
+	streamer := telegram_utils.NewTelegramStreamer(c, &tele.Message{
+		ID:   int(interaction.TgUserMessageId),
+		Chat: c.Chat(),
+	})
 	if len(interaction.UserMessage.MultiContent) > 0 {
 		return c.Send("Cannot retry multi-content messages")
 	} else {
-		chunksCh = h.textService.RetryInteraction(ctx, user, interaction.TgUserMessageId, interaction)
+		return h.textService.RetryInteraction(
+			ctx,
+			user,
+			interaction.TgUserMessageId,
+			interaction,
+			streamer,
+		)
 	}
-
-	return telegram_utils.SendStream(c, &tele.Message{
-		ID:   int(interaction.TgUserMessageId),
-		Chat: c.Chat(),
-	}, chunksCh)
 }
 
 func (h *BotHandler) ListModels(c tele.Context) error {

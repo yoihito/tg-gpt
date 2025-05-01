@@ -2,6 +2,7 @@ package logging
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 )
@@ -14,8 +15,11 @@ func (h *ContextHandler) Handle(ctx context.Context, r slog.Record) error {
 	if requestID, ok := ctx.Value("request_id").(string); ok {
 		r.AddAttrs(slog.String("request_id", requestID))
 	}
-	if userID, ok := ctx.Value("user_id").(string); ok {
-		r.AddAttrs(slog.String("user_id", userID))
+	if userID, ok := ctx.Value("user_id").(int64); ok {
+		r.AddAttrs(slog.String("user_id", fmt.Sprintf("%d", userID)))
+	}
+	if tgUserID, ok := ctx.Value("tg_user_id").(int64); ok {
+		r.AddAttrs(slog.String("tg_user_id", fmt.Sprintf("%d", tgUserID)))
 	}
 	return h.Handler.Handle(ctx, r)
 }
@@ -29,7 +33,7 @@ func SetupLogger(ctx context.Context) error {
 			return err
 		}
 	}
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: &logLevel, AddSource: true}))
+	logger := slog.New(&ContextHandler{slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: &logLevel, AddSource: true})})
 	slog.SetDefault(logger)
 	return nil
 }

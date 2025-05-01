@@ -8,10 +8,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/joho/godotenv"
 
 	tele "gopkg.in/telebot.v3"
-	tele_middleware "gopkg.in/telebot.v3/middleware"
 	"vadimgribanov.com/tg-gpt/internal/config"
 	"vadimgribanov.com/tg-gpt/internal/delivery/tgbot"
 	"vadimgribanov.com/tg-gpt/internal/middleware"
@@ -74,13 +74,18 @@ func main() {
 		slog.ErrorContext(ctx, "Error creating bot", "error", err)
 		return
 	}
+	// b.Use(tele_middleware.Recover(func(err error) {
+	// 	slog.ErrorContext(ctx, "Error in middleware", "error", err)
+	// }))
 	b.Use(func(next tele.HandlerFunc) tele.HandlerFunc {
 		return func(c tele.Context) error {
-			c.Set("requestContext", ctx)
+			newCtx := context.WithValue(ctx, "tg_user_id", c.Sender().ID)
+			requestID := uuid.New().String()
+			newCtx = context.WithValue(newCtx, "request_id", requestID)
+			c.Set("requestContext", newCtx)
 			return next(c)
 		}
 	})
-	b.Use(tele_middleware.Recover())
 	b.Use(middleware.Logger())
 	b.Use(authenticator.Middleware())
 

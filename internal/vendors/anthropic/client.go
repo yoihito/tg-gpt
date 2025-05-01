@@ -64,7 +64,7 @@ func (c *Client) rawRequest(ctx context.Context, payload []byte) (*http.Response
 		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, errors.New(fmt.Sprintf("Server returned non-200 status: %d %s", resp.StatusCode, resp.Status))
+		return resp, fmt.Errorf("server returned non-200 status: %d %s", resp.StatusCode, resp.Status)
 	}
 	return resp, nil
 }
@@ -82,7 +82,7 @@ func (s *StreamedResponse) Close() {
 	s.resp.Body.Close()
 }
 
-func (s *StreamedResponse) Recv() (ContentBlockDeltaData, error) {
+func (s *StreamedResponse) Recv() (any, error) {
 	for {
 		rawLine, err := s.reader.ReadBytes('\n')
 		if err != nil {
@@ -98,12 +98,7 @@ func (s *StreamedResponse) Recv() (ContentBlockDeltaData, error) {
 			return ContentBlockDeltaData{}, err
 		}
 
-		switch typedData := data.(type) {
-		case ContentBlockDeltaData:
-			return typedData, err
-		default:
-			continue
-		}
+		return data, nil
 	}
 }
 
@@ -197,11 +192,16 @@ type ContentBlockStopData struct {
 }
 
 type MessageDeltaData struct {
-	Type  string      `json:"type"`
-	Delta interface{} `json:"delta"`
+	Type  string `json:"type"`
+	Delta Delta  `json:"delta"`
 	Usage struct {
 		OutputTokens int `json:"output_tokens"`
 	} `json:"usage"`
+}
+
+type Delta struct {
+	StopReason   string `json:"stop_reason,omitempty"`
+	StopSequence string `json:"stop_sequence,omitempty"`
 }
 
 type MessageStopData struct {

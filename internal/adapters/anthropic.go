@@ -59,12 +59,31 @@ func (a *AnthropicStreamAdapter) Next() bool {
 		a.err = err
 		return false
 	}
-	a.current = openai.ChatCompletionStreamResponse{
-		Choices: []openai.ChatCompletionStreamChoice{
-			{
-				Delta: openai.ChatCompletionStreamChoiceDelta{Content: resp.Delta.Text},
+	switch typedData := resp.(type) {
+	case anthropic.ContentBlockDeltaData:
+		a.current = openai.ChatCompletionStreamResponse{
+			Choices: []openai.ChatCompletionStreamChoice{
+				{
+					Delta: openai.ChatCompletionStreamChoiceDelta{Content: typedData.Delta.Text},
+				},
 			},
-		},
+		}
+	case anthropic.MessageDeltaData:
+		a.current = openai.ChatCompletionStreamResponse{
+			Usage: &openai.Usage{
+				PromptTokens:     0,
+				CompletionTokens: typedData.Usage.OutputTokens,
+				TotalTokens:      0,
+			},
+		}
+	case anthropic.MessageStartData:
+		a.current = openai.ChatCompletionStreamResponse{
+			Usage: &openai.Usage{
+				PromptTokens:     typedData.Message.Usage.InputTokens,
+				CompletionTokens: 0,
+				TotalTokens:      0,
+			},
+		}
 	}
 	return true
 }
