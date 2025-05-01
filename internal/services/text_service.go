@@ -58,6 +58,8 @@ const (
 	MessagePartTypeImage MessagePartType = "image"
 )
 
+type StreamedResponse struct{}
+
 func (h *TextService) RetryInteraction(ctx context.Context, user models.User, tgUserMessageId int64, interaction models.Interaction) <-chan Result {
 	return h.handleLLMRequest(ctx, user, tgUserMessageId, interaction.UserMessage)
 }
@@ -123,40 +125,42 @@ func (h *TextService) handleLLMRequest(ctx context.Context, user models.User, tg
 		}
 		defer stream.Close()
 
-	streamLoop:
-		for {
+		accumulator := adapters.StreamAccumulator{}
+		for stream.Next() {
 			select {
 			case <-ctx.Done():
 				return
 			default:
-				response, err := stream.Recv()
-				if errors.Is(err, io.EOF) {
-					resultsCh <- Result{Status: EOFStatus}
-					break streamLoop
-				}
-				if err != nil {
-					slog.ErrorContext(ctx, "Got an error while receiving chat completion stream", "error", err)
-					resultsCh <- Result{Err: err}
-					return
-				}
+				response := stream.Current()
+				accumulator.AddChunk(response)
 				resultsCh <- Result{ChunkResponse: response}
 			}
 		}
 
-		outputTokens, err := stream.OutputTokens()
+		if err := stream.Err(); err != nil {
+			if errors.Is(err, io.EOF) {
+				resultsCh <- Result{Status: EOFStatus}
+			} else {
+				slog.ErrorContext(ctx, "Got an error while receiving chat completion stream", "error", err)
+				resultsCh <- Result{Err: err}
+				return
+			}
+		}
+
+		outputTokens, err := accumulator.OutputTokens()
 		if err != nil {
 			slog.ErrorContext(ctx, "Got an error while getting output tokens", "error", err)
 			resultsCh <- Result{Err: err}
 			return
 		}
-		user.NumberOfInputTokens += stream.InputTokens()
+		user.NumberOfInputTokens += accumulator.InputTokens()
 		user.NumberOfOutputTokens += int64(outputTokens)
 		h.usersRepo.UpdateUser(user)
 		h.messagesRepo.AddMessage(models.Interaction{
 			UserMessage: newMessage,
 			AssistantMessage: openai.ChatCompletionMessage{
 				Role:    openai.ChatMessageRoleAssistant,
-				Content: stream.AccumulatedResponse(),
+				Content: accumulator.AccumulatedResponse(),
 			},
 			AuthorId:        user.Id,
 			DialogId:        user.CurrentDialogId,

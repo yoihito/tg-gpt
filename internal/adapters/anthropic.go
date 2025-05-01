@@ -48,40 +48,39 @@ func (a *AnthropicAdapter) CreateChatCompletionStream(ctx context.Context, reque
 }
 
 type AnthropicStreamAdapter struct {
-	stream              *anthropic.StreamedResponse
-	accumulatedResponse string
+	stream  *anthropic.StreamedResponse
+	current openai.ChatCompletionStreamResponse
+	err     error
 }
 
-func (a *AnthropicStreamAdapter) Recv() (openai.ChatCompletionStreamResponse, error) {
+func (a *AnthropicStreamAdapter) Next() bool {
 	resp, err := a.stream.Recv()
 	if err != nil {
-		return openai.ChatCompletionStreamResponse{}, err
+		a.err = err
+		return false
 	}
-
-	a.accumulatedResponse += resp.Delta.Text
-	return openai.ChatCompletionStreamResponse{
+	a.current = openai.ChatCompletionStreamResponse{
 		Choices: []openai.ChatCompletionStreamChoice{
 			{
-				Delta: openai.ChatCompletionStreamChoiceDelta{
-					Content: resp.Delta.Text,
-				},
+				Delta: openai.ChatCompletionStreamChoiceDelta{Content: resp.Delta.Text},
 			},
 		},
-	}, nil
+	}
+	return true
 }
 
-func (a *AnthropicStreamAdapter) InputTokens() int64 {
-	return 0
+func (a *AnthropicStreamAdapter) Current() openai.ChatCompletionStreamResponse {
+	return a.current
 }
 
-func (a *AnthropicStreamAdapter) OutputTokens() (int, error) {
-	return 0, nil
+func (a *AnthropicStreamAdapter) Err() error {
+	return a.err
 }
 
-func (a *AnthropicStreamAdapter) AccumulatedResponse() string {
-	return a.accumulatedResponse
-}
-
-func (a *AnthropicStreamAdapter) Close() {
+func (a *AnthropicStreamAdapter) Close() error {
+	if a.stream == nil {
+		return nil
+	}
 	a.stream.Close()
+	return nil
 }
