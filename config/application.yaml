@@ -9,6 +9,9 @@ models:
   - name: GPT-4o-mini
     model_id: gpt-4o-mini-2024-07-18
     provider: openai
+  - name: GPT-4.1
+    model_id: gpt-4.1-2025-04-14
+    provider: openai
   - name: GPT-o1
     model_id: o1-2024-12-17
     provider: openai
