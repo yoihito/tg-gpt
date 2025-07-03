@@ -35,8 +35,8 @@ type LLMClient interface {
 }
 
 type MessagesRepo interface {
-	AddMessage(message models.Interaction)
-	GetCurrentDialogForUser(user models.User) []models.Interaction
+	AddMessage(message models.Interaction) error
+	GetCurrentDialogForUser(user models.User) ([]models.Interaction, error)
 	PopLatestInteraction(user models.User) (models.Interaction, error)
 }
 
@@ -107,7 +107,11 @@ func (h *TextService) handleLLMRequest(ctx context.Context, user models.User, tg
 		return err
 	}
 
-	interactionHistory := h.messagesRepo.GetCurrentDialogForUser(user)
+	interactionHistory, err := h.messagesRepo.GetCurrentDialogForUser(user)
+	if err != nil {
+		slog.ErrorContext(ctx, "Error getting current dialog for user", "error", err)
+		return err
+	}
 	history := []openai.ChatCompletionMessage{{
 		Role:    openai.ChatMessageRoleSystem,
 		Content: fmt.Sprintf("You are a helpful assistant. Your name is Johhny. Today is %s. Give short concise answers.", time.Now().Format(time.RFC3339)),
@@ -154,7 +158,7 @@ func (h *TextService) handleLLMRequest(ctx context.Context, user models.User, tg
 	user.NumberOfInputTokens += accumulator.InputTokens()
 	user.NumberOfOutputTokens += accumulator.OutputTokens()
 	h.usersRepo.UpdateUser(user)
-	h.messagesRepo.AddMessage(models.Interaction{
+	err = h.messagesRepo.AddMessage(models.Interaction{
 		UserMessage: newMessage,
 		AssistantMessage: openai.ChatCompletionMessage{
 			Role:    openai.ChatMessageRoleAssistant,
@@ -164,5 +168,9 @@ func (h *TextService) handleLLMRequest(ctx context.Context, user models.User, tg
 		DialogId:        user.CurrentDialogId,
 		TgUserMessageId: tgUserMessageId,
 	})
+	if err != nil {
+		slog.ErrorContext(ctx, "Error adding message", "error", err)
+		return err
+	}
 	return nil
 }

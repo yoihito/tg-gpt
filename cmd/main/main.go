@@ -13,6 +13,7 @@ import (
 
 	tele "gopkg.in/telebot.v3"
 	"vadimgribanov.com/tg-gpt/internal/config"
+	"vadimgribanov.com/tg-gpt/internal/database"
 	"vadimgribanov.com/tg-gpt/internal/delivery/tgbot"
 	"vadimgribanov.com/tg-gpt/internal/middleware"
 	"vadimgribanov.com/tg-gpt/internal/repositories"
@@ -34,9 +35,28 @@ func main() {
 	appConfig, err := config.LoadConfig()
 	if err != nil {
 		slog.ErrorContext(ctx, "Error loading config", "error", err)
+		return
 	}
 
-	messagesRepo := repositories.NewMessagesRepo()
+	// Initialize database
+	dbPath := os.Getenv("DATABASE_PATH")
+	if dbPath == "" {
+		dbPath = "data/tg-gpt.db"
+	}
+	
+	db, err := database.NewDB(dbPath)
+	if err != nil {
+		slog.ErrorContext(ctx, "Error initializing database", "error", err)
+		return
+	}
+	defer db.Close()
+
+	if err := db.Migrate(); err != nil {
+		slog.ErrorContext(ctx, "Error running database migrations", "error", err)
+		return
+	}
+
+	messagesRepo := repositories.NewMessagesRepo(db)
 
 	allowedUserIDsStr := os.Getenv("ALLOWED_USER_ID")
 	allowedUserIDs := make([]int64, 0)
@@ -48,7 +68,7 @@ func main() {
 		}
 		allowedUserIDs = append(allowedUserIDs, id)
 	}
-	userRepo := repositories.NewUserRepo()
+	userRepo := repositories.NewUserRepo(db)
 	dialogTimeout := int64(appConfig.DialogTimeout)
 	maxConcurrentRequests := appConfig.MaxConcurrentRequests
 	rateLimiter := middleware.RateLimiter{MaxConcurrentRequests: maxConcurrentRequests}
