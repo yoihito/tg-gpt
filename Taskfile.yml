@@ -14,8 +14,18 @@ tasks:
             - ssh root@$REMOTE_HOST "cp /home/bot/tg-bot /home/bot/tg-bot.bak"
             - rsync -avz bin/tg-bot root@$REMOTE_HOST:/home/bot
             - rsync -avz config root@$REMOTE_HOST:/home/bot 
-            - ssh root@$REMOTE_HOST "sudo supervisorctl restart mytgbot"
+            - ssh root@$REMOTE_HOST "sudo systemctl reload-daemon"
+            - ssh root@$REMOTE_HOST "sudo systemctl restart mytgbot"
     rollback:
         cmds:
             - ssh root@$REMOTE_HOST "cp -f /home/bot/tg-bot.bak /home/bot/tg-bot"
-            - ssh root@$REMOTE_HOST "sudo supervisorctl restart mytgbot"
+            - ssh root@$REMOTE_HOST "sudo systemctl reload-daemon"
+            - ssh root@$REMOTE_HOST "sudo systemctl restart mytgbot"
+    logs:
+        cmds:
+            - ssh root@$REMOTE_HOST "sudo journalctl -u mytgbot -f"
+        desc: "View service logs"
+    status:
+        cmds:
+            - ssh root@$REMOTE_HOST "sudo systemctl status mytgbot"
+        desc: "Check service status"
