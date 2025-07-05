@@ -35,6 +35,12 @@ func (t *TelegramStreamer) SendChunk(chunk openai.ChatCompletionStreamResponse) 
 	slog.DebugContext(ctx, "Streaming chunk", "chunk", chunk)
 	if len(chunk.Choices) > 0 {
 		textChunk := chunk.Choices[0].Delta.Content
+
+		// Skip empty content chunks
+		if textChunk == "" {
+			return nil
+		}
+
 		if len(t.accumulatedMessage)+len(textChunk) >= MaxTelegramMessageLength {
 			if t.prevLength != len(t.accumulatedMessage) {
 				err := t.Flush()
@@ -47,7 +53,7 @@ func (t *TelegramStreamer) SendChunk(chunk openai.ChatCompletionStreamResponse) 
 			t.accumulatedMessage = ""
 			t.prevLength = 0
 		}
-		t.accumulatedMessage += chunk.Choices[0].Delta.Content
+		t.accumulatedMessage += textChunk
 		if len(t.accumulatedMessage)-t.prevLength < StreamingInterval {
 			return nil
 		}
@@ -59,18 +65,24 @@ func (t *TelegramStreamer) SendChunk(chunk openai.ChatCompletionStreamResponse) 
 
 func (t *TelegramStreamer) Flush() error {
 	ctx := t.c.Get("requestContext").(context.Context)
+
+	// Don't send empty messages
+	if strings.TrimSpace(t.accumulatedMessage) == "" {
+		return nil
+	}
+
 	var err error
 	if t.currentMessage == nil {
 		t.currentMessage, err = t.c.Bot().Reply(t.replyTo, FixMarkdown(t.accumulatedMessage), &tele.SendOptions{ParseMode: tele.ModeMarkdown})
 		if err != nil {
 			t.currentMessage, err = t.c.Bot().Reply(t.replyTo, t.accumulatedMessage, &tele.SendOptions{ParseMode: tele.ModeDefault})
-			slog.ErrorContext(ctx, "Error sending message", "error", err)
+			slog.ErrorContext(ctx, "Error sending message", "error", err, "message", t.accumulatedMessage)
 		}
 	} else {
 		_, err = t.c.Bot().Edit(t.currentMessage, FixMarkdown(t.accumulatedMessage), &tele.SendOptions{ParseMode: tele.ModeMarkdown})
 		if err != nil {
 			_, err = t.c.Bot().Edit(t.currentMessage, t.accumulatedMessage, &tele.SendOptions{ParseMode: tele.ModeDefault})
-			slog.ErrorContext(ctx, "Error editing message", "error", err)
+			slog.ErrorContext(ctx, "Error editing message", "error", err, "message", t.accumulatedMessage)
 		}
 	}
 

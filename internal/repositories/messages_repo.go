@@ -144,18 +144,22 @@ func (repo *MessagesRepo) insertMessage(tx *sql.Tx, interactionID int64, role st
 	var content string
 	var multiContent sql.NullString
 	
-	// Handle regular content
-	if message.Content != "" {
-		content = message.Content
-	}
-	
-	// Handle multi-content messages
+	// Handle multi-content messages first
 	if len(message.MultiContent) > 0 {
 		jsonData, err := json.Marshal(message.MultiContent)
 		if err != nil {
 			return fmt.Errorf("failed to serialize multi-content: %w", err)
 		}
 		multiContent = sql.NullString{String: string(jsonData), Valid: true}
+		// When MultiContent is used, content should be empty in the DB
+		content = ""
+	} else {
+		// Handle regular content - ensure it's never empty
+		if message.Content == "" {
+			content = " " // Use space as fallback for empty content
+		} else {
+			content = message.Content
+		}
 	}
 	
 	query := `INSERT INTO messages (interaction_id, role, content, multi_content) VALUES (?, ?, ?, ?)`
@@ -181,20 +185,39 @@ func (repo *MessagesRepo) loadMessages(interactionID int64, interaction *models.
 		
 		if role == "user" {
 			interaction.UserMessage.Role = "user"
-			interaction.UserMessage.Content = content
 			if multiContent.Valid {
 				var multiContentData []openai.ChatMessagePart
 				if err := json.Unmarshal([]byte(multiContent.String), &multiContentData); err == nil {
 					interaction.UserMessage.MultiContent = multiContentData
+					// When MultiContent is used, Content should be empty
+					interaction.UserMessage.Content = ""
+				} else {
+					// Fallback to regular content if MultiContent parsing fails
+					interaction.UserMessage.Content = content
+				}
+			} else {
+				// Ensure content is never empty/null
+				if content == "" {
+					interaction.UserMessage.Content = " " // Use space as fallback
+				} else {
+					interaction.UserMessage.Content = content
 				}
 			}
 		} else if role == "assistant" {
 			interaction.AssistantMessage.Role = "assistant"
-			interaction.AssistantMessage.Content = content
 			if multiContent.Valid {
 				var multiContentData []openai.ChatMessagePart
 				if err := json.Unmarshal([]byte(multiContent.String), &multiContentData); err == nil {
 					interaction.AssistantMessage.MultiContent = multiContentData
+					interaction.AssistantMessage.Content = ""
+				} else {
+					interaction.AssistantMessage.Content = content
+				}
+			} else {
+				if content == "" {
+					interaction.AssistantMessage.Content = " " // Use space as fallback
+				} else {
+					interaction.AssistantMessage.Content = content
 				}
 			}
 		}
@@ -221,20 +244,39 @@ func (repo *MessagesRepo) loadMessagesWithTx(tx *sql.Tx, interactionID int64, in
 		
 		if role == "user" {
 			interaction.UserMessage.Role = "user"
-			interaction.UserMessage.Content = content
 			if multiContent.Valid {
 				var multiContentData []openai.ChatMessagePart
 				if err := json.Unmarshal([]byte(multiContent.String), &multiContentData); err == nil {
 					interaction.UserMessage.MultiContent = multiContentData
+					// When MultiContent is used, Content should be empty
+					interaction.UserMessage.Content = ""
+				} else {
+					// Fallback to regular content if MultiContent parsing fails
+					interaction.UserMessage.Content = content
+				}
+			} else {
+				// Ensure content is never empty/null
+				if content == "" {
+					interaction.UserMessage.Content = " " // Use space as fallback
+				} else {
+					interaction.UserMessage.Content = content
 				}
 			}
 		} else if role == "assistant" {
 			interaction.AssistantMessage.Role = "assistant"
-			interaction.AssistantMessage.Content = content
 			if multiContent.Valid {
 				var multiContentData []openai.ChatMessagePart
 				if err := json.Unmarshal([]byte(multiContent.String), &multiContentData); err == nil {
 					interaction.AssistantMessage.MultiContent = multiContentData
+					interaction.AssistantMessage.Content = ""
+				} else {
+					interaction.AssistantMessage.Content = content
+				}
+			} else {
+				if content == "" {
+					interaction.AssistantMessage.Content = " " // Use space as fallback
+				} else {
+					interaction.AssistantMessage.Content = content
 				}
 			}
 		}

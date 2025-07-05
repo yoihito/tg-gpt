@@ -43,7 +43,7 @@ func main() {
 	if dbPath == "" {
 		dbPath = "data/tg-gpt.db"
 	}
-	
+
 	db, err := database.NewDB(dbPath)
 	if err != nil {
 		slog.ErrorContext(ctx, "Error initializing database", "error", err)
@@ -57,6 +57,7 @@ func main() {
 	}
 
 	messagesRepo := repositories.NewMessagesRepo(db)
+	memoryRepo := repositories.NewMemoryRepo(db)
 
 	allowedUserIDsStr := os.Getenv("ALLOWED_USER_ID")
 	allowedUserIDs := make([]int64, 0)
@@ -74,10 +75,12 @@ func main() {
 	rateLimiter := middleware.RateLimiter{MaxConcurrentRequests: maxConcurrentRequests}
 	authenticator := middleware.UserAuthenticator{UserRepo: userRepo, AllowedUserIds: allowedUserIDs, AppConfig: *appConfig}
 	llmClientProxy := services.NewClientProxyFromConfig(appConfig)
+	memoryService := services.NewMemoryService(memoryRepo)
 	textService := services.NewTextService(
 		llmClientProxy,
 		messagesRepo,
 		userRepo,
+		memoryService,
 		dialogTimeout,
 	)
 	voiceService := &services.VoiceService{

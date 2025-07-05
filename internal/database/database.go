@@ -34,11 +34,12 @@ func NewDB(dbPath string) (*DB, error) {
 
 func (db *DB) Migrate() error {
 	slog.Info("Running database migrations")
-	
+
 	migrations := []string{
 		createUsersTable,
 		createInteractionsTable,
 		createMessagesTable,
+		createMemoriesTable,
 	}
 
 	for i, migration := range migrations {
@@ -89,4 +90,16 @@ CREATE TABLE IF NOT EXISTS messages (
 	multi_content TEXT, -- JSON for multi-content messages
 	created_at INTEGER DEFAULT (strftime('%s', 'now')),
 	FOREIGN KEY (interaction_id) REFERENCES interactions(id)
+);`
+
+const createMemoriesTable = `
+CREATE TABLE IF NOT EXISTS memories (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	user_id INTEGER NOT NULL,
+	memory_key TEXT NOT NULL,
+	memory_value TEXT NOT NULL,
+	created_at INTEGER DEFAULT (strftime('%s', 'now')),
+	updated_at INTEGER DEFAULT (strftime('%s', 'now')),
+	FOREIGN KEY (user_id) REFERENCES users(id),
+	UNIQUE(user_id, memory_key)
 );`

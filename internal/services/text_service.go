@@ -14,11 +14,12 @@ import (
 	"vadimgribanov.com/tg-gpt/internal/telegram_utils"
 )
 
-func NewTextService(client LLMClient, messagesRepo MessagesRepo, usersRepo UsersRepo, dialogTimeout int64) *TextService {
+func NewTextService(client LLMClient, messagesRepo MessagesRepo, usersRepo UsersRepo, memoryService *MemoryService, dialogTimeout int64) *TextService {
 	return &TextService{
 		client:        client,
 		messagesRepo:  messagesRepo,
 		usersRepo:     usersRepo,
+		memoryService: memoryService,
 		dialogTimeout: dialogTimeout,
 	}
 }
@@ -27,6 +28,7 @@ type TextService struct {
 	client        LLMClient
 	messagesRepo  MessagesRepo
 	usersRepo     UsersRepo
+	memoryService *MemoryService
 	dialogTimeout int64
 }
 
@@ -113,56 +115,94 @@ func (h *TextService) handleLLMRequest(ctx context.Context, user models.User, tg
 		return err
 	}
 	history := []openai.ChatCompletionMessage{{
-		Role:    openai.ChatMessageRoleSystem,
-		Content: fmt.Sprintf("You are a helpful assistant. Your name is Johhny. Today is %s. Give short concise answers.", time.Now().Format(time.RFC3339)),
+		Role: openai.ChatMessageRoleSystem,
+		Content: fmt.Sprintf(
+			"You are a helpful assistant. Your name is Johhny. You are provided with a list of memories about the user. Additionally, you can add new records to your memory. IT IS VERY IMPORTANT to capture all smallest details about the user. Today is %s. Give short concise answers.\n<memories>%s</memories>",
+			time.Now().Format(time.RFC3339),
+			h.memoryService.GetMemoryContext(user.Id),
+		),
 	}}
 	for _, interaction := range interactionHistory {
 		history = append(history, interaction.UserMessage, interaction.AssistantMessage)
 	}
 	history = append(history, newMessage)
 
-	stream, err := h.client.CreateChatCompletionStream(ctx, openai.ChatCompletionRequest{
-		Model:    user.CurrentModel,
-		Messages: history,
-	})
-	if err != nil {
-		slog.ErrorContext(ctx, "Got an error while creating chat completion stream", "error", err)
-		return err
-	}
-	defer stream.Close()
-
-	accumulator := adapters.StreamAccumulator{}
-	for stream.Next() {
-		response := stream.Current()
-		accumulator.AddChunk(response)
-		err := streamer.SendChunk(response)
+	accumulatedInputTokens := int64(0)
+	accumulatedOutputTokens := int64(0)
+	accumulatedResponse := ""
+	for {
+		stream, err := h.client.CreateChatCompletionStream(ctx, openai.ChatCompletionRequest{
+			Model:      user.CurrentModel,
+			Messages:   history,
+			Tools:      h.memoryService.GetMemoryTools(),
+			ToolChoice: "auto",
+		})
 		if err != nil {
-			slog.ErrorContext(ctx, "Got an error while sending chunk", "error", err)
+			slog.ErrorContext(ctx, "Got an error while creating chat completion stream", "error", err)
 			return err
 		}
-	}
+		defer stream.Close()
 
-	if err := stream.Err(); err != nil {
-		if errors.Is(err, io.EOF) {
-			err := streamer.Flush()
+		accumulator := adapters.NewStreamAccumulator()
+		for stream.Next() {
+			response := stream.Current()
+			accumulator.AddChunk(response)
+			err := streamer.SendChunk(response)
 			if err != nil {
-				slog.ErrorContext(ctx, "Got an error while flushing stream", "error", err)
+				slog.ErrorContext(ctx, "Got an error while sending chunk", "error", err)
 				return err
 			}
+		}
+
+		if err := stream.Err(); err != nil {
+			if errors.Is(err, io.EOF) {
+				err := streamer.Flush()
+				if err != nil {
+					slog.ErrorContext(ctx, "Got an error while flushing stream", "error", err)
+					return err
+				}
+			} else {
+				slog.ErrorContext(ctx, "Got an error while receiving chat completion stream", "error", err)
+				return err
+			}
+		}
+		accumulatedInputTokens += accumulator.InputTokens()
+		accumulatedOutputTokens += accumulator.OutputTokens()
+		accumulatedResponse = accumulator.AccumulatedResponse()
+
+		if accumulator.HasToolCalls() {
+			slog.InfoContext(ctx, "Has tool calls", "toolCalls", accumulator.GetToolCalls())
+			toolCalls := accumulator.GetToolCalls()
+			history = append(history, openai.ChatCompletionMessage{
+				Role:      openai.ChatMessageRoleAssistant,
+				Content:   accumulatedResponse,
+				ToolCalls: toolCalls,
+			})
+			for _, toolCall := range toolCalls {
+				result, err := h.memoryService.HandleToolCall(user.Id, toolCall)
+				history = append(history, openai.ChatCompletionMessage{
+					Role:       openai.ChatMessageRoleTool,
+					ToolCallID: toolCall.ID,
+					Content:    result,
+				})
+				if err != nil {
+					slog.ErrorContext(ctx, "Error handling tool call", "error", err)
+					return err
+				}
+			}
 		} else {
-			slog.ErrorContext(ctx, "Got an error while receiving chat completion stream", "error", err)
-			return err
+			break
 		}
 	}
 
-	user.NumberOfInputTokens += accumulator.InputTokens()
-	user.NumberOfOutputTokens += accumulator.OutputTokens()
+	user.NumberOfInputTokens += accumulatedInputTokens
+	user.NumberOfOutputTokens += accumulatedOutputTokens
 	h.usersRepo.UpdateUser(user)
 	err = h.messagesRepo.AddMessage(models.Interaction{
 		UserMessage: newMessage,
 		AssistantMessage: openai.ChatCompletionMessage{
 			Role:    openai.ChatMessageRoleAssistant,
-			Content: accumulator.AccumulatedResponse(),
+			Content: accumulatedResponse,
 		},
 		AuthorId:        user.Id,
 		DialogId:        user.CurrentDialogId,
