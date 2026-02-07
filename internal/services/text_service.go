@@ -14,13 +14,14 @@ import (
 	"vadimgribanov.com/tg-gpt/internal/telegram_utils"
 )
 
-func NewTextService(client LLMClient, messagesRepo MessagesRepo, usersRepo UsersRepo, memoryService *MemoryService, dialogTimeout int64) *TextService {
+func NewTextService(client LLMClient, messagesRepo MessagesRepo, usersRepo UsersRepo, memoryService *MemoryService, dialogTimeout int64, defaultModel string) *TextService {
 	return &TextService{
 		client:        client,
 		messagesRepo:  messagesRepo,
 		usersRepo:     usersRepo,
 		memoryService: memoryService,
 		dialogTimeout: dialogTimeout,
+		defaultModel:  defaultModel,
 	}
 }
 
@@ -30,10 +31,12 @@ type TextService struct {
 	usersRepo     UsersRepo
 	memoryService *MemoryService
 	dialogTimeout int64
+	defaultModel  string
 }
 
 type LLMClient interface {
 	CreateChatCompletionStream(ctx context.Context, request openai.ChatCompletionRequest) (adapters.LLMStream, error)
+	IsClientRegistered(modelId string) bool
 }
 
 type MessagesRepo interface {
@@ -47,6 +50,10 @@ type UsersRepo interface {
 }
 
 const EOFStatus = "EOF"
+const AssistantPrompt = `
+You are a helpful assistant. Your name is Johhny. You are provided with a list of memories about the user. Additionally, you can add new records to your memory. IT IS VERY IMPORTANT to capture all the smallest details about the user. Today is %s. Give short concise answers.
+<memories>%s</memories>
+`
 
 type Result struct {
 	Status        string
@@ -104,6 +111,17 @@ func (h *TextService) handleLLMRequest(ctx context.Context, user models.User, tg
 		user.StartNewDialog()
 	}
 	user.Touch()
+
+	// Validate user's current model and fallback to default if not supported
+	modelToUse := user.CurrentModel
+	if !h.client.IsClientRegistered(modelToUse) {
+		slog.WarnContext(ctx, "User's current model not supported, falling back to default",
+			"currentModel", modelToUse,
+			"defaultModel", h.defaultModel)
+		modelToUse = h.defaultModel
+		user.CurrentModel = h.defaultModel
+	}
+
 	err := h.usersRepo.UpdateUser(user)
 	if err != nil {
 		return err
@@ -117,7 +135,7 @@ func (h *TextService) handleLLMRequest(ctx context.Context, user models.User, tg
 	history := []openai.ChatCompletionMessage{{
 		Role: openai.ChatMessageRoleSystem,
 		Content: fmt.Sprintf(
-			"You are a helpful assistant. Your name is Johhny. You are provided with a list of memories about the user. Additionally, you can add new records to your memory. IT IS VERY IMPORTANT to capture all smallest details about the user. Today is %s. Give short concise answers.\n<memories>%s</memories>",
+			AssistantPrompt,
 			time.Now().Format(time.RFC3339),
 			h.memoryService.GetMemoryContext(user.Id),
 		),
@@ -132,7 +150,7 @@ func (h *TextService) handleLLMRequest(ctx context.Context, user models.User, tg
 	accumulatedResponse := ""
 	for {
 		stream, err := h.client.CreateChatCompletionStream(ctx, openai.ChatCompletionRequest{
-			Model:      user.CurrentModel,
+			Model:      modelToUse,
 			Messages:   history,
 			Tools:      h.memoryService.GetMemoryTools(),
 			ToolChoice: "auto",

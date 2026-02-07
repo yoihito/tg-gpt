@@ -82,6 +82,7 @@ func main() {
 		userRepo,
 		memoryService,
 		dialogTimeout,
+		appConfig.DefaultModel.ModelId,
 	)
 	voiceService := &services.VoiceService{
 		Client: llmClientProxy.OpenaiClient,

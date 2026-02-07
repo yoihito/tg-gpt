@@ -1,23 +1,8 @@
 dialog_timeout: 1800
 max_concurrent_requests: 1
 default_model:
-  model_id: gpt-4o-2024-08-06
+  model_id: gpt-5.2
 models:
-  - name: GPT-4o
-    model_id: gpt-4o-2024-08-06
+  - name: GPT-5.2
+    model_id: gpt-5.2
     provider: openai
-  - name: GPT-4o-mini
-    model_id: gpt-4o-mini-2024-07-18
-    provider: openai
-  - name: GPT-4.1
-    model_id: gpt-4.1-2025-04-14
-    provider: openai
-  - name: o4-mini
-    model_id: o4-mini-2025-04-16
-    provider: openai
-  # - name: o3
-  #   model_id: o3-2025-04-16
-  #   provider: openai
-  - name: Claude 3.5 Sonnet v2
-    model_id: claude-3-5-sonnet-20241022
-    provider: anthropic
