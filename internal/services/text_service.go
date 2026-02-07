@@ -14,24 +14,26 @@ import (
 	"vadimgribanov.com/tg-gpt/internal/telegram_utils"
 )
 
-func NewTextService(client LLMClient, messagesRepo MessagesRepo, usersRepo UsersRepo, memoryService *MemoryService, dialogTimeout int64, defaultModel string) *TextService {
+func NewTextService(client LLMClient, messagesRepo MessagesRepo, usersRepo UsersRepo, memoryService *MemoryService, reminderService *ReminderService, dialogTimeout int64, defaultModel string) *TextService {
 	return &TextService{
-		client:        client,
-		messagesRepo:  messagesRepo,
-		usersRepo:     usersRepo,
-		memoryService: memoryService,
-		dialogTimeout: dialogTimeout,
-		defaultModel:  defaultModel,
+		client:          client,
+		messagesRepo:    messagesRepo,
+		usersRepo:       usersRepo,
+		memoryService:   memoryService,
+		reminderService: reminderService,
+		dialogTimeout:   dialogTimeout,
+		defaultModel:    defaultModel,
 	}
 }
 
 type TextService struct {
-	client        LLMClient
-	messagesRepo  MessagesRepo
-	usersRepo     UsersRepo
-	memoryService *MemoryService
-	dialogTimeout int64
-	defaultModel  string
+	client          LLMClient
+	messagesRepo    MessagesRepo
+	usersRepo       UsersRepo
+	memoryService   *MemoryService
+	reminderService *ReminderService
+	dialogTimeout   int64
+	defaultModel    string
 }
 
 type LLMClient interface {
@@ -51,7 +53,7 @@ type UsersRepo interface {
 
 const EOFStatus = "EOF"
 const AssistantPrompt = `
-You are a helpful assistant. Your name is Johhny. You are provided with a list of memories about the user. Additionally, you can add new records to your memory. IT IS VERY IMPORTANT to capture all the smallest details about the user. Today is %s. Give short concise answers.
+You are a helpful assistant. Your name is Johhny. You are provided with a list of memories about the user. Additionally, you can add new records to your memory. You can also create, list, and cancel reminders for the user. IT IS VERY IMPORTANT to capture all the smallest details about the user. Today is %s. Give short concise answers.
 <memories>%s</memories>
 `
 
@@ -148,11 +150,18 @@ func (h *TextService) handleLLMRequest(ctx context.Context, user models.User, tg
 	accumulatedInputTokens := int64(0)
 	accumulatedOutputTokens := int64(0)
 	accumulatedResponse := ""
+
+	// Combine tools from memory and reminder services
+	tools := append(
+		h.memoryService.GetMemoryTools(),
+		h.reminderService.GetReminderTools()...,
+	)
+
 	for {
 		stream, err := h.client.CreateChatCompletionStream(ctx, openai.ChatCompletionRequest{
 			Model:      modelToUse,
 			Messages:   history,
-			Tools:      h.memoryService.GetMemoryTools(),
+			Tools:      tools,
 			ToolChoice: "auto",
 		})
 		if err != nil {
@@ -197,7 +206,20 @@ func (h *TextService) handleLLMRequest(ctx context.Context, user models.User, tg
 				ToolCalls: toolCalls,
 			})
 			for _, toolCall := range toolCalls {
-				result, err := h.memoryService.HandleToolCall(user.Id, toolCall)
+				var result string
+				var err error
+
+				// Route to appropriate service based on tool name
+				switch toolCall.Function.Name {
+				case "save_memory", "get_memory", "list_memories", "delete_memory":
+					result, err = h.memoryService.HandleToolCall(user.Id, toolCall)
+				case "create_reminder", "list_reminders", "cancel_reminder":
+					result, err = h.reminderService.HandleToolCall(user.Id, toolCall)
+				default:
+					err = fmt.Errorf("unknown tool: %s", toolCall.Function.Name)
+					result = "Unknown tool"
+				}
+
 				history = append(history, openai.ChatCompletionMessage{
 					Role:       openai.ChatMessageRoleTool,
 					ToolCallID: toolCall.ID,

@@ -40,6 +40,7 @@ func (db *DB) Migrate() error {
 		createInteractionsTable,
 		createMessagesTable,
 		createMemoriesTable,
+		createRemindersTable,
 	}
 
 	for i, migration := range migrations {
@@ -103,3 +104,28 @@ CREATE TABLE IF NOT EXISTS memories (
 	FOREIGN KEY (user_id) REFERENCES users(id),
 	UNIQUE(user_id, memory_key)
 );`
+
+const createRemindersTable = `
+CREATE TABLE IF NOT EXISTS reminders (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	user_id INTEGER NOT NULL,
+	message TEXT NOT NULL,
+	remind_at INTEGER NOT NULL,
+	created_at INTEGER DEFAULT (strftime('%s', 'now')),
+	updated_at INTEGER DEFAULT (strftime('%s', 'now')),
+	is_fired BOOLEAN DEFAULT false,
+	is_cancelled BOOLEAN DEFAULT false,
+	timezone TEXT DEFAULT 'UTC',
+	is_recurring BOOLEAN DEFAULT false,
+	recurrence_type TEXT CHECK (recurrence_type IN ('daily', 'weekly', 'monthly', NULL)),
+	recurrence_interval INTEGER DEFAULT 1,
+	recurrence_end_at INTEGER,
+	last_fired_at INTEGER,
+	FOREIGN KEY (user_id) REFERENCES users(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_reminders_active ON reminders(remind_at, is_fired, is_cancelled)
+WHERE is_fired = false AND is_cancelled = false;
+
+CREATE INDEX IF NOT EXISTS idx_reminders_user ON reminders(user_id, is_cancelled);
+`

@@ -58,6 +58,7 @@ func main() {
 
 	messagesRepo := repositories.NewMessagesRepo(db)
 	memoryRepo := repositories.NewMemoryRepo(db)
+	reminderRepo := repositories.NewReminderRepo(db)
 
 	allowedUserIDsStr := os.Getenv("ALLOWED_USER_ID")
 	allowedUserIDs := make([]int64, 0)
@@ -76,17 +77,6 @@ func main() {
 	authenticator := middleware.UserAuthenticator{UserRepo: userRepo, AllowedUserIds: allowedUserIDs, AppConfig: *appConfig}
 	llmClientProxy := services.NewClientProxyFromConfig(appConfig)
 	memoryService := services.NewMemoryService(memoryRepo)
-	textService := services.NewTextService(
-		llmClientProxy,
-		messagesRepo,
-		userRepo,
-		memoryService,
-		dialogTimeout,
-		appConfig.DefaultModel.ModelId,
-	)
-	voiceService := &services.VoiceService{
-		Client: llmClientProxy.OpenaiClient,
-	}
 
 	pref := tele.Settings{
 		Token:  os.Getenv("TOKEN"),
@@ -97,6 +87,20 @@ func main() {
 	if err != nil {
 		slog.ErrorContext(ctx, "Error creating bot", "error", err)
 		return
+	}
+
+	reminderService := services.NewReminderService(reminderRepo, userRepo, b)
+	textService := services.NewTextService(
+		llmClientProxy,
+		messagesRepo,
+		userRepo,
+		memoryService,
+		reminderService,
+		dialogTimeout,
+		appConfig.DefaultModel.ModelId,
+	)
+	voiceService := &services.VoiceService{
+		Client: llmClientProxy.OpenaiClient,
 	}
 	// b.Use(tele_middleware.Recover(func(err error) {
 	// 	slog.ErrorContext(ctx, "Error in middleware", "error", err)
@@ -134,6 +138,20 @@ func main() {
 		messagesRepo,
 		llmClientProxy,
 	)
+
+	// Start reminder scheduler
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	if err := reminderService.StartScheduler(ctx); err != nil {
+		slog.ErrorContext(ctx, "Error starting reminder scheduler", "error", err)
+		return
+	}
+	defer func() {
+		if err := reminderService.StopScheduler(ctx); err != nil {
+			slog.ErrorContext(ctx, "Error stopping reminder scheduler", "error", err)
+		}
+	}()
 
 	slog.InfoContext(ctx, "Listening...")
 	b.Start()
