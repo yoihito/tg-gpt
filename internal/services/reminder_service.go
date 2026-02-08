@@ -20,6 +20,7 @@ import (
 type ReminderService struct {
 	reminderRepo *repositories.ReminderRepo
 	userRepo     *repositories.UserRepo
+	messagesRepo *repositories.MessagesRepo
 	timeParser   *utils.TimeParser
 	bot          *tele.Bot
 
@@ -34,11 +35,13 @@ type ReminderService struct {
 func NewReminderService(
 	reminderRepo *repositories.ReminderRepo,
 	userRepo *repositories.UserRepo,
+	messagesRepo *repositories.MessagesRepo,
 	bot *tele.Bot,
 ) *ReminderService {
 	return &ReminderService{
 		reminderRepo: reminderRepo,
 		userRepo:     userRepo,
+		messagesRepo: messagesRepo,
 		timeParser:   utils.NewTimeParser(),
 		bot:          bot,
 		stopChan:     make(chan struct{}),
@@ -52,16 +55,24 @@ func (s *ReminderService) GetReminderTools() []openai.Tool {
 			Type: openai.ToolTypeFunction,
 			Function: &openai.FunctionDefinition{
 				Name:        "create_reminder",
-				Description: "Create a reminder for the user. Use natural language for time (e.g., 'tomorrow at 3pm', 'in 2 hours', 'daily at 8am'). The reminder_text should include both the time and the message.",
+				Description: "Create a reminder for the user. IMPORTANT: Always check your memory for the user's timezone. If you don't have it, ask the user for their timezone/location and save it to memory before creating the reminder.",
 				Parameters: map[string]interface{}{
 					"type": "object",
 					"properties": map[string]interface{}{
-						"reminder_text": map[string]interface{}{
+						"time_expression": map[string]interface{}{
 							"type":        "string",
-							"description": "Full reminder text including time and message (e.g., 'tomorrow at 3pm call dentist', 'daily at 8am take medicine', 'in 2 hours check the oven')",
+							"description": "Time expression in English (e.g., 'in 5 minutes', 'tomorrow at 3pm', 'next Monday at 9am', 'daily at 8am', 'every week')",
+						},
+						"message": map[string]interface{}{
+							"type":        "string",
+							"description": "The reminder message in the user's language",
+						},
+						"timezone": map[string]interface{}{
+							"type":        "string",
+							"description": "User's timezone in IANA format (e.g., 'America/New_York', 'Europe/Moscow', 'Asia/Tokyo'). Retrieve from your memory or ask the user.",
 						},
 					},
-					"required": []string{"reminder_text"},
+					"required": []string{"time_expression", "message", "timezone"},
 				},
 			},
 		},
@@ -127,24 +138,32 @@ func (s *ReminderService) HandleToolCall(userID int64, toolCall openai.ToolCall)
 // handleCreateReminder creates a new reminder
 func (s *ReminderService) handleCreateReminder(userID int64, arguments string) (string, error) {
 	var args struct {
-		ReminderText string `json:"reminder_text"`
+		TimeExpression string `json:"time_expression"`
+		Message        string `json:"message"`
+		Timezone       string `json:"timezone"`
 	}
 
 	if err := json.Unmarshal([]byte(arguments), &args); err != nil {
 		return "", fmt.Errorf("invalid arguments for create_reminder: %w", err)
 	}
 
-	// Default to UTC timezone
-	timezone := "UTC"
-	loc, _ := utils.GetUserTimezone(timezone)
-
-	// Check for recurrence pattern
-	recurrenceType, interval, messageWithTime := s.timeParser.ParseRecurrence(args.ReminderText)
-
-	// Parse the time
-	parsedTime, message, err := s.timeParser.ParseTime(messageWithTime, time.Now(), loc)
+	// Load user's timezone
+	loc, err := utils.GetUserTimezone(args.Timezone)
 	if err != nil {
-		return "", fmt.Errorf("could not understand time: %w", err)
+		slog.Warn("Invalid timezone provided, falling back to UTC", "timezone", args.Timezone, "error", err)
+		loc = time.UTC
+		args.Timezone = "UTC"
+	}
+
+	// Check for recurrence pattern in time expression
+	recurrenceType, interval, timeExpressionCleaned := s.timeParser.ParseRecurrence(args.TimeExpression)
+
+	// Parse the time from the English time expression using user's timezone
+	// The reference time should be in the user's timezone
+	referenceTime := time.Now().In(loc)
+	parsedTime, _, err := s.timeParser.ParseTime(timeExpressionCleaned+" placeholder", referenceTime, loc)
+	if err != nil {
+		return "", fmt.Errorf("could not understand time expression '%s': %w", args.TimeExpression, err)
 	}
 
 	// Validate time is in the future
@@ -154,9 +173,9 @@ func (s *ReminderService) handleCreateReminder(userID int64, arguments string) (
 
 	reminder := models.Reminder{
 		UserID:             userID,
-		Message:            message,
+		Message:            args.Message,
 		RemindAt:           *parsedTime,
-		Timezone:           timezone,
+		Timezone:           args.Timezone,
 		IsRecurring:        recurrenceType != nil,
 		RecurrenceInterval: interval,
 	}
@@ -172,15 +191,15 @@ func (s *ReminderService) handleCreateReminder(userID int64, arguments string) (
 		return "Failed to create reminder", err
 	}
 
-	// Format response
-	timeStr := parsedTime.Format("Mon Jan 2, 2006 at 3:04 PM MST")
-	response := fmt.Sprintf("Reminder set for %s: %s", timeStr, message)
+	// Format response in user's timezone
+	timeStr := parsedTime.In(loc).Format("Mon Jan 2, 2006 at 3:04 PM MST")
+	response := fmt.Sprintf("Reminder set for %s: %s", timeStr, args.Message)
 
 	if reminder.IsRecurring && reminder.RecurrenceType != nil {
 		response += fmt.Sprintf(" (Repeats: %s)", *reminder.RecurrenceType)
 	}
 
-	slog.Info("Reminder created", "reminder_id", id, "user_id", userID, "remind_at", parsedTime)
+	slog.Info("Reminder created", "reminder_id", id, "user_id", userID, "remind_at", parsedTime, "timezone", args.Timezone)
 
 	return response, nil
 }
@@ -336,12 +355,56 @@ func (s *ReminderService) fireReminder(ctx context.Context, reminder models.Remi
 		return
 	}
 
-	// Send reminder message
-	message := fmt.Sprintf("🔔 Reminder: %s", reminder.Message)
-	_, err = s.bot.Send(&tele.User{ID: user.ChatId}, message)
+	// Create natural reminder messages
+	naturalMessages := []string{
+		"Hey! Just wanted to remind you: %s",
+		"Hi there! You asked me to remind you: %s",
+		"Reminder! Don't forget: %s",
+		"Hey, it's time! Remember: %s",
+		"Quick reminder: %s",
+		"Just a heads up: %s",
+	}
+
+	// Select a random natural message format
+	messageFormat := naturalMessages[time.Now().UnixNano()%int64(len(naturalMessages))]
+	naturalMessage := fmt.Sprintf(messageFormat, reminder.Message)
+
+	// Send reminder message to Telegram
+	sentMsg, err := s.bot.Send(&tele.User{ID: user.ChatId}, naturalMessage)
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to send reminder", "error", err, "reminder_id", reminder.ID)
 		return
+	}
+
+	// Touch user to update last_interaction time
+	user.Touch()
+	if err := s.userRepo.UpdateUser(user); err != nil {
+		slog.ErrorContext(ctx, "Failed to update user last interaction", "error", err, "user_id", reminder.UserID)
+	}
+
+	// Save reminder to conversation history as an interaction
+	// Create a synthetic user message to pair with the assistant's reminder
+	userMessage := openai.ChatCompletionMessage{
+		Role:    openai.ChatMessageRoleUser,
+		Content: fmt.Sprintf("[Reminder triggered for: %s]", reminder.Message),
+	}
+
+	assistantMessage := openai.ChatCompletionMessage{
+		Role:    openai.ChatMessageRoleAssistant,
+		Content: naturalMessage,
+	}
+
+	interaction := models.Interaction{
+		UserMessage:      userMessage,
+		AssistantMessage: assistantMessage,
+		AuthorId:         user.Id,
+		DialogId:         user.CurrentDialogId,
+		TgUserMessageId:  0, // No actual user message
+		TgAssistantMessageId: int64(sentMsg.ID),
+	}
+
+	if err := s.messagesRepo.AddMessage(interaction); err != nil {
+		slog.ErrorContext(ctx, "Failed to save reminder to conversation history", "error", err, "reminder_id", reminder.ID)
 	}
 
 	// Mark as fired

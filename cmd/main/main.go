@@ -89,7 +89,7 @@ func main() {
 		return
 	}
 
-	reminderService := services.NewReminderService(reminderRepo, userRepo, b)
+	reminderService := services.NewReminderService(reminderRepo, userRepo, messagesRepo, b)
 	textService := services.NewTextService(
 		llmClientProxy,
 		messagesRepo,
