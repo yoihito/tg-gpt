@@ -166,11 +166,6 @@ func (s *ReminderService) handleCreateReminder(userID int64, arguments string) (
 		return "", fmt.Errorf("could not understand time expression '%s': %w", args.TimeExpression, err)
 	}
 
-	// Validate time is in the future
-	if parsedTime.Before(time.Now()) {
-		return "", fmt.Errorf("reminder time must be in the future")
-	}
-
 	reminder := models.Reminder{
 		UserID:             userID,
 		Message:            args.Message,
@@ -395,11 +390,11 @@ func (s *ReminderService) fireReminder(ctx context.Context, reminder models.Remi
 	}
 
 	interaction := models.Interaction{
-		UserMessage:      userMessage,
-		AssistantMessage: assistantMessage,
-		AuthorId:         user.Id,
-		DialogId:         user.CurrentDialogId,
-		TgUserMessageId:  0, // No actual user message
+		UserMessage:          userMessage,
+		AssistantMessage:     assistantMessage,
+		AuthorId:             user.Id,
+		DialogId:             user.CurrentDialogId,
+		TgUserMessageId:      0, // No actual user message
 		TgAssistantMessageId: int64(sentMsg.ID),
 	}
 
