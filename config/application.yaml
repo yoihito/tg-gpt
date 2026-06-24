@@ -6,3 +6,19 @@ models:
   - name: GPT-5.2
     model_id: gpt-5.2
     provider: openai
+
+memory:
+  embedding:
+    model: text-embedding-3-small
+  extractor:
+    model: gpt-5.4-nano
+  thresholds:
+    fact_confidence_min: 0.7
+    preference_confidence_min: 0.8
+    semantic_dedup_cosine: 0.92
+  retrieval:
+    facts_top_k: 5
+    episodes_top_k: 2
+    recent_trace_events: 8
+  episode:
+    min_turns: 3

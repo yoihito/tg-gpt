@@ -18,11 +18,11 @@ import (
 )
 
 type ReminderService struct {
-	reminderRepo *repositories.ReminderRepo
-	userRepo     *repositories.UserRepo
-	messagesRepo *repositories.MessagesRepo
-	timeParser   *utils.TimeParser
-	bot          *tele.Bot
+	reminderRepo  *repositories.ReminderRepo
+	userRepo      *repositories.UserRepo
+	memoryManager *MemoryManager
+	timeParser    *utils.TimeParser
+	bot           *tele.Bot
 
 	// Scheduler management
 	ticker    *time.Ticker
@@ -35,16 +35,16 @@ type ReminderService struct {
 func NewReminderService(
 	reminderRepo *repositories.ReminderRepo,
 	userRepo *repositories.UserRepo,
-	messagesRepo *repositories.MessagesRepo,
+	memoryManager *MemoryManager,
 	bot *tele.Bot,
 ) *ReminderService {
 	return &ReminderService{
-		reminderRepo: reminderRepo,
-		userRepo:     userRepo,
-		messagesRepo: messagesRepo,
-		timeParser:   utils.NewTimeParser(),
-		bot:          bot,
-		stopChan:     make(chan struct{}),
+		reminderRepo:  reminderRepo,
+		userRepo:      userRepo,
+		memoryManager: memoryManager,
+		timeParser:    utils.NewTimeParser(),
+		bot:           bot,
+		stopChan:      make(chan struct{}),
 	}
 }
 
@@ -377,29 +377,10 @@ func (s *ReminderService) fireReminder(ctx context.Context, reminder models.Remi
 		slog.ErrorContext(ctx, "Failed to update user last interaction", "error", err, "user_id", reminder.UserID)
 	}
 
-	// Save reminder to conversation history as an interaction
-	// Create a synthetic user message to pair with the assistant's reminder
-	userMessage := openai.ChatCompletionMessage{
-		Role:    openai.ChatMessageRoleUser,
-		Content: fmt.Sprintf("[Reminder triggered for: %s]", reminder.Message),
-	}
-
-	assistantMessage := openai.ChatCompletionMessage{
-		Role:    openai.ChatMessageRoleAssistant,
-		Content: naturalMessage,
-	}
-
-	interaction := models.Interaction{
-		UserMessage:          userMessage,
-		AssistantMessage:     assistantMessage,
-		AuthorId:             user.Id,
-		DialogId:             user.CurrentDialogId,
-		TgUserMessageId:      0, // No actual user message
-		TgAssistantMessageId: int64(sentMsg.ID),
-	}
-
-	if err := s.messagesRepo.AddMessage(interaction); err != nil {
-		slog.ErrorContext(ctx, "Failed to save reminder to conversation history", "error", err, "reminder_id", reminder.ID)
+	// Save reminder firing to trace so subsequent conversation has context.
+	syntheticUserText := fmt.Sprintf("[Reminder triggered for: %s]", reminder.Message)
+	if err := s.memoryManager.RecordReminderFire(user.Id, user.CurrentDialogId, syntheticUserText, naturalMessage, int64(sentMsg.ID)); err != nil {
+		slog.ErrorContext(ctx, "Failed to save reminder to trace", "error", err, "reminder_id", reminder.ID)
 	}
 
 	// Mark as fired

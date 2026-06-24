@@ -21,7 +21,7 @@ func RegisterHandlers(
 	textService *services.TextService,
 	voiceService *services.VoiceService,
 	userRepo *repositories.UserRepo,
-	messagesRepo *repositories.MessagesRepo,
+	memoryManager *services.MemoryManager,
 	llmClientProxy *services.LLMClientProxy,
 ) {
 	handler := NewBotHandler(
@@ -29,7 +29,7 @@ func RegisterHandlers(
 		textService,
 		voiceService,
 		userRepo,
-		messagesRepo,
+		memoryManager,
 		llmClientProxy,
 	)
 
@@ -58,7 +58,7 @@ type BotHandler struct {
 	textService    *services.TextService
 	voiceService   *services.VoiceService
 	userRepo       *repositories.UserRepo
-	messagesRepo   *repositories.MessagesRepo
+	memoryManager  *services.MemoryManager
 	llmClientProxy *services.LLMClientProxy
 }
 
@@ -67,7 +67,7 @@ func NewBotHandler(
 	textService *services.TextService,
 	voiceService *services.VoiceService,
 	userRepo *repositories.UserRepo,
-	messagesRepo *repositories.MessagesRepo,
+	memoryManager *services.MemoryManager,
 	llmClientProxy *services.LLMClientProxy,
 ) *BotHandler {
 	return &BotHandler{
@@ -75,7 +75,7 @@ func NewBotHandler(
 		textService:    textService,
 		voiceService:   voiceService,
 		userRepo:       userRepo,
-		messagesRepo:   messagesRepo,
+		memoryManager:  memoryManager,
 		llmClientProxy: llmClientProxy,
 	}
 }
@@ -185,34 +185,25 @@ func (h *BotHandler) HandlePhoto(c tele.Context) error {
 func (h *BotHandler) RetryLastMessage(c tele.Context) error {
 	ctx := c.Get("requestContext").(context.Context)
 	slog.DebugContext(ctx, "Retrying last message")
-	err := c.Notify(tele.Typing)
-	if err != nil {
+	if err := c.Notify(tele.Typing); err != nil {
 		return err
 	}
 
 	user := c.Get("user").(models.User)
-	interaction, err := h.messagesRepo.PopLatestInteraction(user)
+	userMsg, tgMsgID, err := h.memoryManager.PopForRetry(user.Id, user.CurrentDialogId)
 	if err != nil {
 		return c.Send("No messages found")
 	}
 
-	slog.DebugContext(ctx, "Last interaction with the user", "interaction", interaction)
+	if len(userMsg.MultiContent) > 0 {
+		return c.Send("Cannot retry multi-content messages")
+	}
 
 	streamer := telegram_utils.NewTelegramStreamer(c, &tele.Message{
-		ID:   int(interaction.TgUserMessageId),
+		ID:   int(tgMsgID),
 		Chat: c.Chat(),
 	})
-	if len(interaction.UserMessage.MultiContent) > 0 {
-		return c.Send("Cannot retry multi-content messages")
-	} else {
-		return h.textService.RetryInteraction(
-			ctx,
-			user,
-			interaction.TgUserMessageId,
-			interaction,
-			streamer,
-		)
-	}
+	return h.textService.RetryWithMessage(ctx, user, tgMsgID, userMsg, streamer)
 }
 
 func (h *BotHandler) ListModels(c tele.Context) error {
@@ -262,6 +253,9 @@ func (h *BotHandler) NewDialog(c tele.Context) error {
 	slog.DebugContext(ctx, "Starting new dialog")
 
 	user := c.Get("user").(models.User)
+	oldDialogID := user.CurrentDialogId
+	go h.memoryManager.CloseDialog(context.WithoutCancel(ctx), user.Id, oldDialogID)
+
 	user.StartNewDialog()
 	err := h.userRepo.UpdateUser(user)
 	if err != nil {

@@ -38,7 +38,6 @@ func main() {
 		return
 	}
 
-	// Initialize database
 	dbPath := os.Getenv("DATABASE_PATH")
 	if dbPath == "" {
 		dbPath = "data/tg-gpt.db"
@@ -56,8 +55,11 @@ func main() {
 		return
 	}
 
-	messagesRepo := repositories.NewMessagesRepo(db)
-	memoryRepo := repositories.NewMemoryRepo(db)
+	userRepo := repositories.NewUserRepo(db)
+	traceRepo := repositories.NewTraceRepo(db)
+	prefRepo := repositories.NewPreferenceRepo(db)
+	factRepo := repositories.NewFactRepo(db)
+	episodeRepo := repositories.NewEpisodeRepo(db)
 	reminderRepo := repositories.NewReminderRepo(db)
 
 	allowedUserIDsStr := os.Getenv("ALLOWED_USER_ID")
@@ -70,13 +72,32 @@ func main() {
 		}
 		allowedUserIDs = append(allowedUserIDs, id)
 	}
-	userRepo := repositories.NewUserRepo(db)
 	dialogTimeout := int64(appConfig.DialogTimeout)
 	maxConcurrentRequests := appConfig.MaxConcurrentRequests
 	rateLimiter := middleware.RateLimiter{MaxConcurrentRequests: maxConcurrentRequests}
 	authenticator := middleware.UserAuthenticator{UserRepo: userRepo, AllowedUserIds: allowedUserIDs, AppConfig: *appConfig}
+
 	llmClientProxy := services.NewClientProxyFromConfig(appConfig)
-	memoryService := services.NewMemoryService(memoryRepo)
+
+	embedder := services.NewEmbedder(llmClientProxy.OpenaiClient, appConfig.Memory.Embedding.Model)
+	extractor := services.NewExtractor(llmClientProxy.OpenaiClient, appConfig.Memory.Extractor.Model)
+	summarizer := services.NewSummarizer(llmClientProxy.OpenaiClient, appConfig.Memory.Extractor.Model)
+
+	memoryManager := services.NewMemoryManager(
+		traceRepo, prefRepo, factRepo, episodeRepo,
+		embedder, extractor, summarizer,
+		services.MemoryConfig{
+			FactConfidenceMin:   appConfig.Memory.Thresholds.FactConfidenceMin,
+			PrefConfidenceMin:   appConfig.Memory.Thresholds.PreferenceConfidenceMin,
+			SemanticDedupCosine: appConfig.Memory.Thresholds.SemanticDedupCosine,
+			FactsTopK:           appConfig.Memory.Retrieval.FactsTopK,
+			EpisodesTopK:        appConfig.Memory.Retrieval.EpisodesTopK,
+			EpisodeMinTurns:     appConfig.Memory.Episode.MinTurns,
+			RecentTraceEvents:   appConfig.Memory.Retrieval.RecentTraceEvents,
+		},
+	)
+
+	memoryService := services.NewMemoryService(prefRepo, memoryManager)
 
 	pref := tele.Settings{
 		Token:  os.Getenv("TOKEN"),
@@ -89,12 +110,12 @@ func main() {
 		return
 	}
 
-	reminderService := services.NewReminderService(reminderRepo, userRepo, messagesRepo, b)
+	reminderService := services.NewReminderService(reminderRepo, userRepo, memoryManager, b)
 	textService := services.NewTextService(
 		llmClientProxy,
-		messagesRepo,
 		userRepo,
 		memoryService,
+		memoryManager,
 		reminderService,
 		dialogTimeout,
 		appConfig.DefaultModel.ModelId,
@@ -102,9 +123,7 @@ func main() {
 	voiceService := &services.VoiceService{
 		Client: llmClientProxy.OpenaiClient,
 	}
-	// b.Use(tele_middleware.Recover(func(err error) {
-	// 	slog.ErrorContext(ctx, "Error in middleware", "error", err)
-	// }))
+
 	b.Use(func(next tele.HandlerFunc) tele.HandlerFunc {
 		return func(c tele.Context) error {
 			newCtx := context.WithValue(ctx, "tg_user_id", c.Sender().ID)
@@ -135,11 +154,10 @@ func main() {
 		textService,
 		voiceService,
 		userRepo,
-		messagesRepo,
+		memoryManager,
 		llmClientProxy,
 	)
 
-	// Start reminder scheduler
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
