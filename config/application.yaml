@@ -1,10 +1,10 @@
 dialog_timeout: 1800
 max_concurrent_requests: 1
 default_model:
-  model_id: gpt-5.2
+  model_id: gpt-5.5
 models:
-  - name: GPT-5.2
-    model_id: gpt-5.2
+  - name: GPT-5.5
+    model_id: gpt-5.5
     provider: openai
 
 memory:
