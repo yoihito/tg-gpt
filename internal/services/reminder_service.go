@@ -20,11 +20,11 @@ import (
 type ReminderService struct {
 	reminderRepo  *repositories.ReminderRepo
 	userRepo      *repositories.UserRepo
+	prefRepo      *repositories.PreferenceRepo
 	memoryManager *MemoryManager
 	timeParser    *utils.TimeParser
 	bot           *tele.Bot
 
-	// Scheduler management
 	ticker    *time.Ticker
 	stopChan  chan struct{}
 	wg        sync.WaitGroup
@@ -35,12 +35,14 @@ type ReminderService struct {
 func NewReminderService(
 	reminderRepo *repositories.ReminderRepo,
 	userRepo *repositories.UserRepo,
+	prefRepo *repositories.PreferenceRepo,
 	memoryManager *MemoryManager,
 	bot *tele.Bot,
 ) *ReminderService {
 	return &ReminderService{
 		reminderRepo:  reminderRepo,
 		userRepo:      userRepo,
+		prefRepo:      prefRepo,
 		memoryManager: memoryManager,
 		timeParser:    utils.NewTimeParser(),
 		bot:           bot,
@@ -48,28 +50,31 @@ func NewReminderService(
 	}
 }
 
-// GetReminderTools returns tool definitions for LLM
+// isoLocalLayout: ISO 8601 without timezone offset; interpreted in the supplied
+// *time.Location at parse time.
+const isoLocalLayout = "2006-01-02T15:04:05"
+
 func (s *ReminderService) GetReminderTools() []openai.Tool {
 	return []openai.Tool{
 		{
 			Type: openai.ToolTypeFunction,
 			Function: &openai.FunctionDefinition{
-				Name:        "create_reminder",
-				Description: "Create a reminder for the user. IMPORTANT: Always check your memory for the user's timezone. If you don't have it, ask the user for their timezone/location and save it to memory before creating the reminder.",
+				Name:        "create_one_shot_reminder",
+				Description: "Create a single, non-repeating reminder. Use this whenever the user wants to be reminded exactly once.",
 				Parameters: map[string]interface{}{
 					"type": "object",
 					"properties": map[string]interface{}{
 						"time_expression": map[string]interface{}{
 							"type":        "string",
-							"description": "Time expression in English (e.g., 'in 5 minutes', 'tomorrow at 3pm', 'next Monday at 9am', 'daily at 8am', 'every week')",
+							"description": "Natural language time: 'in 5 minutes', 'tomorrow at 3pm', 'next Monday at 9am'.",
 						},
 						"message": map[string]interface{}{
 							"type":        "string",
-							"description": "The reminder message in the user's language",
+							"description": "The reminder message in the user's language.",
 						},
 						"timezone": map[string]interface{}{
 							"type":        "string",
-							"description": "User's timezone in IANA format (e.g., 'America/New_York', 'Europe/Moscow', 'Asia/Tokyo'). Retrieve from your memory or ask the user.",
+							"description": "User's IANA timezone (e.g. 'Europe/Berlin'). Read it from the user's preferences shown in the system prompt; if it's not there, ask the user and save it as preference 'timezone' before calling this tool.",
 						},
 					},
 					"required": []string{"time_expression", "message", "timezone"},
@@ -79,8 +84,46 @@ func (s *ReminderService) GetReminderTools() []openai.Tool {
 		{
 			Type: openai.ToolTypeFunction,
 			Function: &openai.FunctionDefinition{
+				Name:        "create_recurring_reminder",
+				Description: "Create a reminder that repeats on a schedule. Use whenever the user mentions repetition (daily, weekly, monthly, every N days/weeks/months).",
+				Parameters: map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"message": map[string]interface{}{
+							"type":        "string",
+							"description": "The reminder message in the user's language.",
+						},
+						"timezone": map[string]interface{}{
+							"type":        "string",
+							"description": "User's IANA timezone. Read from preferences; ask the user if missing.",
+						},
+						"frequency": map[string]interface{}{
+							"type":        "string",
+							"enum":        []string{"daily", "weekly", "monthly"},
+							"description": "Base unit of recurrence.",
+						},
+						"interval": map[string]interface{}{
+							"type":        "integer",
+							"description": "Repeat every N units of frequency. interval=2 + frequency=weekly = biweekly. Defaults to 1 if omitted.",
+						},
+						"start_at": map[string]interface{}{
+							"type":        "string",
+							"description": "ISO 8601 datetime (no timezone suffix) of the first occurrence, in the user's local timezone. Example: '2026-06-25T09:00:00'.",
+						},
+						"until": map[string]interface{}{
+							"type":        "string",
+							"description": "Optional ISO 8601 datetime after which recurrence stops. Omit for indefinite recurrence.",
+						},
+					},
+					"required": []string{"message", "timezone", "frequency", "start_at"},
+				},
+			},
+		},
+		{
+			Type: openai.ToolTypeFunction,
+			Function: &openai.FunctionDefinition{
 				Name:        "list_reminders",
-				Description: "List all active reminders for the user.",
+				Description: "List all active (not-yet-fired, not-cancelled) reminders for the user.",
 				Parameters: map[string]interface{}{
 					"type":       "object",
 					"properties": map[string]interface{}{},
@@ -91,13 +134,13 @@ func (s *ReminderService) GetReminderTools() []openai.Tool {
 			Type: openai.ToolTypeFunction,
 			Function: &openai.FunctionDefinition{
 				Name:        "cancel_reminder",
-				Description: "Cancel a specific reminder by its ID.",
+				Description: "Cancel a reminder by its ID. For recurring reminders, this cancels all future occurrences.",
 				Parameters: map[string]interface{}{
 					"type": "object",
 					"properties": map[string]interface{}{
 						"reminder_id": map[string]interface{}{
 							"type":        "string",
-							"description": "The ID of the reminder to cancel",
+							"description": "The ID of the reminder to cancel.",
 						},
 					},
 					"required": []string{"reminder_id"},
@@ -107,27 +150,24 @@ func (s *ReminderService) GetReminderTools() []openai.Tool {
 	}
 }
 
-// HandleToolCall routes tool calls to appropriate handlers
 func (s *ReminderService) HandleToolCall(userID int64, toolCall openai.ToolCall) (string, error) {
-	// Special handling for list_reminders which doesn't need arguments
 	if toolCall.Function.Name == "list_reminders" {
 		return s.handleListReminders(userID)
 	}
 
-	// Validate that we have complete arguments for other tool calls
 	if strings.TrimSpace(toolCall.Function.Arguments) == "" {
 		return "", fmt.Errorf("empty arguments for tool call: %s", toolCall.Function.Name)
 	}
-
-	// Try to validate JSON structure
-	var test map[string]interface{}
-	if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &test); err != nil {
+	var probe map[string]interface{}
+	if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &probe); err != nil {
 		return "", fmt.Errorf("invalid JSON arguments for %s: %w - arguments: %s", toolCall.Function.Name, err, toolCall.Function.Arguments)
 	}
 
 	switch toolCall.Function.Name {
-	case "create_reminder":
-		return s.handleCreateReminder(userID, toolCall.Function.Arguments)
+	case "create_one_shot_reminder":
+		return s.handleCreateOneShotReminder(userID, toolCall.Function.Arguments)
+	case "create_recurring_reminder":
+		return s.handleCreateRecurringReminder(userID, toolCall.Function.Arguments)
 	case "cancel_reminder":
 		return s.handleCancelReminder(userID, toolCall.Function.Arguments)
 	default:
@@ -135,178 +175,216 @@ func (s *ReminderService) HandleToolCall(userID int64, toolCall openai.ToolCall)
 	}
 }
 
-// handleCreateReminder creates a new reminder
-func (s *ReminderService) handleCreateReminder(userID int64, arguments string) (string, error) {
+func (s *ReminderService) handleCreateOneShotReminder(userID int64, arguments string) (string, error) {
 	var args struct {
 		TimeExpression string `json:"time_expression"`
 		Message        string `json:"message"`
 		Timezone       string `json:"timezone"`
 	}
-
 	if err := json.Unmarshal([]byte(arguments), &args); err != nil {
-		return "", fmt.Errorf("invalid arguments for create_reminder: %w", err)
+		return "", fmt.Errorf("invalid arguments for create_one_shot_reminder: %w", err)
 	}
 
-	// Load user's timezone
 	loc, err := utils.GetUserTimezone(args.Timezone)
 	if err != nil {
-		slog.Warn("Invalid timezone provided, falling back to UTC", "timezone", args.Timezone, "error", err)
-		loc = time.UTC
-		args.Timezone = "UTC"
+		return fmt.Sprintf("Cannot create reminder: %s. Ask the user for their IANA timezone (e.g. 'Europe/Berlin').", err), nil
 	}
 
-	// Check for recurrence pattern in time expression
-	recurrenceType, interval, timeExpressionCleaned := s.timeParser.ParseRecurrence(args.TimeExpression)
-
-	// Parse the time from the English time expression using user's timezone
-	// The reference time should be in the user's timezone
-	referenceTime := time.Now().In(loc)
-	parsedTime, _, err := s.timeParser.ParseTime(timeExpressionCleaned+" placeholder", referenceTime, loc)
+	parsedTime, err := s.timeParser.ParseTimeOnly(args.TimeExpression, time.Now().In(loc), loc)
 	if err != nil {
-		return "", fmt.Errorf("could not understand time expression '%s': %w", args.TimeExpression, err)
+		return fmt.Sprintf("Could not understand time expression %q. Ask the user to rephrase.", args.TimeExpression), nil
 	}
 
-	reminder := models.Reminder{
+	id, err := s.reminderRepo.CreateReminder(models.Reminder{
 		UserID:             userID,
 		Message:            args.Message,
 		RemindAt:           *parsedTime,
-		Timezone:           args.Timezone,
-		IsRecurring:        recurrenceType != nil,
-		RecurrenceInterval: interval,
-	}
-
-	if recurrenceType != nil {
-		rt := models.RecurrenceType(*recurrenceType)
-		reminder.RecurrenceType = &rt
-	}
-
-	id, err := s.reminderRepo.CreateReminder(reminder)
+		IsRecurring:        false,
+		RecurrenceInterval: 1,
+	})
 	if err != nil {
-		slog.Error("Failed to create reminder", "error", err, "user_id", userID)
+		slog.Error("Failed to create one-shot reminder", "error", err, "user_id", userID)
+		return "Failed to create reminder", err
+	}
+	timeStr := parsedTime.In(loc).Format("Mon Jan 2, 2006 at 3:04 PM MST")
+	slog.Info("One-shot reminder created", "reminder_id", id, "user_id", userID, "remind_at", parsedTime, "timezone", args.Timezone)
+	return fmt.Sprintf("Reminder set for %s: %s", timeStr, args.Message), nil
+}
+
+func (s *ReminderService) handleCreateRecurringReminder(userID int64, arguments string) (string, error) {
+	var args struct {
+		Message   string `json:"message"`
+		Timezone  string `json:"timezone"`
+		Frequency string `json:"frequency"`
+		Interval  int    `json:"interval"`
+		StartAt   string `json:"start_at"`
+		Until     string `json:"until"`
+	}
+	if err := json.Unmarshal([]byte(arguments), &args); err != nil {
+		return "", fmt.Errorf("invalid arguments for create_recurring_reminder: %w", err)
+	}
+
+	loc, err := utils.GetUserTimezone(args.Timezone)
+	if err != nil {
+		return fmt.Sprintf("Cannot create reminder: %s. Ask the user for their IANA timezone (e.g. 'Europe/Berlin').", err), nil
+	}
+
+	var rType models.RecurrenceType
+	switch args.Frequency {
+	case "daily":
+		rType = models.RecurrenceTypeDaily
+	case "weekly":
+		rType = models.RecurrenceTypeWeekly
+	case "monthly":
+		rType = models.RecurrenceTypeMonthly
+	default:
+		return fmt.Sprintf("Invalid frequency %q. Must be 'daily', 'weekly', or 'monthly'.", args.Frequency), nil
+	}
+
+	startAt, err := time.ParseInLocation(isoLocalLayout, args.StartAt, loc)
+	if err != nil {
+		return fmt.Sprintf("Invalid start_at %q. Use ISO 8601 like '2026-06-25T09:00:00'.", args.StartAt), nil
+	}
+
+	var until *time.Time
+	if strings.TrimSpace(args.Until) != "" {
+		u, err := time.ParseInLocation(isoLocalLayout, args.Until, loc)
+		if err != nil {
+			return fmt.Sprintf("Invalid until %q. Use ISO 8601 like '2026-12-31T23:59:59'.", args.Until), nil
+		}
+		until = &u
+	}
+
+	interval := args.Interval
+	if interval < 1 {
+		interval = 1
+	}
+
+	id, err := s.reminderRepo.CreateReminder(models.Reminder{
+		UserID:             userID,
+		Message:            args.Message,
+		RemindAt:           startAt,
+		IsRecurring:        true,
+		RecurrenceType:     &rType,
+		RecurrenceInterval: interval,
+		RecurrenceEndAt:    until,
+	})
+	if err != nil {
+		slog.Error("Failed to create recurring reminder", "error", err, "user_id", userID)
 		return "Failed to create reminder", err
 	}
 
-	// Format response in user's timezone
-	timeStr := parsedTime.In(loc).Format("Mon Jan 2, 2006 at 3:04 PM MST")
-	response := fmt.Sprintf("Reminder set for %s: %s", timeStr, args.Message)
-
-	if reminder.IsRecurring && reminder.RecurrenceType != nil {
-		response += fmt.Sprintf(" (Repeats: %s)", *reminder.RecurrenceType)
+	timeStr := startAt.In(loc).Format("Mon Jan 2, 2006 at 3:04 PM MST")
+	resp := fmt.Sprintf("Recurring reminder set, first fire %s (repeats %s every %d). Message: %s", timeStr, args.Frequency, interval, args.Message)
+	if until != nil {
+		resp += fmt.Sprintf(" until %s", until.In(loc).Format("Mon Jan 2, 2006"))
 	}
-
-	slog.Info("Reminder created", "reminder_id", id, "user_id", userID, "remind_at", parsedTime, "timezone", args.Timezone)
-
-	return response, nil
+	slog.Info("Recurring reminder created",
+		"reminder_id", id,
+		"user_id", userID,
+		"frequency", args.Frequency,
+		"interval", interval,
+		"start_at", startAt,
+		"timezone", args.Timezone,
+	)
+	return resp, nil
 }
 
-// handleListReminders lists all active reminders for a user
 func (s *ReminderService) handleListReminders(userID int64) (string, error) {
 	reminders, err := s.reminderRepo.GetActiveRemindersForUser(userID)
 	if err != nil {
 		return "", err
 	}
-
 	if len(reminders) == 0 {
 		return "No active reminders found", nil
 	}
 
-	var result strings.Builder
-	result.WriteString(fmt.Sprintf("You have %d active reminder(s):\n", len(reminders)))
-
-	for i, reminder := range reminders {
-		timeStr := reminder.RemindAt.Format("Mon Jan 2 at 3:04 PM")
-		status := "pending"
-		if reminder.IsFired {
-			status = "fired"
-		}
-
-		result.WriteString(fmt.Sprintf("%d. [ID: %d] %s - %s (%s)\n",
-			i+1, reminder.ID, timeStr, reminder.Message, status))
-
-		if reminder.IsRecurring && reminder.RecurrenceType != nil {
-			result.WriteString(fmt.Sprintf("   Repeats: %s\n", *reminder.RecurrenceType))
-		}
+	loc, _ := s.getUserTimezone(userID)
+	if loc == nil {
+		loc = time.UTC
 	}
 
-	return result.String(), nil
+	var b strings.Builder
+	fmt.Fprintf(&b, "You have %d active reminder(s):\n", len(reminders))
+	for i, r := range reminders {
+		fmt.Fprintf(&b, "%d. [ID: %d] %s - %s",
+			i+1, r.ID, r.RemindAt.In(loc).Format("Mon Jan 2 at 3:04 PM"), r.Message)
+		if r.IsRecurring && r.RecurrenceType != nil {
+			fmt.Fprintf(&b, " (repeats %s every %d)", *r.RecurrenceType, r.RecurrenceInterval)
+		}
+		b.WriteString("\n")
+	}
+	return b.String(), nil
 }
 
-// handleCancelReminder cancels a specific reminder
 func (s *ReminderService) handleCancelReminder(userID int64, arguments string) (string, error) {
 	var args struct {
 		ReminderID string `json:"reminder_id"`
 	}
-
 	if err := json.Unmarshal([]byte(arguments), &args); err != nil {
 		return "", fmt.Errorf("invalid arguments for cancel_reminder: %w", err)
 	}
-
 	reminderID, err := strconv.ParseInt(args.ReminderID, 10, 64)
 	if err != nil {
 		return "", fmt.Errorf("invalid reminder ID: %w", err)
 	}
-
-	// Verify reminder exists and belongs to user
-	_, err = s.reminderRepo.GetReminderByID(reminderID, userID)
-	if err != nil {
+	if _, err := s.reminderRepo.GetReminderByID(reminderID, userID); err != nil {
 		return "", fmt.Errorf("reminder not found: %w", err)
 	}
-
-	err = s.reminderRepo.CancelReminder(reminderID, userID)
-	if err != nil {
+	if err := s.reminderRepo.CancelReminder(reminderID, userID); err != nil {
 		return "", fmt.Errorf("failed to cancel reminder: %w", err)
 	}
-
 	slog.Info("Reminder cancelled", "reminder_id", reminderID, "user_id", userID)
 	return fmt.Sprintf("Reminder #%d cancelled", reminderID), nil
 }
 
-// StartScheduler begins the background reminder checker
+func (s *ReminderService) getUserTimezone(userID int64) (*time.Location, error) {
+	pref, err := s.prefRepo.Get(userID, "timezone")
+	if err != nil {
+		return nil, fmt.Errorf("read timezone preference: %w", err)
+	}
+	if pref == nil {
+		return nil, fmt.Errorf("user has no 'timezone' preference")
+	}
+	loc, err := time.LoadLocation(pref.PrefValue)
+	if err != nil {
+		return nil, fmt.Errorf("invalid stored timezone %q: %w", pref.PrefValue, err)
+	}
+	return loc, nil
+}
+
 func (s *ReminderService) StartScheduler(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
 	if s.isRunning {
 		return fmt.Errorf("scheduler already running")
 	}
-
-	s.ticker = time.NewTicker(30 * time.Second) // Check every 30 seconds
+	s.ticker = time.NewTicker(30 * time.Second)
 	s.isRunning = true
-
 	s.wg.Add(1)
 	go s.schedulerLoop(ctx)
-
 	slog.InfoContext(ctx, "Reminder scheduler started")
 	return nil
 }
 
-// StopScheduler gracefully stops the scheduler
 func (s *ReminderService) StopScheduler(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
 	if !s.isRunning {
 		return nil
 	}
-
 	slog.InfoContext(ctx, "Stopping reminder scheduler")
-
 	close(s.stopChan)
 	s.ticker.Stop()
 	s.wg.Wait()
-
 	s.isRunning = false
 	slog.InfoContext(ctx, "Reminder scheduler stopped")
-
 	return nil
 }
 
-// schedulerLoop is the main background loop
 func (s *ReminderService) schedulerLoop(ctx context.Context) {
 	defer s.wg.Done()
-
 	slog.InfoContext(ctx, "Scheduler loop started")
-
 	for {
 		select {
 		case <-s.stopChan:
@@ -318,39 +396,30 @@ func (s *ReminderService) schedulerLoop(ctx context.Context) {
 	}
 }
 
-// checkAndFireReminders polls for due reminders and sends them
 func (s *ReminderService) checkAndFireReminders(ctx context.Context) {
-	now := time.Now()
-
-	dueReminders, err := s.reminderRepo.GetDueReminders(now)
+	dueReminders, err := s.reminderRepo.GetDueReminders(time.Now())
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to fetch due reminders", "error", err)
 		return
 	}
-
 	if len(dueReminders) == 0 {
 		return
 	}
-
 	slog.InfoContext(ctx, "Found due reminders", "count", len(dueReminders))
-
 	for _, reminder := range dueReminders {
 		s.fireReminder(ctx, reminder)
 	}
 }
 
-// fireReminder sends a reminder to the user
 func (s *ReminderService) fireReminder(ctx context.Context, reminder models.Reminder) {
 	slog.InfoContext(ctx, "Firing reminder", "reminder_id", reminder.ID, "user_id", reminder.UserID)
 
-	// Get user to retrieve chat ID
 	user, err := s.userRepo.GetUser(reminder.UserID)
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to get user for reminder", "error", err, "user_id", reminder.UserID)
 		return
 	}
 
-	// Create natural reminder messages
 	naturalMessages := []string{
 		"Hey! Just wanted to remind you: %s",
 		"Hi there! You asked me to remind you: %s",
@@ -359,48 +428,59 @@ func (s *ReminderService) fireReminder(ctx context.Context, reminder models.Remi
 		"Quick reminder: %s",
 		"Just a heads up: %s",
 	}
-
-	// Select a random natural message format
 	messageFormat := naturalMessages[time.Now().UnixNano()%int64(len(naturalMessages))]
 	naturalMessage := fmt.Sprintf(messageFormat, reminder.Message)
 
-	// Send reminder message to Telegram
 	sentMsg, err := s.bot.Send(&tele.User{ID: user.ChatId}, naturalMessage)
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to send reminder", "error", err, "reminder_id", reminder.ID)
 		return
 	}
 
-	// Touch user to update last_interaction time
 	user.Touch()
 	if err := s.userRepo.UpdateUser(user); err != nil {
 		slog.ErrorContext(ctx, "Failed to update user last interaction", "error", err, "user_id", reminder.UserID)
 	}
 
-	// Save reminder firing to trace so subsequent conversation has context.
 	syntheticUserText := fmt.Sprintf("[Reminder triggered for: %s]", reminder.Message)
 	if err := s.memoryManager.RecordReminderFire(user.Id, user.CurrentDialogId, syntheticUserText, naturalMessage, int64(sentMsg.ID)); err != nil {
 		slog.ErrorContext(ctx, "Failed to save reminder to trace", "error", err, "reminder_id", reminder.ID)
 	}
 
-	// Mark as fired
-	err = s.reminderRepo.MarkReminderFired(reminder.ID, time.Now())
-	if err != nil {
+	if reminder.IsRecurring && !reminder.HasExpiredRecurrence() {
+		s.rescheduleRecurring(ctx, reminder)
+		return
+	}
+
+	if err := s.reminderRepo.MarkReminderFired(reminder.ID, time.Now()); err != nil {
 		slog.ErrorContext(ctx, "Failed to mark reminder as fired", "error", err, "reminder_id", reminder.ID)
 	}
+	slog.InfoContext(ctx, "Reminder fired", "reminder_id", reminder.ID)
+}
 
-	// Handle recurring reminders
-	if reminder.IsRecurring && !reminder.HasExpiredRecurrence() {
-		nextTime := reminder.CalculateNextOccurrence()
-		if nextTime != nil {
-			err = s.reminderRepo.ScheduleNextOccurrence(reminder, *nextTime)
-			if err != nil {
-				slog.ErrorContext(ctx, "Failed to schedule next occurrence", "error", err, "reminder_id", reminder.ID)
-			} else {
-				slog.InfoContext(ctx, "Scheduled next occurrence", "reminder_id", reminder.ID, "next_time", nextTime)
-			}
-		}
+func (s *ReminderService) rescheduleRecurring(ctx context.Context, reminder models.Reminder) {
+	loc, err := s.getUserTimezone(reminder.UserID)
+	if err != nil {
+		slog.WarnContext(ctx, "No timezone preference for recurring reminder; falling back to UTC", "error", err, "reminder_id", reminder.ID)
+		loc = time.UTC
 	}
 
-	slog.InfoContext(ctx, "Reminder fired successfully", "reminder_id", reminder.ID)
+	nextTime := reminder.CalculateNextOccurrence(loc)
+	if nextTime == nil {
+		// Recurrence ended (past until-date or unsupported type) — close it out.
+		if err := s.reminderRepo.MarkReminderFired(reminder.ID, time.Now()); err != nil {
+			slog.ErrorContext(ctx, "Failed to mark expired recurring reminder", "error", err, "reminder_id", reminder.ID)
+		}
+		slog.InfoContext(ctx, "Recurring reminder closed (no more occurrences)", "reminder_id", reminder.ID)
+		return
+	}
+
+	if err := s.reminderRepo.UpdateNextOccurrence(reminder.ID, *nextTime, time.Now()); err != nil {
+		slog.ErrorContext(ctx, "Failed to update next occurrence", "error", err, "reminder_id", reminder.ID)
+		return
+	}
+	slog.InfoContext(ctx, "Recurring reminder rescheduled",
+		"reminder_id", reminder.ID,
+		"next_time", nextTime,
+	)
 }

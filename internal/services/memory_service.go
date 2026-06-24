@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/sashabaranov/go-openai"
 	"vadimgribanov.com/tg-gpt/internal/models"
@@ -118,12 +119,43 @@ func (s *MemoryService) GetMemoryTools() []openai.Tool {
 				},
 			},
 		},
+		{
+			Type: openai.ToolTypeFunction,
+			Function: &openai.FunctionDefinition{
+				Name:        "list_episodes",
+				Description: "List stored dialog summaries (episodic memory) for the user. Each entry has an ID, date, and short summary.",
+				Parameters: map[string]interface{}{
+					"type":       "object",
+					"properties": map[string]interface{}{},
+				},
+			},
+		},
+		{
+			Type: openai.ToolTypeFunction,
+			Function: &openai.FunctionDefinition{
+				Name:        "forget_episode",
+				Description: "Delete a stored episode by its ID. Use after list_episodes to find the right ID.",
+				Parameters: map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"episode_id": map[string]interface{}{
+							"type":        "integer",
+							"description": "The ID of the episode to delete (from list_episodes).",
+						},
+					},
+					"required": []string{"episode_id"},
+				},
+			},
+		},
 	}
 }
 
 func (s *MemoryService) HandleToolCall(ctx context.Context, mctx TurnContext, toolCall openai.ToolCall) (string, error) {
-	if toolCall.Function.Name == "list_memories" {
+	switch toolCall.Function.Name {
+	case "list_memories":
 		return s.handleListMemories(mctx.UserID)
+	case "list_episodes":
+		return s.handleListEpisodes(mctx.UserID)
 	}
 
 	if strings.TrimSpace(toolCall.Function.Arguments) == "" {
@@ -146,6 +178,8 @@ func (s *MemoryService) HandleToolCall(ctx context.Context, mctx TurnContext, to
 		return s.handleSaveFact(ctx, mctx, toolCall.Function.Arguments)
 	case "forget_about":
 		return s.handleForgetAbout(mctx.UserID, toolCall.Function.Arguments)
+	case "forget_episode":
+		return s.handleForgetEpisode(mctx.UserID, toolCall.Function.Arguments)
 	default:
 		return "", fmt.Errorf("unknown tool call: %s", toolCall.Function.Name)
 	}
@@ -158,6 +192,10 @@ func (s *MemoryService) handleSaveMemory(mctx TurnContext, arguments string) (st
 	}
 	if err := json.Unmarshal([]byte(arguments), &args); err != nil {
 		return "", fmt.Errorf("invalid arguments for save_memory: %w", err)
+	}
+	if hint, err := ValidatePreference(args.Key, args.Content); err != nil {
+		slog.Warn("Rejected invalid preference write", "key", args.Key, "value", args.Content, "error", err)
+		return hint, nil
 	}
 	traceID := mctx.UserTraceID
 	err := s.prefs.Upsert(repositories.UpsertPreferenceInput{
@@ -203,6 +241,26 @@ func (s *MemoryService) handleListMemories(userID int64) (string, error) {
 	b.WriteString("Preferences:\n")
 	for _, p := range prefs {
 		fmt.Fprintf(&b, "- %s: %s\n", p.PrefKey, p.PrefValue)
+	}
+	return b.String(), nil
+}
+
+func (s *MemoryService) handleListEpisodes(userID int64) (string, error) {
+	episodes, err := s.memoryManager.ListEpisodes(userID)
+	if err != nil {
+		return "", err
+	}
+	if len(episodes) == 0 {
+		return "No episodes stored.", nil
+	}
+	var b strings.Builder
+	b.WriteString("Episodes:\n")
+	for _, e := range episodes {
+		date := time.Unix(e.EndedAt, 0).Format("2006-01-02")
+		if e.EndedAt == 0 {
+			date = time.Unix(e.CreatedAt, 0).Format("2006-01-02")
+		}
+		fmt.Fprintf(&b, "- ID %d (%s): %s\n", e.ID, date, e.Summary)
 	}
 	return b.String(), nil
 }
@@ -259,4 +317,20 @@ func (s *MemoryService) handleForgetAbout(userID int64, arguments string) (strin
 		return "", err
 	}
 	return fmt.Sprintf("Revoked %d fact(s) about %s.", n, args.Subject), nil
+}
+
+func (s *MemoryService) handleForgetEpisode(userID int64, arguments string) (string, error) {
+	var args struct {
+		EpisodeID int64 `json:"episode_id"`
+	}
+	if err := json.Unmarshal([]byte(arguments), &args); err != nil {
+		return "", fmt.Errorf("invalid arguments for forget_episode: %w", err)
+	}
+	if args.EpisodeID == 0 {
+		return "episode_id is required", nil
+	}
+	if err := s.memoryManager.DeleteEpisode(userID, args.EpisodeID); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("Episode deleted: %d", args.EpisodeID), nil
 }

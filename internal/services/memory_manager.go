@@ -519,6 +519,16 @@ func (m *MemoryManager) RevokeFactsBySubject(userID int64, subject string) (int6
 	return m.facts.MarkRevokedBySubject(userID, subject)
 }
 
+// ListEpisodes returns all stored episodes for a user (used by the list_episodes tool).
+func (m *MemoryManager) ListEpisodes(userID int64) ([]models.Episode, error) {
+	return m.episodes.ListAll(userID)
+}
+
+// DeleteEpisode removes one episode after verifying it belongs to the user.
+func (m *MemoryManager) DeleteEpisode(userID, id int64) error {
+	return m.episodes.Delete(id, userID)
+}
+
 // CloseDialog summarizes the given (user, dialog) and writes one episodic_memory row.
 // Idempotent: skips if an episode already exists for that dialog or if fewer than
 // EpisodeMinTurns turns are present. Failures are logged but never returned — the
@@ -590,6 +600,11 @@ func (m *MemoryManager) promote(ctx context.Context, mctx TurnContext, c Candida
 	switch c.Type {
 	case CandidatePreference:
 		if c.Confidence < m.cfg.PrefConfidenceMin || c.Key == "" || c.Value == "" {
+			return nil
+		}
+		if _, err := ValidatePreference(c.Key, c.Value); err != nil {
+			slog.WarnContext(ctx, "Dropping invalid inferred preference",
+				"key", c.Key, "value", c.Value, "error", err)
 			return nil
 		}
 		traceID := mctx.UserTraceID

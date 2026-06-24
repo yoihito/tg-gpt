@@ -68,8 +68,46 @@ func (db *DB) Migrate() error {
 		return fmt.Errorf("failed to migrate legacy tables: %w", err)
 	}
 
+	if err := db.dropRemindersTimezoneIfExists(); err != nil {
+		return fmt.Errorf("failed to drop reminders.timezone column: %w", err)
+	}
+
 	slog.Info("Database migrations completed successfully")
 	return nil
+}
+
+func (db *DB) dropRemindersTimezoneIfExists() error {
+	has, err := columnExists(db.DB, "reminders", "timezone")
+	if err != nil {
+		return err
+	}
+	if !has {
+		return nil
+	}
+	slog.Info("Dropping reminders.timezone column (moved to preferences)")
+	_, err = db.Exec(`ALTER TABLE reminders DROP COLUMN timezone`)
+	return err
+}
+
+func columnExists(db *sql.DB, table, column string) (bool, error) {
+	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notNull, pk int
+		var dfltValue sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notNull, &dfltValue, &pk); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 func (db *DB) migrateLegacyTables() error {
@@ -318,7 +356,6 @@ CREATE TABLE IF NOT EXISTS reminders (
 	updated_at INTEGER DEFAULT (strftime('%s', 'now')),
 	is_fired BOOLEAN DEFAULT false,
 	is_cancelled BOOLEAN DEFAULT false,
-	timezone TEXT DEFAULT 'UTC',
 	is_recurring BOOLEAN DEFAULT false,
 	recurrence_type TEXT CHECK (recurrence_type IN ('daily', 'weekly', 'monthly', NULL)),
 	recurrence_interval INTEGER DEFAULT 1,

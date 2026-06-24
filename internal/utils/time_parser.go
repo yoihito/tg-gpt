@@ -24,14 +24,13 @@ func NewTimeParser() *TimeParser {
 	}
 }
 
-// ParseTime extracts time from natural language input
-// Returns parsed time and the remaining message text after removing the time expression
+// ParseTime extracts time from a natural-language reminder string and returns the
+// time plus the remaining message text (after the time expression is removed).
+// Used by the one-shot reminder path where the LLM packs both into one string.
 func (tp *TimeParser) ParseTime(input string, referenceTime time.Time, timezone *time.Location) (*time.Time, string, error) {
 	if timezone == nil {
 		timezone = time.UTC
 	}
-
-	// Adjust reference time to user's timezone
 	localRef := referenceTime.In(timezone)
 
 	result, err := tp.parser.Parse(input, localRef)
@@ -39,59 +38,37 @@ func (tp *TimeParser) ParseTime(input string, referenceTime time.Time, timezone 
 		return nil, "", fmt.Errorf("could not parse time from input")
 	}
 
-	// Extract the parsed time
 	parsedTime := result.Time
-
-	// Remove the time expression from the input to get the reminder message
 	message := strings.TrimSpace(strings.Replace(input, result.Text, "", 1))
 	if message == "" {
 		return nil, "", fmt.Errorf("no reminder message provided")
 	}
-
 	return &parsedTime, message, nil
 }
 
-// ParseRecurrence extracts recurrence pattern from text
-// Returns recurrence type, interval, and cleaned message
-func (tp *TimeParser) ParseRecurrence(input string) (*string, int, string) {
-	input = strings.ToLower(input)
-
-	patterns := map[string]struct {
-		recurrence string
-		interval   int
-	}{
-		"daily":          {"daily", 1},
-		"every day":      {"daily", 1},
-		"weekly":         {"weekly", 1},
-		"every week":     {"weekly", 1},
-		"monthly":        {"monthly", 1},
-		"every month":    {"monthly", 1},
-		"every 2 days":   {"daily", 2},
-		"every 3 days":   {"daily", 3},
-		"every 2 weeks":  {"weekly", 2},
-		"every 2 months": {"monthly", 2},
+// ParseTimeOnly parses a natural-language time expression without requiring a residual
+// message. Returns just the parsed time.
+func (tp *TimeParser) ParseTimeOnly(input string, referenceTime time.Time, timezone *time.Location) (*time.Time, error) {
+	if timezone == nil {
+		timezone = time.UTC
 	}
+	localRef := referenceTime.In(timezone)
 
-	for pattern, config := range patterns {
-		if strings.Contains(input, pattern) {
-			cleanedMessage := strings.TrimSpace(strings.Replace(input, pattern, "", 1))
-			return &config.recurrence, config.interval, cleanedMessage
-		}
+	result, err := tp.parser.Parse(input, localRef)
+	if err != nil || result == nil {
+		return nil, fmt.Errorf("could not parse time from %q", input)
 	}
-
-	return nil, 1, input
+	return &result.Time, nil
 }
 
-// GetUserTimezone attempts to load timezone or defaults to UTC
+// GetUserTimezone attempts to load timezone; returns an error if the name is invalid.
 func GetUserTimezone(timezoneStr string) (*time.Location, error) {
 	if timezoneStr == "" {
-		return time.UTC, nil
+		return nil, fmt.Errorf("timezone is required")
 	}
-
 	loc, err := time.LoadLocation(timezoneStr)
 	if err != nil {
-		return time.UTC, fmt.Errorf("invalid timezone: %w", err)
+		return nil, fmt.Errorf("invalid timezone %q: %w", timezoneStr, err)
 	}
-
 	return loc, nil
 }

@@ -110,7 +110,7 @@ func main() {
 		return
 	}
 
-	reminderService := services.NewReminderService(reminderRepo, userRepo, memoryManager, b)
+	reminderService := services.NewReminderService(reminderRepo, userRepo, prefRepo, memoryManager, b)
 	textService := services.NewTextService(
 		llmClientProxy,
 		userRepo,

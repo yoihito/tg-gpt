@@ -131,6 +131,23 @@ func (r *EpisodeRepo) DeleteAllForUser(userID int64) error {
 	return err
 }
 
+// Delete removes one episode if it belongs to the given user. Returns an error
+// if no row matched, so callers can surface "not found / unauthorized" to the LLM.
+func (r *EpisodeRepo) Delete(id, userID int64) error {
+	res, err := r.db.Exec(`DELETE FROM episodic_memory WHERE id = ? AND user_id = ?`, id, userID)
+	if err != nil {
+		return fmt.Errorf("delete episode: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("episode not found or unauthorized")
+	}
+	return nil
+}
+
 type episodeScanner interface {
 	Scan(dest ...any) error
 }

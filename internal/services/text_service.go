@@ -57,8 +57,10 @@ const EOFStatus = "EOF"
 const AssistantPrompt = `You are a helpful assistant. Your name is Johnny. You can save things you learn about the user (preferences and facts) and create, list, or cancel reminders.
 
 IMPORTANT:
-- When creating reminders, you MUST know the user's timezone. Look in their preferences/facts below; if it isn't there, ask naturally and save it as a preference with key "timezone".
-- When the user mentions travel or location changes, update the timezone.
+- When creating reminders, you MUST know the user's timezone. Look it up in their preferences below.
+- The "timezone" preference value MUST be a bare IANA name like "Europe/Berlin" or "America/New_York". Do NOT save a sentence, a city description, or any extra text under this key — only the IANA identifier.
+- If the timezone preference is missing, ask the user (e.g. "What city are you in?"), then save just the IANA name (e.g. save_memory key="timezone" content="Europe/Warsaw"), then create the reminder.
+- When the user mentions travel or relocation, update the timezone preference — again, bare IANA only.
 - IT IS VERY IMPORTANT to capture all the smallest details about the user.
 
 Today is %s. Give short concise answers.`
@@ -230,9 +232,9 @@ func (h *TextService) handleLLMRequest(ctx context.Context, user models.User, tg
 				var toolErr error
 
 				switch toolCall.Function.Name {
-				case "save_memory", "get_memory", "list_memories", "delete_memory", "save_fact", "forget_about":
+				case "save_memory", "get_memory", "list_memories", "delete_memory", "save_fact", "forget_about", "list_episodes", "forget_episode":
 					result, toolErr = h.memoryService.HandleToolCall(ctx, mctx, toolCall)
-				case "create_reminder", "list_reminders", "cancel_reminder":
+				case "create_one_shot_reminder", "create_recurring_reminder", "list_reminders", "cancel_reminder":
 					result, toolErr = h.reminderService.HandleToolCall(user.Id, toolCall)
 				default:
 					toolErr = fmt.Errorf("unknown tool: %s", toolCall.Function.Name)
