@@ -20,6 +20,10 @@ func NewReminderRepo(db *database.DB) *ReminderRepo {
 // CreateReminder inserts a new reminder. Timezone is NOT stored on the row — it
 // lives in preference_memory and is fetched at fire time for recurring reminders.
 func (r *ReminderRepo) CreateReminder(reminder models.Reminder) (int64, error) {
+	actionType := reminder.ActionType
+	if actionType == "" {
+		actionType = models.ReminderActionNotify
+	}
 	var recurrenceType sql.NullString
 	if reminder.RecurrenceType != nil {
 		recurrenceType = sql.NullString{String: string(*reminder.RecurrenceType), Valid: true}
@@ -32,8 +36,9 @@ func (r *ReminderRepo) CreateReminder(reminder models.Reminder) (int64, error) {
 	result, err := r.db.Exec(`
 		INSERT INTO reminders (
 			user_id, message, remind_at,
-			is_recurring, recurrence_type, recurrence_interval, recurrence_end_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?)
+			is_recurring, recurrence_type, recurrence_interval, recurrence_end_at,
+			action_type, action_prompt
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		reminder.UserID,
 		reminder.Message,
@@ -42,6 +47,8 @@ func (r *ReminderRepo) CreateReminder(reminder models.Reminder) (int64, error) {
 		recurrenceType,
 		reminder.RecurrenceInterval,
 		recurrenceEndAt,
+		string(actionType),
+		reminder.ActionPrompt,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("failed to create reminder: %w", err)
@@ -55,9 +62,10 @@ func (r *ReminderRepo) CreateReminder(reminder models.Reminder) (int64, error) {
 func (r *ReminderRepo) GetActiveRemindersForUser(userID int64) ([]models.Reminder, error) {
 	rows, err := r.db.Query(`
 		SELECT id, user_id, message, remind_at, created_at, updated_at,
-		       is_fired, is_cancelled,
+		       is_fired, is_cancelled, is_processing,
 		       is_recurring, recurrence_type, recurrence_interval,
-		       recurrence_end_at, last_fired_at
+		       recurrence_end_at, last_fired_at, processing_started_at,
+		       action_type, action_prompt
 		FROM reminders
 		WHERE user_id = ? AND is_cancelled = false AND is_fired = false
 		ORDER BY remind_at ASC
@@ -70,18 +78,21 @@ func (r *ReminderRepo) GetActiveRemindersForUser(userID int64) ([]models.Reminde
 }
 
 func (r *ReminderRepo) GetDueReminders(before time.Time) ([]models.Reminder, error) {
+	staleProcessingBefore := before.Add(-30 * time.Minute)
 	rows, err := r.db.Query(`
 		SELECT id, user_id, message, remind_at, created_at, updated_at,
-		       is_fired, is_cancelled,
+		       is_fired, is_cancelled, is_processing,
 		       is_recurring, recurrence_type, recurrence_interval,
-		       recurrence_end_at, last_fired_at
+		       recurrence_end_at, last_fired_at, processing_started_at,
+		       action_type, action_prompt
 		FROM reminders
 		WHERE remind_at <= ?
 		  AND is_fired = false
 		  AND is_cancelled = false
+		  AND (is_processing = false OR processing_started_at < ?)
 		ORDER BY remind_at ASC
 		LIMIT 100
-	`, before.Unix())
+	`, before.Unix(), staleProcessingBefore.Unix())
 	if err != nil {
 		return nil, fmt.Errorf("failed to query due reminders: %w", err)
 	}
@@ -89,12 +100,50 @@ func (r *ReminderRepo) GetDueReminders(before time.Time) ([]models.Reminder, err
 	return r.scanReminders(rows)
 }
 
+func (r *ReminderRepo) ClaimReminder(reminderID int64, now time.Time) (bool, error) {
+	staleProcessingBefore := now.Add(-30 * time.Minute)
+	result, err := r.db.Exec(`
+		UPDATE reminders
+		SET is_processing = true,
+		    processing_started_at = ?,
+		    updated_at = strftime('%s', 'now')
+		WHERE id = ?
+		  AND is_fired = false
+		  AND is_cancelled = false
+		  AND (is_processing = false OR processing_started_at < ?)
+	`, now.Unix(), reminderID, staleProcessingBefore.Unix())
+	if err != nil {
+		return false, fmt.Errorf("failed to claim reminder: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("failed to check claimed reminder rows: %w", err)
+	}
+	return rows > 0, nil
+}
+
+func (r *ReminderRepo) ReleaseReminderClaim(reminderID int64) error {
+	_, err := r.db.Exec(`
+		UPDATE reminders
+		SET is_processing = false,
+		    processing_started_at = NULL,
+		    updated_at = strftime('%s', 'now')
+		WHERE id = ?
+	`, reminderID)
+	if err != nil {
+		return fmt.Errorf("failed to release reminder claim: %w", err)
+	}
+	return nil
+}
+
 // MarkReminderFired marks a one-shot reminder as fired.
 func (r *ReminderRepo) MarkReminderFired(reminderID int64, firedAt time.Time) error {
 	_, err := r.db.Exec(`
 		UPDATE reminders
 		SET is_fired = true,
+		    is_processing = false,
 		    last_fired_at = ?,
+		    processing_started_at = NULL,
 		    updated_at = strftime('%s', 'now')
 		WHERE id = ?
 	`, firedAt.Unix(), reminderID)
@@ -111,7 +160,9 @@ func (r *ReminderRepo) UpdateNextOccurrence(reminderID int64, newRemindAt, lastF
 		UPDATE reminders
 		SET remind_at = ?,
 		    is_fired = false,
+		    is_processing = false,
 		    last_fired_at = ?,
+		    processing_started_at = NULL,
 		    updated_at = strftime('%s', 'now')
 		WHERE id = ?
 	`, newRemindAt.Unix(), lastFiredAt.Unix(), reminderID)
@@ -125,6 +176,8 @@ func (r *ReminderRepo) CancelReminder(reminderID int64, userID int64) error {
 	result, err := r.db.Exec(`
 		UPDATE reminders
 		SET is_cancelled = true,
+		    is_processing = false,
+		    processing_started_at = NULL,
 		    updated_at = strftime('%s', 'now')
 		WHERE id = ? AND user_id = ?
 	`, reminderID, userID)
@@ -144,9 +197,10 @@ func (r *ReminderRepo) CancelReminder(reminderID int64, userID int64) error {
 func (r *ReminderRepo) GetReminderByID(reminderID int64, userID int64) (*models.Reminder, error) {
 	row := r.db.QueryRow(`
 		SELECT id, user_id, message, remind_at, created_at, updated_at,
-		       is_fired, is_cancelled,
+		       is_fired, is_cancelled, is_processing,
 		       is_recurring, recurrence_type, recurrence_interval,
-		       recurrence_end_at, last_fired_at
+		       recurrence_end_at, last_fired_at, processing_started_at,
+		       action_type, action_prompt
 		FROM reminders
 		WHERE id = ? AND user_id = ?
 	`, reminderID, userID)
@@ -165,7 +219,8 @@ func (r *ReminderRepo) scanReminders(rows *sql.Rows) ([]models.Reminder, error) 
 	for rows.Next() {
 		var reminder models.Reminder
 		var recurrenceType sql.NullString
-		var recurrenceEndAt, lastFiredAt sql.NullInt64
+		var recurrenceEndAt, lastFiredAt, processingStartedAt sql.NullInt64
+		var actionType, actionPrompt sql.NullString
 		var remindAt, createdAt, updatedAt int64
 
 		err := rows.Scan(
@@ -177,11 +232,15 @@ func (r *ReminderRepo) scanReminders(rows *sql.Rows) ([]models.Reminder, error) 
 			&updatedAt,
 			&reminder.IsFired,
 			&reminder.IsCancelled,
+			&reminder.IsProcessing,
 			&reminder.IsRecurring,
 			&recurrenceType,
 			&reminder.RecurrenceInterval,
 			&recurrenceEndAt,
 			&lastFiredAt,
+			&processingStartedAt,
+			&actionType,
+			&actionPrompt,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan reminder: %w", err)
@@ -203,6 +262,17 @@ func (r *ReminderRepo) scanReminders(rows *sql.Rows) ([]models.Reminder, error) 
 			t := time.Unix(lastFiredAt.Int64, 0)
 			reminder.LastFiredAt = &t
 		}
+		if processingStartedAt.Valid {
+			t := time.Unix(processingStartedAt.Int64, 0)
+			reminder.ProcessingStartedAt = &t
+		}
+		reminder.ActionType = models.ReminderActionNotify
+		if actionType.Valid && actionType.String != "" {
+			reminder.ActionType = models.ReminderActionType(actionType.String)
+		}
+		if actionPrompt.Valid {
+			reminder.ActionPrompt = actionPrompt.String
+		}
 
 		reminders = append(reminders, reminder)
 	}
@@ -212,7 +282,8 @@ func (r *ReminderRepo) scanReminders(rows *sql.Rows) ([]models.Reminder, error) 
 func (r *ReminderRepo) scanReminder(row *sql.Row) (models.Reminder, error) {
 	var reminder models.Reminder
 	var recurrenceType sql.NullString
-	var recurrenceEndAt, lastFiredAt sql.NullInt64
+	var recurrenceEndAt, lastFiredAt, processingStartedAt sql.NullInt64
+	var actionType, actionPrompt sql.NullString
 	var remindAt, createdAt, updatedAt int64
 
 	err := row.Scan(
@@ -224,11 +295,15 @@ func (r *ReminderRepo) scanReminder(row *sql.Row) (models.Reminder, error) {
 		&updatedAt,
 		&reminder.IsFired,
 		&reminder.IsCancelled,
+		&reminder.IsProcessing,
 		&reminder.IsRecurring,
 		&recurrenceType,
 		&reminder.RecurrenceInterval,
 		&recurrenceEndAt,
 		&lastFiredAt,
+		&processingStartedAt,
+		&actionType,
+		&actionPrompt,
 	)
 	if err != nil {
 		return models.Reminder{}, err
@@ -249,6 +324,17 @@ func (r *ReminderRepo) scanReminder(row *sql.Row) (models.Reminder, error) {
 	if lastFiredAt.Valid {
 		t := time.Unix(lastFiredAt.Int64, 0)
 		reminder.LastFiredAt = &t
+	}
+	if processingStartedAt.Valid {
+		t := time.Unix(processingStartedAt.Int64, 0)
+		reminder.ProcessingStartedAt = &t
+	}
+	reminder.ActionType = models.ReminderActionNotify
+	if actionType.Valid && actionType.String != "" {
+		reminder.ActionType = models.ReminderActionType(actionType.String)
+	}
+	if actionPrompt.Valid {
+		reminder.ActionPrompt = actionPrompt.String
 	}
 	return reminder, nil
 }

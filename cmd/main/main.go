@@ -122,6 +122,7 @@ func main() {
 		dialogTimeout,
 		appConfig.DefaultModel.ModelId,
 	)
+	reminderService.SetScheduledActionRunner(textService)
 	voiceService := &services.VoiceService{
 		Client: llmClientProxy.OpenaiClient,
 	}

@@ -3,27 +3,35 @@ package models
 import "time"
 
 type RecurrenceType string
+type ReminderActionType string
 
 const (
 	RecurrenceTypeDaily   RecurrenceType = "daily"
 	RecurrenceTypeWeekly  RecurrenceType = "weekly"
 	RecurrenceTypeMonthly RecurrenceType = "monthly"
+
+	ReminderActionNotify ReminderActionType = "notify"
+	ReminderActionPrompt ReminderActionType = "prompt"
 )
 
 type Reminder struct {
-	ID                 int64
-	UserID             int64
-	Message            string
-	RemindAt           time.Time
-	CreatedAt          time.Time
-	UpdatedAt          time.Time
-	IsFired            bool
-	IsCancelled        bool
-	IsRecurring        bool
-	RecurrenceType     *RecurrenceType
-	RecurrenceInterval int
-	RecurrenceEndAt    *time.Time
-	LastFiredAt        *time.Time
+	ID                  int64
+	UserID              int64
+	Message             string
+	RemindAt            time.Time
+	CreatedAt           time.Time
+	UpdatedAt           time.Time
+	IsFired             bool
+	IsCancelled         bool
+	IsProcessing        bool
+	IsRecurring         bool
+	RecurrenceType      *RecurrenceType
+	RecurrenceInterval  int
+	RecurrenceEndAt     *time.Time
+	LastFiredAt         *time.Time
+	ProcessingStartedAt *time.Time
+	ActionType          ReminderActionType
+	ActionPrompt        string
 }
 
 func (r *Reminder) ShouldFire(now time.Time) bool {

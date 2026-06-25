@@ -91,18 +91,20 @@ func (h *TextService) RetryWithMessage(
 	userMsg llm.Message,
 	streamer *telegram_utils.TelegramStreamer,
 ) error {
-	return h.handleLLMRequest(ctx, user, tgUserMessageId, userMsg, streamer)
+	_, err := h.handleLLMRequest(ctx, user, tgUserMessageId, userMsg, streamer)
+	return err
 }
 
 func (h *TextService) OnStreamableTextHandler(ctx context.Context, user models.User, tgUserMessageId int64, userText string, streamer *telegram_utils.TelegramStreamer) error {
-	return h.handleLLMRequest(ctx, user, tgUserMessageId, llm.Message{
+	_, err := h.handleLLMRequest(ctx, user, tgUserMessageId, llm.Message{
 		Role:    llm.RoleUser,
 		Content: userText,
 	}, streamer)
+	return err
 }
 
 func (h *TextService) OnStreamableVisionHandler(ctx context.Context, user models.User, tgUserMessageId int64, userText string, imageUrl string, streamer *telegram_utils.TelegramStreamer) error {
-	return h.handleLLMRequest(ctx, user, tgUserMessageId, llm.Message{
+	_, err := h.handleLLMRequest(ctx, user, tgUserMessageId, llm.Message{
 		Role: llm.RoleUser,
 		Parts: []llm.ContentPart{
 			{
@@ -115,6 +117,23 @@ func (h *TextService) OnStreamableVisionHandler(ctx context.Context, user models
 			},
 		},
 	}, streamer)
+	return err
+}
+
+func (h *TextService) RunScheduledAction(ctx context.Context, user models.User, reminder models.Reminder) (string, error) {
+	prompt := reminder.ActionPrompt
+	if prompt == "" {
+		prompt = reminder.Message
+	}
+	msg := llm.Message{
+		Role: llm.RoleUser,
+		Content: fmt.Sprintf(
+			"[Scheduled reminder action triggered]\nReminder: %s\nTask: %s",
+			reminder.Message,
+			prompt,
+		),
+	}
+	return h.handleLLMRequestWithTools(ctx, user, 0, msg, nil, h.getScheduledActionTools(), "\n\nScheduled action mode: execute the scheduled task now and return the result directly. Only the web_search tool is available.")
 }
 
 func extractQueryText(msg llm.Message) string {
@@ -129,7 +148,37 @@ func extractQueryText(msg llm.Message) string {
 	return ""
 }
 
-func (h *TextService) handleLLMRequest(ctx context.Context, user models.User, tgUserMessageId int64, newMessage llm.Message, streamer *telegram_utils.TelegramStreamer) error {
+func (h *TextService) handleLLMRequest(ctx context.Context, user models.User, tgUserMessageId int64, newMessage llm.Message, streamer *telegram_utils.TelegramStreamer) (string, error) {
+	return h.handleLLMRequestWithTools(ctx, user, tgUserMessageId, newMessage, streamer, h.getDefaultTools(), "")
+}
+
+func (h *TextService) getDefaultTools() []llm.Tool {
+	tools := append(
+		h.memoryService.GetMemoryTools(),
+		h.reminderService.GetReminderTools()...,
+	)
+	if h.webSearchService != nil {
+		tools = append(tools, h.webSearchService.GetWebSearchTools()...)
+	}
+	return tools
+}
+
+func (h *TextService) getScheduledActionTools() []llm.Tool {
+	if h.webSearchService == nil {
+		return nil
+	}
+	return h.webSearchService.GetWebSearchTools()
+}
+
+func (h *TextService) handleLLMRequestWithTools(
+	ctx context.Context,
+	user models.User,
+	tgUserMessageId int64,
+	newMessage llm.Message,
+	streamer *telegram_utils.TelegramStreamer,
+	tools []llm.Tool,
+	systemPromptSuffix string,
+) (string, error) {
 	if time.Now().Unix()-user.LastInteraction > h.dialogTimeout {
 		oldDialogID := user.CurrentDialogId
 		go h.memoryManager.CloseDialog(context.WithoutCancel(ctx), user.Id, oldDialogID)
@@ -147,35 +196,31 @@ func (h *TextService) handleLLMRequest(ctx context.Context, user models.User, tg
 	}
 
 	if err := h.usersRepo.UpdateUser(user); err != nil {
-		return err
+		return "", err
 	}
 
 	mctx, err := h.memoryManager.BeginTurn(user.Id, user.CurrentDialogId, newMessage, tgUserMessageId)
 	if err != nil {
 		slog.ErrorContext(ctx, "Error beginning turn", "error", err)
-		return err
+		return "", err
 	}
 
 	queryText := extractQueryText(newMessage)
 	retrieved, err := h.memoryManager.Retrieve(ctx, mctx, queryText)
 	if err != nil {
 		slog.ErrorContext(ctx, "Error retrieving memory", "error", err)
-		return err
+		return "", err
 	}
 
-	systemHeader := fmt.Sprintf(AssistantPrompt, time.Now().Format(time.RFC3339))
+	systemHeader := fmt.Sprintf(AssistantPrompt, time.Now().Format(time.RFC3339)) + systemPromptSuffix
 	history := h.memoryManager.AssemblePrompt(systemHeader, retrieved)
 
 	accumulatedInputTokens := int64(0)
 	accumulatedOutputTokens := int64(0)
 	accumulatedResponse := ""
-
-	tools := append(
-		h.memoryService.GetMemoryTools(),
-		h.reminderService.GetReminderTools()...,
-	)
-	if h.webSearchService != nil {
-		tools = append(tools, h.webSearchService.GetWebSearchTools()...)
+	allowedTools := make(map[string]struct{}, len(tools))
+	for _, tool := range tools {
+		allowedTools[tool.Name] = struct{}{}
 	}
 
 	for {
@@ -187,7 +232,7 @@ func (h *TextService) handleLLMRequest(ctx context.Context, user models.User, tg
 		})
 		if err != nil {
 			slog.ErrorContext(ctx, "Got an error while creating chat completion stream", "error", err)
-			return err
+			return "", err
 		}
 		defer stream.Close()
 
@@ -195,21 +240,25 @@ func (h *TextService) handleLLMRequest(ctx context.Context, user models.User, tg
 		for stream.Next() {
 			event := stream.Event()
 			accumulator.AddEvent(event)
-			if err := streamer.SendEvent(event); err != nil {
-				slog.ErrorContext(ctx, "Got an error while sending chunk", "error", err)
-				return err
+			if streamer != nil {
+				if err := streamer.SendEvent(event); err != nil {
+					slog.ErrorContext(ctx, "Got an error while sending chunk", "error", err)
+					return "", err
+				}
 			}
 		}
 
 		if err := stream.Err(); err != nil {
 			if errors.Is(err, io.EOF) {
-				if err := streamer.Flush(); err != nil {
-					slog.ErrorContext(ctx, "Got an error while flushing stream", "error", err)
-					return err
+				if streamer != nil {
+					if err := streamer.Flush(); err != nil {
+						slog.ErrorContext(ctx, "Got an error while flushing stream", "error", err)
+						return "", err
+					}
 				}
 			} else {
 				slog.ErrorContext(ctx, "Got an error while receiving chat completion stream", "error", err)
-				return err
+				return "", err
 			}
 		}
 		accumulatedInputTokens += accumulator.InputTokens()
@@ -222,7 +271,7 @@ func (h *TextService) handleLLMRequest(ctx context.Context, user models.User, tg
 
 			if _, err := h.memoryManager.AppendModelMsg(mctx, accumulatedResponse, toolCalls, modelToUse, 0); err != nil {
 				slog.ErrorContext(ctx, "Error appending model_msg with tool calls", "error", err)
-				return err
+				return "", err
 			}
 
 			history = append(history, llm.Message{
@@ -235,21 +284,31 @@ func (h *TextService) handleLLMRequest(ctx context.Context, user models.User, tg
 				var result string
 				var toolErr error
 
-				switch toolCall.Name {
-				case "save_memory", "get_memory", "list_memories", "delete_memory", "save_fact", "forget_about", "list_episodes", "forget_episode":
-					result, toolErr = h.memoryService.HandleToolCall(ctx, mctx, toolCall)
-				case "create_one_shot_reminder", "create_recurring_reminder", "list_reminders", "cancel_reminder":
-					result, toolErr = h.reminderService.HandleToolCall(user.Id, toolCall)
-				case "web_search":
-					result, toolErr = h.webSearchService.HandleToolCall(ctx, toolCall)
-				default:
-					toolErr = fmt.Errorf("unknown tool: %s", toolCall.Name)
-					result = "Unknown tool"
+				if _, ok := allowedTools[toolCall.Name]; !ok {
+					toolErr = fmt.Errorf("tool is not available in this mode: %s", toolCall.Name)
+					result = "Tool is not available in this mode."
+				} else {
+					switch toolCall.Name {
+					case "save_memory", "get_memory", "list_memories", "delete_memory", "save_fact", "forget_about", "list_episodes", "forget_episode":
+						result, toolErr = h.memoryService.HandleToolCall(ctx, mctx, toolCall)
+					case "create_one_shot_reminder", "create_recurring_reminder", "list_reminders", "cancel_reminder":
+						result, toolErr = h.reminderService.HandleToolCall(user.Id, toolCall)
+					case "web_search":
+						if h.webSearchService == nil {
+							result = "Web search is not configured."
+							toolErr = fmt.Errorf("web search is not configured")
+						} else {
+							result, toolErr = h.webSearchService.HandleToolCall(ctx, toolCall)
+						}
+					default:
+						toolErr = fmt.Errorf("unknown tool: %s", toolCall.Name)
+						result = "Unknown tool"
+					}
 				}
 
 				if _, err := h.memoryManager.AppendToolResult(mctx, toolCall.ID, toolCall.Name, result); err != nil {
 					slog.ErrorContext(ctx, "Error appending tool_result", "error", err)
-					return err
+					return "", err
 				}
 
 				history = append(history, llm.Message{
@@ -262,13 +321,13 @@ func (h *TextService) handleLLMRequest(ctx context.Context, user models.User, tg
 				})
 				if toolErr != nil {
 					slog.ErrorContext(ctx, "Error handling tool call", "error", toolErr)
-					return toolErr
+					return "", toolErr
 				}
 			}
 		} else {
 			if _, err := h.memoryManager.AppendModelMsg(mctx, accumulatedResponse, nil, modelToUse, 0); err != nil {
 				slog.ErrorContext(ctx, "Error appending model_msg", "error", err)
-				return err
+				return "", err
 			}
 			break
 		}
@@ -282,5 +341,5 @@ func (h *TextService) handleLLMRequest(ctx context.Context, user models.User, tg
 
 	go h.memoryManager.EndTurn(context.WithoutCancel(ctx), mctx, queryText, accumulatedResponse)
 
-	return nil
+	return accumulatedResponse, nil
 }

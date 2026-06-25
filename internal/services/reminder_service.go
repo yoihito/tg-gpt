@@ -14,8 +14,13 @@ import (
 	"vadimgribanov.com/tg-gpt/internal/llm"
 	"vadimgribanov.com/tg-gpt/internal/models"
 	"vadimgribanov.com/tg-gpt/internal/repositories"
+	"vadimgribanov.com/tg-gpt/internal/telegram_utils"
 	"vadimgribanov.com/tg-gpt/internal/utils"
 )
+
+type ScheduledActionRunner interface {
+	RunScheduledAction(ctx context.Context, user models.User, reminder models.Reminder) (string, error)
+}
 
 type ReminderService struct {
 	reminderRepo  *repositories.ReminderRepo
@@ -24,6 +29,7 @@ type ReminderService struct {
 	memoryManager *MemoryManager
 	timeParser    *utils.TimeParser
 	bot           *tele.Bot
+	actionRunner  ScheduledActionRunner
 
 	ticker    *time.Ticker
 	stopChan  chan struct{}
@@ -50,6 +56,10 @@ func NewReminderService(
 	}
 }
 
+func (s *ReminderService) SetScheduledActionRunner(actionRunner ScheduledActionRunner) {
+	s.actionRunner = actionRunner
+}
+
 // isoLocalLayout: ISO 8601 without timezone offset; interpreted in the supplied
 // *time.Location at parse time.
 const isoLocalLayout = "2006-01-02T15:04:05"
@@ -73,6 +83,15 @@ func (s *ReminderService) GetReminderTools() []llm.Tool {
 					"timezone": map[string]interface{}{
 						"type":        "string",
 						"description": "User's IANA timezone (e.g. 'Europe/Berlin'). Read it from the user's preferences shown in the system prompt; if it's not there, ask the user and save it as preference 'timezone' before calling this tool.",
+					},
+					"action_type": map[string]interface{}{
+						"type":        "string",
+						"enum":        []string{"notify", "prompt"},
+						"description": "Use notify for simple reminders. Use prompt when the user wants the bot to perform a scheduled action later.",
+					},
+					"action_prompt": map[string]interface{}{
+						"type":        "string",
+						"description": "Instruction to execute at reminder time. Required when action_type is prompt. Scheduled actions can only use web_search.",
 					},
 				},
 				"required": []string{"time_expression", "message", "timezone"},
@@ -108,6 +127,15 @@ func (s *ReminderService) GetReminderTools() []llm.Tool {
 					"until": map[string]interface{}{
 						"type":        "string",
 						"description": "Optional ISO 8601 datetime after which recurrence stops. Omit for indefinite recurrence.",
+					},
+					"action_type": map[string]interface{}{
+						"type":        "string",
+						"enum":        []string{"notify", "prompt"},
+						"description": "Use notify for simple reminders. Use prompt when the user wants the bot to perform a scheduled action each time.",
+					},
+					"action_prompt": map[string]interface{}{
+						"type":        "string",
+						"description": "Instruction to execute at reminder time. Required when action_type is prompt. Scheduled actions can only use web_search.",
 					},
 				},
 				"required": []string{"message", "timezone", "frequency", "start_at"},
@@ -168,9 +196,15 @@ func (s *ReminderService) handleCreateOneShotReminder(userID int64, arguments st
 		TimeExpression string `json:"time_expression"`
 		Message        string `json:"message"`
 		Timezone       string `json:"timezone"`
+		ActionType     string `json:"action_type"`
+		ActionPrompt   string `json:"action_prompt"`
 	}
 	if err := json.Unmarshal([]byte(arguments), &args); err != nil {
 		return "", fmt.Errorf("invalid arguments for create_one_shot_reminder: %w", err)
+	}
+	actionType, actionPrompt, err := normalizeReminderAction(args.ActionType, args.ActionPrompt)
+	if err != nil {
+		return err.Error(), nil
 	}
 
 	loc, err := utils.GetUserTimezone(args.Timezone)
@@ -189,6 +223,8 @@ func (s *ReminderService) handleCreateOneShotReminder(userID int64, arguments st
 		RemindAt:           *parsedTime,
 		IsRecurring:        false,
 		RecurrenceInterval: 1,
+		ActionType:         actionType,
+		ActionPrompt:       actionPrompt,
 	})
 	if err != nil {
 		slog.Error("Failed to create one-shot reminder", "error", err, "user_id", userID)
@@ -196,20 +232,29 @@ func (s *ReminderService) handleCreateOneShotReminder(userID int64, arguments st
 	}
 	timeStr := parsedTime.In(loc).Format("Mon Jan 2, 2006 at 3:04 PM MST")
 	slog.Info("One-shot reminder created", "reminder_id", id, "user_id", userID, "remind_at", parsedTime, "timezone", args.Timezone)
+	if actionType == models.ReminderActionPrompt {
+		return fmt.Sprintf("Scheduled action set for %s: %s", timeStr, args.Message), nil
+	}
 	return fmt.Sprintf("Reminder set for %s: %s", timeStr, args.Message), nil
 }
 
 func (s *ReminderService) handleCreateRecurringReminder(userID int64, arguments string) (string, error) {
 	var args struct {
-		Message   string `json:"message"`
-		Timezone  string `json:"timezone"`
-		Frequency string `json:"frequency"`
-		Interval  int    `json:"interval"`
-		StartAt   string `json:"start_at"`
-		Until     string `json:"until"`
+		Message      string `json:"message"`
+		Timezone     string `json:"timezone"`
+		Frequency    string `json:"frequency"`
+		Interval     int    `json:"interval"`
+		StartAt      string `json:"start_at"`
+		Until        string `json:"until"`
+		ActionType   string `json:"action_type"`
+		ActionPrompt string `json:"action_prompt"`
 	}
 	if err := json.Unmarshal([]byte(arguments), &args); err != nil {
 		return "", fmt.Errorf("invalid arguments for create_recurring_reminder: %w", err)
+	}
+	actionType, actionPrompt, err := normalizeReminderAction(args.ActionType, args.ActionPrompt)
+	if err != nil {
+		return err.Error(), nil
 	}
 
 	loc, err := utils.GetUserTimezone(args.Timezone)
@@ -256,6 +301,8 @@ func (s *ReminderService) handleCreateRecurringReminder(userID int64, arguments 
 		RecurrenceType:     &rType,
 		RecurrenceInterval: interval,
 		RecurrenceEndAt:    until,
+		ActionType:         actionType,
+		ActionPrompt:       actionPrompt,
 	})
 	if err != nil {
 		slog.Error("Failed to create recurring reminder", "error", err, "user_id", userID)
@@ -263,7 +310,11 @@ func (s *ReminderService) handleCreateRecurringReminder(userID int64, arguments 
 	}
 
 	timeStr := startAt.In(loc).Format("Mon Jan 2, 2006 at 3:04 PM MST")
-	resp := fmt.Sprintf("Recurring reminder set, first fire %s (repeats %s every %d). Message: %s", timeStr, args.Frequency, interval, args.Message)
+	label := "Recurring reminder set"
+	if actionType == models.ReminderActionPrompt {
+		label = "Recurring scheduled action set"
+	}
+	resp := fmt.Sprintf("%s, first fire %s (repeats %s every %d). Message: %s", label, timeStr, args.Frequency, interval, args.Message)
 	if until != nil {
 		resp += fmt.Sprintf(" until %s", until.In(loc).Format("Mon Jan 2, 2006"))
 	}
@@ -276,6 +327,25 @@ func (s *ReminderService) handleCreateRecurringReminder(userID int64, arguments 
 		"timezone", args.Timezone,
 	)
 	return resp, nil
+}
+
+func normalizeReminderAction(actionTypeRaw, actionPromptRaw string) (models.ReminderActionType, string, error) {
+	actionType := models.ReminderActionType(strings.TrimSpace(actionTypeRaw))
+	if actionType == "" {
+		actionType = models.ReminderActionNotify
+	}
+	actionPrompt := strings.TrimSpace(actionPromptRaw)
+	switch actionType {
+	case models.ReminderActionNotify:
+		return actionType, "", nil
+	case models.ReminderActionPrompt:
+		if actionPrompt == "" {
+			return "", "", fmt.Errorf("Cannot create scheduled action: action_prompt is required when action_type is prompt.")
+		}
+		return actionType, actionPrompt, nil
+	default:
+		return "", "", fmt.Errorf("Invalid action_type %q. Must be 'notify' or 'prompt'.", actionTypeRaw)
+	}
 }
 
 func (s *ReminderService) handleListReminders(userID int64) (string, error) {
@@ -299,6 +369,9 @@ func (s *ReminderService) handleListReminders(userID int64) (string, error) {
 			i+1, r.ID, r.RemindAt.In(loc).Format("Mon Jan 2 at 3:04 PM"), r.Message)
 		if r.IsRecurring && r.RecurrenceType != nil {
 			fmt.Fprintf(&b, " (repeats %s every %d)", *r.RecurrenceType, r.RecurrenceInterval)
+		}
+		if r.ActionType == models.ReminderActionPrompt {
+			fmt.Fprintf(&b, " [scheduled action]")
 		}
 		b.WriteString("\n")
 	}
@@ -402,9 +475,25 @@ func (s *ReminderService) checkAndFireReminders(ctx context.Context) {
 func (s *ReminderService) fireReminder(ctx context.Context, reminder models.Reminder) {
 	slog.InfoContext(ctx, "Firing reminder", "reminder_id", reminder.ID, "user_id", reminder.UserID)
 
+	claimed, err := s.reminderRepo.ClaimReminder(reminder.ID, time.Now())
+	if err != nil {
+		slog.ErrorContext(ctx, "Failed to claim reminder", "error", err, "reminder_id", reminder.ID)
+		return
+	}
+	if !claimed {
+		slog.InfoContext(ctx, "Reminder already claimed or closed", "reminder_id", reminder.ID)
+		return
+	}
+
 	user, err := s.userRepo.GetUser(reminder.UserID)
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to get user for reminder", "error", err, "user_id", reminder.UserID)
+		s.releaseReminderClaim(ctx, reminder.ID)
+		return
+	}
+
+	if reminder.ActionType == models.ReminderActionPrompt {
+		s.fireScheduledAction(ctx, user, reminder)
 		return
 	}
 
@@ -422,6 +511,7 @@ func (s *ReminderService) fireReminder(ctx context.Context, reminder models.Remi
 	sentMsg, err := s.bot.Send(&tele.User{ID: user.ChatId}, naturalMessage)
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to send reminder", "error", err, "reminder_id", reminder.ID)
+		s.releaseReminderClaim(ctx, reminder.ID)
 		return
 	}
 
@@ -444,6 +534,63 @@ func (s *ReminderService) fireReminder(ctx context.Context, reminder models.Remi
 		slog.ErrorContext(ctx, "Failed to mark reminder as fired", "error", err, "reminder_id", reminder.ID)
 	}
 	slog.InfoContext(ctx, "Reminder fired", "reminder_id", reminder.ID)
+}
+
+func (s *ReminderService) fireScheduledAction(ctx context.Context, user models.User, reminder models.Reminder) {
+	if s.actionRunner == nil {
+		slog.ErrorContext(ctx, "No scheduled action runner configured", "reminder_id", reminder.ID)
+		s.releaseReminderClaim(ctx, reminder.ID)
+		return
+	}
+
+	response, err := s.actionRunner.RunScheduledAction(ctx, user, reminder)
+	if err != nil {
+		slog.ErrorContext(ctx, "Failed to run scheduled action", "error", err, "reminder_id", reminder.ID)
+		s.releaseReminderClaim(ctx, reminder.ID)
+		return
+	}
+
+	if err := s.sendBotMessage(ctx, user.ChatId, response); err != nil {
+		slog.ErrorContext(ctx, "Failed to send scheduled action result", "error", err, "reminder_id", reminder.ID)
+		s.releaseReminderClaim(ctx, reminder.ID)
+		return
+	}
+
+	if reminder.IsRecurring && !reminder.HasExpiredRecurrence() {
+		s.rescheduleRecurring(ctx, reminder)
+		return
+	}
+
+	if err := s.reminderRepo.MarkReminderFired(reminder.ID, time.Now()); err != nil {
+		slog.ErrorContext(ctx, "Failed to mark scheduled action as fired", "error", err, "reminder_id", reminder.ID)
+	}
+	slog.InfoContext(ctx, "Scheduled action fired", "reminder_id", reminder.ID)
+}
+
+func (s *ReminderService) sendBotMessage(ctx context.Context, chatID int64, text string) error {
+	if strings.TrimSpace(text) == "" {
+		text = "Scheduled action completed, but returned no text."
+	}
+	for len(text) > 0 {
+		chunk := text
+		if len(chunk) > telegram_utils.MaxTelegramMessageLength {
+			chunk = text[:telegram_utils.MaxTelegramMessageLength]
+		}
+		if _, err := s.bot.Send(&tele.User{ID: chatID}, telegram_utils.FixMarkdown(chunk), &tele.SendOptions{ParseMode: tele.ModeMarkdown}); err != nil {
+			slog.WarnContext(ctx, "Failed to send markdown message; retrying as plain text", "error", err)
+			if _, fallbackErr := s.bot.Send(&tele.User{ID: chatID}, chunk, &tele.SendOptions{ParseMode: tele.ModeDefault}); fallbackErr != nil {
+				return fallbackErr
+			}
+		}
+		text = text[len(chunk):]
+	}
+	return nil
+}
+
+func (s *ReminderService) releaseReminderClaim(ctx context.Context, reminderID int64) {
+	if err := s.reminderRepo.ReleaseReminderClaim(reminderID); err != nil {
+		slog.ErrorContext(ctx, "Failed to release reminder claim", "error", err, "reminder_id", reminderID)
+	}
 }
 
 func (s *ReminderService) rescheduleRecurring(ctx context.Context, reminder models.Reminder) {

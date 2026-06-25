@@ -72,7 +72,37 @@ func (db *DB) Migrate() error {
 		return fmt.Errorf("failed to drop reminders.timezone column: %w", err)
 	}
 
+	if err := db.addReminderActionColumnsIfMissing(); err != nil {
+		return fmt.Errorf("failed to add reminder action columns: %w", err)
+	}
+
 	slog.Info("Database migrations completed successfully")
+	return nil
+}
+
+func (db *DB) addReminderActionColumnsIfMissing() error {
+	columns := []struct {
+		name string
+		sql  string
+	}{
+		{"is_processing", `ALTER TABLE reminders ADD COLUMN is_processing BOOLEAN DEFAULT false`},
+		{"processing_started_at", `ALTER TABLE reminders ADD COLUMN processing_started_at INTEGER`},
+		{"action_type", `ALTER TABLE reminders ADD COLUMN action_type TEXT NOT NULL DEFAULT 'notify'`},
+		{"action_prompt", `ALTER TABLE reminders ADD COLUMN action_prompt TEXT`},
+	}
+	for _, column := range columns {
+		has, err := columnExists(db.DB, "reminders", column.name)
+		if err != nil {
+			return err
+		}
+		if has {
+			continue
+		}
+		slog.Info("Adding reminders column", "column", column.name)
+		if _, err := db.Exec(column.sql); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -356,11 +386,15 @@ CREATE TABLE IF NOT EXISTS reminders (
 	updated_at INTEGER DEFAULT (strftime('%s', 'now')),
 	is_fired BOOLEAN DEFAULT false,
 	is_cancelled BOOLEAN DEFAULT false,
+	is_processing BOOLEAN DEFAULT false,
 	is_recurring BOOLEAN DEFAULT false,
 	recurrence_type TEXT CHECK (recurrence_type IN ('daily', 'weekly', 'monthly', NULL)),
 	recurrence_interval INTEGER DEFAULT 1,
 	recurrence_end_at INTEGER,
 	last_fired_at INTEGER,
+	processing_started_at INTEGER,
+	action_type TEXT NOT NULL DEFAULT 'notify',
+	action_prompt TEXT,
 	FOREIGN KEY (user_id) REFERENCES users(id)
 );
 
