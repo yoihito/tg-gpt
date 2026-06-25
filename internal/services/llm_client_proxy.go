@@ -8,22 +8,22 @@ import (
 	openai "github.com/sashabaranov/go-openai"
 	"vadimgribanov.com/tg-gpt/internal/adapters"
 	"vadimgribanov.com/tg-gpt/internal/config"
+	"vadimgribanov.com/tg-gpt/internal/llm"
 	"vadimgribanov.com/tg-gpt/internal/vendors/anthropic"
 )
 
 type LLMClientProxy struct {
 	supportedModels map[string]config.LLMModel
-	providers       map[string]ProviderClient
+	providers       map[llm.Provider]ProviderClient
 	OpenaiClient    *openai.Client
 }
 
 type ProviderClient interface {
-	CreateChatCompletionStream(ctx context.Context, request openai.ChatCompletionRequest) (adapters.LLMStream, error)
-	Provider() string
+	llm.Client
 }
 
 func NewLLMClientProxy() *LLMClientProxy {
-	return &LLMClientProxy{supportedModels: make(map[string]config.LLMModel), providers: make(map[string]ProviderClient)}
+	return &LLMClientProxy{supportedModels: make(map[string]config.LLMModel), providers: make(map[llm.Provider]ProviderClient)}
 }
 
 func NewClientProxyFromConfig(config *config.Config) *LLMClientProxy {
@@ -64,17 +64,18 @@ func (p *LLMClientProxy) getClient(modelId string) (ProviderClient, error) {
 	if _, ok := p.supportedModels[modelId]; !ok {
 		return nil, fmt.Errorf("client with modelId %s not found", modelId)
 	}
-	if _, ok := p.providers[p.supportedModels[modelId].Provider]; !ok {
-		return nil, fmt.Errorf("provider with name %s not found", p.supportedModels[modelId].Provider)
+	provider := llm.Provider(p.supportedModels[modelId].Provider)
+	if _, ok := p.providers[provider]; !ok {
+		return nil, fmt.Errorf("provider with name %s not found", provider)
 	}
 
-	return p.providers[p.supportedModels[modelId].Provider], nil
+	return p.providers[provider], nil
 }
 
-func (p *LLMClientProxy) CreateChatCompletionStream(ctx context.Context, request openai.ChatCompletionRequest) (adapters.LLMStream, error) {
+func (p *LLMClientProxy) Stream(ctx context.Context, request llm.Request) (llm.Stream, error) {
 	client, err := p.getClient(request.Model)
 	if err != nil {
 		return nil, err
 	}
-	return client.CreateChatCompletionStream(ctx, request)
+	return client.Stream(ctx, request)
 }

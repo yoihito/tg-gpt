@@ -6,8 +6,8 @@ import (
 	"log/slog"
 	"strings"
 
-	"github.com/sashabaranov/go-openai"
 	tele "gopkg.in/telebot.v3"
+	"vadimgribanov.com/tg-gpt/internal/llm"
 )
 
 const MaxTelegramMessageLength = 4096
@@ -30,37 +30,32 @@ func NewTelegramStreamer(c tele.Context, replyTo *tele.Message) *TelegramStreame
 	}
 }
 
-func (t *TelegramStreamer) SendChunk(chunk openai.ChatCompletionStreamResponse) error {
+func (t *TelegramStreamer) SendEvent(event llm.StreamEvent) error {
 	ctx := t.c.Get("requestContext").(context.Context)
-	slog.DebugContext(ctx, "Streaming chunk", "chunk", chunk)
-	if len(chunk.Choices) > 0 {
-		textChunk := chunk.Choices[0].Delta.Content
-
-		// Skip empty content chunks
-		if textChunk == "" {
-			return nil
-		}
-
-		if len(t.accumulatedMessage)+len(textChunk) >= MaxTelegramMessageLength {
-			if t.prevLength != len(t.accumulatedMessage) {
-				err := t.Flush()
-				if err != nil {
-					return err
-				}
-			}
-			t.messages = append(t.messages, t.currentMessage)
-			t.currentMessage = nil
-			t.accumulatedMessage = ""
-			t.prevLength = 0
-		}
-		t.accumulatedMessage += textChunk
-		if len(t.accumulatedMessage)-t.prevLength < StreamingInterval {
-			return nil
-		}
-		t.prevLength = len(t.accumulatedMessage)
-		return t.Flush()
+	slog.DebugContext(ctx, "Streaming event", "event", event)
+	textChunk := event.TextDelta
+	if textChunk == "" {
+		return nil
 	}
-	return nil
+
+	if len(t.accumulatedMessage)+len(textChunk) >= MaxTelegramMessageLength {
+		if t.prevLength != len(t.accumulatedMessage) {
+			err := t.Flush()
+			if err != nil {
+				return err
+			}
+		}
+		t.messages = append(t.messages, t.currentMessage)
+		t.currentMessage = nil
+		t.accumulatedMessage = ""
+		t.prevLength = 0
+	}
+	t.accumulatedMessage += textChunk
+	if len(t.accumulatedMessage)-t.prevLength < StreamingInterval {
+		return nil
+	}
+	t.prevLength = len(t.accumulatedMessage)
+	return t.Flush()
 }
 
 func (t *TelegramStreamer) Flush() error {

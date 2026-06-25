@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/sashabaranov/go-openai"
+	"vadimgribanov.com/tg-gpt/internal/llm"
 	"vadimgribanov.com/tg-gpt/internal/models"
 	"vadimgribanov.com/tg-gpt/internal/repositories"
 	"vadimgribanov.com/tg-gpt/internal/vec"
@@ -78,12 +78,12 @@ type RetrievedMemory struct {
 // candidates promoted from this turn.
 func (m *MemoryManager) BeginTurn(
 	userID, dialogID int64,
-	msg openai.ChatCompletionMessage,
+	msg llm.Message,
 	tgMsgID int64,
 ) (TurnContext, error) {
 	payload := models.UserMsgPayload{
 		Content:      msg.Content,
-		MultiContent: msg.MultiContent,
+		MultiContent: msg.Parts,
 	}
 	var tgPtr *int64
 	if tgMsgID != 0 {
@@ -104,22 +104,22 @@ func (m *MemoryManager) BeginTurn(
 
 // PopForRetry deletes the most recent user_msg event and everything after it in the
 // current dialog, returning the popped user message so it can be replayed.
-func (m *MemoryManager) PopForRetry(userID, dialogID int64) (openai.ChatCompletionMessage, int64, error) {
+func (m *MemoryManager) PopForRetry(userID, dialogID int64) (llm.Message, int64, error) {
 	e, err := m.trace.PopLatestExchange(userID, dialogID)
 	if err != nil {
-		return openai.ChatCompletionMessage{}, 0, err
+		return llm.Message{}, 0, err
 	}
 	var p models.UserMsgPayload
 	if err := json.Unmarshal(e.Payload, &p); err != nil {
-		return openai.ChatCompletionMessage{}, 0, fmt.Errorf("parse user_msg payload: %w", err)
+		return llm.Message{}, 0, fmt.Errorf("parse user_msg payload: %w", err)
 	}
 	var tgMsgID int64
 	if e.TgMessageID != nil {
 		tgMsgID = *e.TgMessageID
 	}
-	msg := openai.ChatCompletionMessage{Role: openai.ChatMessageRoleUser}
+	msg := llm.Message{Role: llm.RoleUser}
 	if len(p.MultiContent) > 0 {
-		msg.MultiContent = p.MultiContent
+		msg.Parts = p.MultiContent
 	} else {
 		msg.Content = p.Content
 	}
@@ -130,7 +130,7 @@ func (m *MemoryManager) PopForRetry(userID, dialogID int64) (openai.ChatCompleti
 func (m *MemoryManager) AppendModelMsg(
 	mctx TurnContext,
 	content string,
-	toolCalls []openai.ToolCall,
+	toolCalls []llm.ToolCall,
 	model string,
 	tgMsgID int64,
 ) (int64, error) {
@@ -401,7 +401,7 @@ func rrfFuse(a, b []int64, topN int) []int64 {
 // AssemblePrompt builds the LLM message list. systemHeader is the caller's base system
 // prompt (constants + dynamic bits like the current date). MemoryManager appends a
 // memory block to the system message and converts recent trace events into chat messages.
-func (m *MemoryManager) AssemblePrompt(systemHeader string, retrieved RetrievedMemory) []openai.ChatCompletionMessage {
+func (m *MemoryManager) AssemblePrompt(systemHeader string, retrieved RetrievedMemory) []llm.Message {
 	var sys strings.Builder
 	sys.WriteString(systemHeader)
 
@@ -425,8 +425,8 @@ func (m *MemoryManager) AssemblePrompt(systemHeader string, retrieved RetrievedM
 		}
 	}
 
-	messages := []openai.ChatCompletionMessage{
-		{Role: openai.ChatMessageRoleSystem, Content: sys.String()},
+	messages := []llm.Message{
+		{Role: llm.RoleSystem, Content: sys.String()},
 	}
 	// Trim leading trace events until we hit a user_msg so we never start the replay
 	// mid-tool-call-group (which would leave an orphan `role: tool` message that OpenAI rejects).
@@ -445,16 +445,16 @@ func (m *MemoryManager) AssemblePrompt(systemHeader string, retrieved RetrievedM
 	return messages
 }
 
-func traceEventToMessage(e models.TraceEvent) (openai.ChatCompletionMessage, bool) {
+func traceEventToMessage(e models.TraceEvent) (llm.Message, bool) {
 	switch e.EventType {
 	case models.EventTypeUserMsg:
 		var p models.UserMsgPayload
 		if err := json.Unmarshal(e.Payload, &p); err != nil {
-			return openai.ChatCompletionMessage{}, false
+			return llm.Message{}, false
 		}
-		msg := openai.ChatCompletionMessage{Role: openai.ChatMessageRoleUser}
+		msg := llm.Message{Role: llm.RoleUser}
 		if len(p.MultiContent) > 0 {
-			msg.MultiContent = p.MultiContent
+			msg.Parts = p.MultiContent
 		} else {
 			msg.Content = p.Content
 		}
@@ -462,25 +462,28 @@ func traceEventToMessage(e models.TraceEvent) (openai.ChatCompletionMessage, boo
 	case models.EventTypeModelMsg:
 		var p models.ModelMsgPayload
 		if err := json.Unmarshal(e.Payload, &p); err != nil {
-			return openai.ChatCompletionMessage{}, false
+			return llm.Message{}, false
 		}
-		return openai.ChatCompletionMessage{
-			Role:      openai.ChatMessageRoleAssistant,
+		return llm.Message{
+			Role:      llm.RoleAssistant,
 			Content:   p.Content,
 			ToolCalls: p.ToolCalls,
 		}, true
 	case models.EventTypeToolResult:
 		var p models.ToolResultPayload
 		if err := json.Unmarshal(e.Payload, &p); err != nil {
-			return openai.ChatCompletionMessage{}, false
+			return llm.Message{}, false
 		}
-		return openai.ChatCompletionMessage{
-			Role:       openai.ChatMessageRoleTool,
-			ToolCallID: p.ToolCallID,
-			Content:    p.Result,
+		return llm.Message{
+			Role: llm.RoleTool,
+			ToolResult: &llm.ToolResult{
+				CallID: p.ToolCallID,
+				Name:   p.Name,
+				Output: p.Result,
+			},
 		}, true
 	}
-	return openai.ChatCompletionMessage{}, false
+	return llm.Message{}, false
 }
 
 // EndTurn runs extraction + promotion gate. Designed to be called in a goroutine after

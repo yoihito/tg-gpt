@@ -8,8 +8,8 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/sashabaranov/go-openai"
 	"vadimgribanov.com/tg-gpt/internal/adapters"
+	"vadimgribanov.com/tg-gpt/internal/llm"
 	"vadimgribanov.com/tg-gpt/internal/models"
 	"vadimgribanov.com/tg-gpt/internal/telegram_utils"
 )
@@ -45,7 +45,7 @@ type TextService struct {
 }
 
 type LLMClient interface {
-	CreateChatCompletionStream(ctx context.Context, request openai.ChatCompletionRequest) (adapters.LLMStream, error)
+	Stream(ctx context.Context, request llm.Request) (llm.Stream, error)
 	IsClientRegistered(modelId string) bool
 }
 
@@ -66,9 +66,9 @@ IMPORTANT:
 Today is %s. Give short concise answers.`
 
 type Result struct {
-	Status        string
-	ChunkResponse openai.ChatCompletionStreamResponse
-	Err           error
+	Status      string
+	StreamEvent llm.StreamEvent
+	Err         error
 }
 
 type MessagePartType string
@@ -84,51 +84,48 @@ func (h *TextService) RetryWithMessage(
 	ctx context.Context,
 	user models.User,
 	tgUserMessageId int64,
-	userMsg openai.ChatCompletionMessage,
+	userMsg llm.Message,
 	streamer *telegram_utils.TelegramStreamer,
 ) error {
 	return h.handleLLMRequest(ctx, user, tgUserMessageId, userMsg, streamer)
 }
 
 func (h *TextService) OnStreamableTextHandler(ctx context.Context, user models.User, tgUserMessageId int64, userText string, streamer *telegram_utils.TelegramStreamer) error {
-	return h.handleLLMRequest(ctx, user, tgUserMessageId, openai.ChatCompletionMessage{
-		Role:    openai.ChatMessageRoleUser,
+	return h.handleLLMRequest(ctx, user, tgUserMessageId, llm.Message{
+		Role:    llm.RoleUser,
 		Content: userText,
 	}, streamer)
 }
 
 func (h *TextService) OnStreamableVisionHandler(ctx context.Context, user models.User, tgUserMessageId int64, userText string, imageUrl string, streamer *telegram_utils.TelegramStreamer) error {
-	return h.handleLLMRequest(ctx, user, tgUserMessageId, openai.ChatCompletionMessage{
-		Role: openai.ChatMessageRoleUser,
-		MultiContent: []openai.ChatMessagePart{
+	return h.handleLLMRequest(ctx, user, tgUserMessageId, llm.Message{
+		Role: llm.RoleUser,
+		Parts: []llm.ContentPart{
 			{
-				Type: openai.ChatMessagePartTypeText,
+				Type: llm.ContentPartText,
 				Text: userText,
 			},
 			{
-				Type: openai.ChatMessagePartTypeImageURL,
-				ImageURL: &openai.ChatMessageImageURL{
-					URL:    imageUrl,
-					Detail: openai.ImageURLDetailLow,
-				},
+				Type:     llm.ContentPartImageURL,
+				ImageURL: imageUrl,
 			},
 		},
 	}, streamer)
 }
 
-func extractQueryText(msg openai.ChatCompletionMessage) string {
+func extractQueryText(msg llm.Message) string {
 	if msg.Content != "" {
 		return msg.Content
 	}
-	for _, part := range msg.MultiContent {
-		if part.Type == openai.ChatMessagePartTypeText && part.Text != "" {
+	for _, part := range msg.Parts {
+		if part.Type == llm.ContentPartText && part.Text != "" {
 			return part.Text
 		}
 	}
 	return ""
 }
 
-func (h *TextService) handleLLMRequest(ctx context.Context, user models.User, tgUserMessageId int64, newMessage openai.ChatCompletionMessage, streamer *telegram_utils.TelegramStreamer) error {
+func (h *TextService) handleLLMRequest(ctx context.Context, user models.User, tgUserMessageId int64, newMessage llm.Message, streamer *telegram_utils.TelegramStreamer) error {
 	if time.Now().Unix()-user.LastInteraction > h.dialogTimeout {
 		oldDialogID := user.CurrentDialogId
 		go h.memoryManager.CloseDialog(context.WithoutCancel(ctx), user.Id, oldDialogID)
@@ -175,11 +172,11 @@ func (h *TextService) handleLLMRequest(ctx context.Context, user models.User, tg
 	)
 
 	for {
-		stream, err := h.client.CreateChatCompletionStream(ctx, openai.ChatCompletionRequest{
+		stream, err := h.client.Stream(ctx, llm.Request{
 			Model:      modelToUse,
 			Messages:   history,
 			Tools:      tools,
-			ToolChoice: "auto",
+			ToolChoice: llm.ToolChoiceAuto,
 		})
 		if err != nil {
 			slog.ErrorContext(ctx, "Got an error while creating chat completion stream", "error", err)
@@ -189,9 +186,9 @@ func (h *TextService) handleLLMRequest(ctx context.Context, user models.User, tg
 
 		accumulator := adapters.NewStreamAccumulator()
 		for stream.Next() {
-			response := stream.Current()
-			accumulator.AddChunk(response)
-			if err := streamer.SendChunk(response); err != nil {
+			event := stream.Event()
+			accumulator.AddEvent(event)
+			if err := streamer.SendEvent(event); err != nil {
 				slog.ErrorContext(ctx, "Got an error while sending chunk", "error", err)
 				return err
 			}
@@ -221,8 +218,8 @@ func (h *TextService) handleLLMRequest(ctx context.Context, user models.User, tg
 				return err
 			}
 
-			history = append(history, openai.ChatCompletionMessage{
-				Role:      openai.ChatMessageRoleAssistant,
+			history = append(history, llm.Message{
+				Role:      llm.RoleAssistant,
 				Content:   accumulatedResponse,
 				ToolCalls: toolCalls,
 			})
@@ -231,25 +228,28 @@ func (h *TextService) handleLLMRequest(ctx context.Context, user models.User, tg
 				var result string
 				var toolErr error
 
-				switch toolCall.Function.Name {
+				switch toolCall.Name {
 				case "save_memory", "get_memory", "list_memories", "delete_memory", "save_fact", "forget_about", "list_episodes", "forget_episode":
 					result, toolErr = h.memoryService.HandleToolCall(ctx, mctx, toolCall)
 				case "create_one_shot_reminder", "create_recurring_reminder", "list_reminders", "cancel_reminder":
 					result, toolErr = h.reminderService.HandleToolCall(user.Id, toolCall)
 				default:
-					toolErr = fmt.Errorf("unknown tool: %s", toolCall.Function.Name)
+					toolErr = fmt.Errorf("unknown tool: %s", toolCall.Name)
 					result = "Unknown tool"
 				}
 
-				if _, err := h.memoryManager.AppendToolResult(mctx, toolCall.ID, toolCall.Function.Name, result); err != nil {
+				if _, err := h.memoryManager.AppendToolResult(mctx, toolCall.ID, toolCall.Name, result); err != nil {
 					slog.ErrorContext(ctx, "Error appending tool_result", "error", err)
 					return err
 				}
 
-				history = append(history, openai.ChatCompletionMessage{
-					Role:       openai.ChatMessageRoleTool,
-					ToolCallID: toolCall.ID,
-					Content:    result,
+				history = append(history, llm.Message{
+					Role: llm.RoleTool,
+					ToolResult: &llm.ToolResult{
+						CallID: toolCall.ID,
+						Name:   toolCall.Name,
+						Output: result,
+					},
 				})
 				if toolErr != nil {
 					slog.ErrorContext(ctx, "Error handling tool call", "error", toolErr)

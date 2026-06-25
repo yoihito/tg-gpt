@@ -3,7 +3,7 @@ package adapters
 import (
 	"context"
 
-	"github.com/sashabaranov/go-openai"
+	"vadimgribanov.com/tg-gpt/internal/llm"
 	"vadimgribanov.com/tg-gpt/internal/vendors/anthropic"
 )
 
@@ -15,20 +15,27 @@ func NewAnthropicAdapter(client *anthropic.Client) *AnthropicAdapter {
 	return &AnthropicAdapter{client: client}
 }
 
-func (a *AnthropicAdapter) Provider() string {
-	return "anthropic"
+func (a *AnthropicAdapter) Provider() llm.Provider {
+	return llm.ProviderAnthropic
 }
 
-func (a *AnthropicAdapter) CreateChatCompletionStream(ctx context.Context, request openai.ChatCompletionRequest) (LLMStream, error) {
+func (a *AnthropicAdapter) Capabilities(model string) llm.Capabilities {
+	return llm.Capabilities{}
+}
+
+func (a *AnthropicAdapter) Stream(ctx context.Context, request llm.Request) (llm.Stream, error) {
 	anthropicMessages := []anthropic.Message{}
 	systemPrompt := ""
 	for _, message := range request.Messages {
-		if message.Role == "system" {
+		if message.Role == llm.RoleSystem {
 			systemPrompt = message.Content
 			continue
 		}
+		if message.ToolResult != nil {
+			continue
+		}
 		anthropicMessages = append(anthropicMessages, anthropic.Message{
-			Role:    message.Role,
+			Role:    string(message.Role),
 			Content: message.Content,
 		})
 	}
@@ -39,7 +46,6 @@ func (a *AnthropicAdapter) CreateChatCompletionStream(ctx context.Context, reque
 		Messages:  anthropicMessages,
 		MaxTokens: 4096,
 	})
-
 	if err != nil {
 		return nil, err
 	}
@@ -49,7 +55,7 @@ func (a *AnthropicAdapter) CreateChatCompletionStream(ctx context.Context, reque
 
 type AnthropicStreamAdapter struct {
 	stream  *anthropic.StreamedResponse
-	current openai.ChatCompletionStreamResponse
+	current llm.StreamEvent
 	err     error
 }
 
@@ -59,36 +65,19 @@ func (a *AnthropicStreamAdapter) Next() bool {
 		a.err = err
 		return false
 	}
+	a.current = llm.StreamEvent{}
 	switch typedData := resp.(type) {
 	case anthropic.ContentBlockDeltaData:
-		a.current = openai.ChatCompletionStreamResponse{
-			Choices: []openai.ChatCompletionStreamChoice{
-				{
-					Delta: openai.ChatCompletionStreamChoiceDelta{Content: typedData.Delta.Text},
-				},
-			},
-		}
+		a.current.TextDelta = typedData.Delta.Text
 	case anthropic.MessageDeltaData:
-		a.current = openai.ChatCompletionStreamResponse{
-			Usage: &openai.Usage{
-				PromptTokens:     0,
-				CompletionTokens: typedData.Usage.OutputTokens,
-				TotalTokens:      0,
-			},
-		}
+		a.current.Usage = &llm.Usage{OutputTokens: int64(typedData.Usage.OutputTokens)}
 	case anthropic.MessageStartData:
-		a.current = openai.ChatCompletionStreamResponse{
-			Usage: &openai.Usage{
-				PromptTokens:     typedData.Message.Usage.InputTokens,
-				CompletionTokens: 0,
-				TotalTokens:      0,
-			},
-		}
+		a.current.Usage = &llm.Usage{InputTokens: int64(typedData.Message.Usage.InputTokens)}
 	}
 	return true
 }
 
-func (a *AnthropicStreamAdapter) Current() openai.ChatCompletionStreamResponse {
+func (a *AnthropicStreamAdapter) Event() llm.StreamEvent {
 	return a.current
 }
 

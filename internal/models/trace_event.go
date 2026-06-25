@@ -3,7 +3,7 @@ package models
 import (
 	"encoding/json"
 
-	"github.com/sashabaranov/go-openai"
+	"vadimgribanov.com/tg-gpt/internal/llm"
 )
 
 const (
@@ -26,13 +26,13 @@ type TraceEvent struct {
 }
 
 type UserMsgPayload struct {
-	Content      string                   `json:"content"`
-	MultiContent []openai.ChatMessagePart `json:"multi_content,omitempty"`
+	Content      string            `json:"content"`
+	MultiContent []llm.ContentPart `json:"multi_content,omitempty"`
 }
 
 type ModelMsgPayload struct {
-	Content   string            `json:"content"`
-	ToolCalls []openai.ToolCall `json:"tool_calls,omitempty"`
+	Content   string         `json:"content"`
+	ToolCalls []llm.ToolCall `json:"tool_calls,omitempty"`
 }
 
 type ToolResultPayload struct {

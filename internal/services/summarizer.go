@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/sashabaranov/go-openai"
+	"vadimgribanov.com/tg-gpt/internal/llm"
 	"vadimgribanov.com/tg-gpt/internal/models"
 )
 
@@ -64,7 +65,7 @@ func renderTranscript(events []models.TraceEvent) string {
 			text := p.Content
 			if text == "" {
 				for _, part := range p.MultiContent {
-					if part.Type == openai.ChatMessagePartTypeText {
+					if part.Type == llm.ContentPartText {
 						text = part.Text
 						break
 					}

@@ -195,7 +195,7 @@ func (h *BotHandler) RetryLastMessage(c tele.Context) error {
 		return c.Send("No messages found")
 	}
 
-	if len(userMsg.MultiContent) > 0 {
+	if len(userMsg.Parts) > 0 {
 		return c.Send("Cannot retry multi-content messages")
 	}
 

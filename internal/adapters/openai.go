@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/sashabaranov/go-openai"
+	"vadimgribanov.com/tg-gpt/internal/llm"
 )
 
 type OpenaiAdapter struct {
@@ -14,15 +15,30 @@ func NewOpenaiAdapter(client *openai.Client) *OpenaiAdapter {
 	return &OpenaiAdapter{client: client}
 }
 
-func (a *OpenaiAdapter) Provider() string {
-	return "openai"
+func (a *OpenaiAdapter) Provider() llm.Provider {
+	return llm.ProviderOpenAI
 }
 
-func (a *OpenaiAdapter) CreateChatCompletionStream(ctx context.Context, request openai.ChatCompletionRequest) (LLMStream, error) {
-	request.StreamOptions = &openai.StreamOptions{
-		IncludeUsage: true,
+func (a *OpenaiAdapter) Capabilities(model string) llm.Capabilities {
+	return llm.Capabilities{
+		FunctionTools: true,
+		Vision:        true,
+		ToolChoice:    true,
 	}
-	stream, err := a.client.CreateChatCompletionStream(ctx, request)
+}
+
+func (a *OpenaiAdapter) Stream(ctx context.Context, request llm.Request) (llm.Stream, error) {
+	openaiReq := openai.ChatCompletionRequest{
+		Model:         request.Model,
+		Messages:      toOpenAIChatMessages(request.Messages),
+		Tools:         toOpenAITools(request.Tools),
+		StreamOptions: &openai.StreamOptions{IncludeUsage: true},
+	}
+	if request.ToolChoice != "" {
+		openaiReq.ToolChoice = string(request.ToolChoice)
+	}
+
+	stream, err := a.client.CreateChatCompletionStream(ctx, openaiReq)
 	if err != nil {
 		return nil, err
 	}
@@ -31,7 +47,7 @@ func (a *OpenaiAdapter) CreateChatCompletionStream(ctx context.Context, request 
 
 type OpenaiStreamAdapter struct {
 	stream  *openai.ChatCompletionStream
-	current openai.ChatCompletionStreamResponse
+	current llm.StreamEvent
 	err     error
 }
 
@@ -41,11 +57,11 @@ func (a *OpenaiStreamAdapter) Next() bool {
 		a.err = err
 		return false
 	}
-	a.current = response
+	a.current = fromOpenAIStreamResponse(response)
 	return true
 }
 
-func (a *OpenaiStreamAdapter) Current() openai.ChatCompletionStreamResponse {
+func (a *OpenaiStreamAdapter) Event() llm.StreamEvent {
 	return a.current
 }
 
@@ -59,4 +75,124 @@ func (a *OpenaiStreamAdapter) Close() error {
 	}
 	a.stream.Close()
 	return nil
+}
+
+func toOpenAIChatMessages(messages []llm.Message) []openai.ChatCompletionMessage {
+	out := make([]openai.ChatCompletionMessage, 0, len(messages))
+	for _, msg := range messages {
+		switch msg.Role {
+		case llm.RoleTool:
+			if msg.ToolResult == nil {
+				continue
+			}
+			out = append(out, openai.ChatCompletionMessage{
+				Role:       openai.ChatMessageRoleTool,
+				ToolCallID: msg.ToolResult.CallID,
+				Content:    msg.ToolResult.Output,
+			})
+		case llm.RoleAssistant:
+			out = append(out, openai.ChatCompletionMessage{
+				Role:      openai.ChatMessageRoleAssistant,
+				Content:   msg.Content,
+				ToolCalls: toOpenAIToolCalls(msg.ToolCalls),
+			})
+		case llm.RoleSystem:
+			out = append(out, openai.ChatCompletionMessage{
+				Role:    openai.ChatMessageRoleSystem,
+				Content: msg.Content,
+			})
+		default:
+			oai := openai.ChatCompletionMessage{Role: openai.ChatMessageRoleUser, Content: msg.Content}
+			if len(msg.Parts) > 0 {
+				oai.Content = ""
+				oai.MultiContent = toOpenAIMessageParts(msg.Parts)
+			}
+			out = append(out, oai)
+		}
+	}
+	return out
+}
+
+func toOpenAIMessageParts(parts []llm.ContentPart) []openai.ChatMessagePart {
+	out := make([]openai.ChatMessagePart, 0, len(parts))
+	for _, part := range parts {
+		switch part.Type {
+		case llm.ContentPartImageURL:
+			out = append(out, openai.ChatMessagePart{
+				Type: openai.ChatMessagePartTypeImageURL,
+				ImageURL: &openai.ChatMessageImageURL{
+					URL:    part.ImageURL,
+					Detail: openai.ImageURLDetailLow,
+				},
+			})
+		default:
+			out = append(out, openai.ChatMessagePart{
+				Type: openai.ChatMessagePartTypeText,
+				Text: part.Text,
+			})
+		}
+	}
+	return out
+}
+
+func toOpenAITools(tools []llm.Tool) []openai.Tool {
+	out := make([]openai.Tool, 0, len(tools))
+	for _, tool := range tools {
+		out = append(out, openai.Tool{
+			Type: openai.ToolTypeFunction,
+			Function: &openai.FunctionDefinition{
+				Name:        tool.Name,
+				Description: tool.Description,
+				Parameters:  tool.Parameters,
+			},
+		})
+	}
+	return out
+}
+
+func toOpenAIToolCalls(calls []llm.ToolCall) []openai.ToolCall {
+	out := make([]openai.ToolCall, 0, len(calls))
+	for _, call := range calls {
+		index := call.Index
+		out = append(out, openai.ToolCall{
+			ID:    call.ID,
+			Type:  openai.ToolTypeFunction,
+			Index: &index,
+			Function: openai.FunctionCall{
+				Name:      call.Name,
+				Arguments: call.Arguments,
+			},
+		})
+	}
+	return out
+}
+
+func fromOpenAIStreamResponse(response openai.ChatCompletionStreamResponse) llm.StreamEvent {
+	var event llm.StreamEvent
+	if len(response.Choices) > 0 {
+		delta := response.Choices[0].Delta
+		event.TextDelta = delta.Content
+		if len(delta.ToolCalls) > 0 {
+			event.ToolCalls = make([]llm.ToolCall, 0, len(delta.ToolCalls))
+			for _, tc := range delta.ToolCalls {
+				idx := 0
+				if tc.Index != nil {
+					idx = *tc.Index
+				}
+				event.ToolCalls = append(event.ToolCalls, llm.ToolCall{
+					ID:        tc.ID,
+					Index:     idx,
+					Name:      tc.Function.Name,
+					Arguments: tc.Function.Arguments,
+				})
+			}
+		}
+	}
+	if response.Usage != nil {
+		event.Usage = &llm.Usage{
+			InputTokens:  int64(response.Usage.PromptTokens),
+			OutputTokens: int64(response.Usage.CompletionTokens),
+		}
+	}
+	return event
 }

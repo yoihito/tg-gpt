@@ -10,8 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/sashabaranov/go-openai"
 	tele "gopkg.in/telebot.v3"
+	"vadimgribanov.com/tg-gpt/internal/llm"
 	"vadimgribanov.com/tg-gpt/internal/models"
 	"vadimgribanov.com/tg-gpt/internal/repositories"
 	"vadimgribanov.com/tg-gpt/internal/utils"
@@ -54,124 +54,112 @@ func NewReminderService(
 // *time.Location at parse time.
 const isoLocalLayout = "2006-01-02T15:04:05"
 
-func (s *ReminderService) GetReminderTools() []openai.Tool {
-	return []openai.Tool{
+func (s *ReminderService) GetReminderTools() []llm.Tool {
+	return []llm.Tool{
 		{
-			Type: openai.ToolTypeFunction,
-			Function: &openai.FunctionDefinition{
-				Name:        "create_one_shot_reminder",
-				Description: "Create a single, non-repeating reminder. Use this whenever the user wants to be reminded exactly once.",
-				Parameters: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"time_expression": map[string]interface{}{
-							"type":        "string",
-							"description": "Natural language time: 'in 5 minutes', 'tomorrow at 3pm', 'next Monday at 9am'.",
-						},
-						"message": map[string]interface{}{
-							"type":        "string",
-							"description": "The reminder message in the user's language.",
-						},
-						"timezone": map[string]interface{}{
-							"type":        "string",
-							"description": "User's IANA timezone (e.g. 'Europe/Berlin'). Read it from the user's preferences shown in the system prompt; if it's not there, ask the user and save it as preference 'timezone' before calling this tool.",
-						},
+			Name:        "create_one_shot_reminder",
+			Description: "Create a single, non-repeating reminder. Use this whenever the user wants to be reminded exactly once.",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"time_expression": map[string]interface{}{
+						"type":        "string",
+						"description": "Natural language time: 'in 5 minutes', 'tomorrow at 3pm', 'next Monday at 9am'.",
 					},
-					"required": []string{"time_expression", "message", "timezone"},
+					"message": map[string]interface{}{
+						"type":        "string",
+						"description": "The reminder message in the user's language.",
+					},
+					"timezone": map[string]interface{}{
+						"type":        "string",
+						"description": "User's IANA timezone (e.g. 'Europe/Berlin'). Read it from the user's preferences shown in the system prompt; if it's not there, ask the user and save it as preference 'timezone' before calling this tool.",
+					},
 				},
+				"required": []string{"time_expression", "message", "timezone"},
 			},
 		},
 		{
-			Type: openai.ToolTypeFunction,
-			Function: &openai.FunctionDefinition{
-				Name:        "create_recurring_reminder",
-				Description: "Create a reminder that repeats on a schedule. Use whenever the user mentions repetition (daily, weekly, monthly, every N days/weeks/months).",
-				Parameters: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"message": map[string]interface{}{
-							"type":        "string",
-							"description": "The reminder message in the user's language.",
-						},
-						"timezone": map[string]interface{}{
-							"type":        "string",
-							"description": "User's IANA timezone. Read from preferences; ask the user if missing.",
-						},
-						"frequency": map[string]interface{}{
-							"type":        "string",
-							"enum":        []string{"daily", "weekly", "monthly"},
-							"description": "Base unit of recurrence.",
-						},
-						"interval": map[string]interface{}{
-							"type":        "integer",
-							"description": "Repeat every N units of frequency. interval=2 + frequency=weekly = biweekly. Defaults to 1 if omitted.",
-						},
-						"start_at": map[string]interface{}{
-							"type":        "string",
-							"description": "ISO 8601 datetime (no timezone suffix) of the first occurrence, in the user's local timezone. Example: '2026-06-25T09:00:00'.",
-						},
-						"until": map[string]interface{}{
-							"type":        "string",
-							"description": "Optional ISO 8601 datetime after which recurrence stops. Omit for indefinite recurrence.",
-						},
+			Name:        "create_recurring_reminder",
+			Description: "Create a reminder that repeats on a schedule. Use whenever the user mentions repetition (daily, weekly, monthly, every N days/weeks/months).",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"message": map[string]interface{}{
+						"type":        "string",
+						"description": "The reminder message in the user's language.",
 					},
-					"required": []string{"message", "timezone", "frequency", "start_at"},
+					"timezone": map[string]interface{}{
+						"type":        "string",
+						"description": "User's IANA timezone. Read from preferences; ask the user if missing.",
+					},
+					"frequency": map[string]interface{}{
+						"type":        "string",
+						"enum":        []string{"daily", "weekly", "monthly"},
+						"description": "Base unit of recurrence.",
+					},
+					"interval": map[string]interface{}{
+						"type":        "integer",
+						"description": "Repeat every N units of frequency. interval=2 + frequency=weekly = biweekly. Defaults to 1 if omitted.",
+					},
+					"start_at": map[string]interface{}{
+						"type":        "string",
+						"description": "ISO 8601 datetime (no timezone suffix) of the first occurrence, in the user's local timezone. Example: '2026-06-25T09:00:00'.",
+					},
+					"until": map[string]interface{}{
+						"type":        "string",
+						"description": "Optional ISO 8601 datetime after which recurrence stops. Omit for indefinite recurrence.",
+					},
 				},
+				"required": []string{"message", "timezone", "frequency", "start_at"},
 			},
 		},
 		{
-			Type: openai.ToolTypeFunction,
-			Function: &openai.FunctionDefinition{
-				Name:        "list_reminders",
-				Description: "List all active (not-yet-fired, not-cancelled) reminders for the user.",
-				Parameters: map[string]interface{}{
-					"type":       "object",
-					"properties": map[string]interface{}{},
-				},
+			Name:        "list_reminders",
+			Description: "List all active (not-yet-fired, not-cancelled) reminders for the user.",
+			Parameters: map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{},
 			},
 		},
 		{
-			Type: openai.ToolTypeFunction,
-			Function: &openai.FunctionDefinition{
-				Name:        "cancel_reminder",
-				Description: "Cancel a reminder by its ID. For recurring reminders, this cancels all future occurrences.",
-				Parameters: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"reminder_id": map[string]interface{}{
-							"type":        "string",
-							"description": "The ID of the reminder to cancel.",
-						},
+			Name:        "cancel_reminder",
+			Description: "Cancel a reminder by its ID. For recurring reminders, this cancels all future occurrences.",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"reminder_id": map[string]interface{}{
+						"type":        "string",
+						"description": "The ID of the reminder to cancel.",
 					},
-					"required": []string{"reminder_id"},
 				},
+				"required": []string{"reminder_id"},
 			},
 		},
 	}
 }
 
-func (s *ReminderService) HandleToolCall(userID int64, toolCall openai.ToolCall) (string, error) {
-	if toolCall.Function.Name == "list_reminders" {
+func (s *ReminderService) HandleToolCall(userID int64, toolCall llm.ToolCall) (string, error) {
+	if toolCall.Name == "list_reminders" {
 		return s.handleListReminders(userID)
 	}
 
-	if strings.TrimSpace(toolCall.Function.Arguments) == "" {
-		return "", fmt.Errorf("empty arguments for tool call: %s", toolCall.Function.Name)
+	if strings.TrimSpace(toolCall.Arguments) == "" {
+		return "", fmt.Errorf("empty arguments for tool call: %s", toolCall.Name)
 	}
 	var probe map[string]interface{}
-	if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &probe); err != nil {
-		return "", fmt.Errorf("invalid JSON arguments for %s: %w - arguments: %s", toolCall.Function.Name, err, toolCall.Function.Arguments)
+	if err := json.Unmarshal([]byte(toolCall.Arguments), &probe); err != nil {
+		return "", fmt.Errorf("invalid JSON arguments for %s: %w - arguments: %s", toolCall.Name, err, toolCall.Arguments)
 	}
 
-	switch toolCall.Function.Name {
+	switch toolCall.Name {
 	case "create_one_shot_reminder":
-		return s.handleCreateOneShotReminder(userID, toolCall.Function.Arguments)
+		return s.handleCreateOneShotReminder(userID, toolCall.Arguments)
 	case "create_recurring_reminder":
-		return s.handleCreateRecurringReminder(userID, toolCall.Function.Arguments)
+		return s.handleCreateRecurringReminder(userID, toolCall.Arguments)
 	case "cancel_reminder":
-		return s.handleCancelReminder(userID, toolCall.Function.Arguments)
+		return s.handleCancelReminder(userID, toolCall.Arguments)
 	default:
-		return "", fmt.Errorf("unknown tool call: %s", toolCall.Function.Name)
+		return "", fmt.Errorf("unknown tool call: %s", toolCall.Name)
 	}
 }
 

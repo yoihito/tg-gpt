@@ -1,48 +1,51 @@
 package adapters
 
-import (
-	"github.com/sashabaranov/go-openai"
-)
-
-type LLMStream interface {
-	Next() bool
-	Current() openai.ChatCompletionStreamResponse
-	Close() error
-	Err() error
-}
+import "vadimgribanov.com/tg-gpt/internal/llm"
 
 type StreamAccumulator struct {
 	accumulatedResponse string
 	promptTokens        int64
 	completionTokens    int64
-	toolCalls           map[int]openai.ToolCall
+	toolCalls           map[int]llm.ToolCall
 }
 
 func NewStreamAccumulator() *StreamAccumulator {
 	return &StreamAccumulator{
-		toolCalls: make(map[int]openai.ToolCall),
+		toolCalls: make(map[int]llm.ToolCall),
 	}
 }
 
-func (s *StreamAccumulator) AddChunk(chunk openai.ChatCompletionStreamResponse) {
-	if len(chunk.Choices) > 0 {
-		if len(chunk.Choices[0].Delta.ToolCalls) > 0 {
-			for _, toolCall := range chunk.Choices[0].Delta.ToolCalls {
-				if _, ok := s.toolCalls[*toolCall.Index]; !ok {
-					s.toolCalls[*toolCall.Index] = toolCall
-					continue
-				}
-				existingCall := s.toolCalls[*toolCall.Index]
-				existingCall.Function.Arguments += toolCall.Function.Arguments
-				s.toolCalls[*toolCall.Index] = existingCall
-			}
-		}
-		s.accumulatedResponse += chunk.Choices[0].Delta.Content
+func (s *StreamAccumulator) AddEvent(event llm.StreamEvent) {
+	if event.TextDelta != "" {
+		s.accumulatedResponse += event.TextDelta
 	}
-	if chunk.Usage != nil {
-		s.promptTokens += int64(chunk.Usage.PromptTokens)
-		s.completionTokens += int64(chunk.Usage.CompletionTokens)
+	if event.ToolCall != nil {
+		s.addToolCallDelta(*event.ToolCall)
 	}
+	for _, call := range event.ToolCalls {
+		s.addToolCallDelta(call)
+	}
+	if event.Usage != nil {
+		s.promptTokens += event.Usage.InputTokens
+		s.completionTokens += event.Usage.OutputTokens
+	}
+}
+
+func (s *StreamAccumulator) addToolCallDelta(call llm.ToolCall) {
+	idx := call.Index
+	existing, ok := s.toolCalls[idx]
+	if !ok {
+		s.toolCalls[idx] = call
+		return
+	}
+	if call.ID != "" {
+		existing.ID = call.ID
+	}
+	if call.Name != "" {
+		existing.Name = call.Name
+	}
+	existing.Arguments += call.Arguments
+	s.toolCalls[idx] = existing
 }
 
 func (s *StreamAccumulator) AccumulatedResponse() string {
@@ -61,8 +64,8 @@ func (s *StreamAccumulator) HasToolCalls() bool {
 	return len(s.toolCalls) > 0
 }
 
-func (s *StreamAccumulator) GetToolCalls() []openai.ToolCall {
-	toolCalls := make([]openai.ToolCall, 0, len(s.toolCalls))
+func (s *StreamAccumulator) GetToolCalls() []llm.ToolCall {
+	toolCalls := make([]llm.ToolCall, 0, len(s.toolCalls))
 	for _, toolCall := range s.toolCalls {
 		toolCalls = append(toolCalls, toolCall)
 	}

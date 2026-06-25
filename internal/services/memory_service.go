@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/sashabaranov/go-openai"
+	"vadimgribanov.com/tg-gpt/internal/llm"
 	"vadimgribanov.com/tg-gpt/internal/models"
 	"vadimgribanov.com/tg-gpt/internal/repositories"
 )
@@ -22,166 +22,142 @@ func NewMemoryService(prefs *repositories.PreferenceRepo, memoryManager *MemoryM
 	return &MemoryService{prefs: prefs, memoryManager: memoryManager}
 }
 
-func (s *MemoryService) GetMemoryTools() []openai.Tool {
-	return []openai.Tool{
+func (s *MemoryService) GetMemoryTools() []llm.Tool {
+	return []llm.Tool{
 		{
-			Type: openai.ToolTypeFunction,
-			Function: &openai.FunctionDefinition{
-				Name:        "save_memory",
-				Description: "Save a stable user preference (e.g. timezone, language, format, communication style). For durable facts about the user, use save_fact instead.",
-				Parameters: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"key": map[string]interface{}{
-							"type":        "string",
-							"description": "Short snake_case key (e.g. 'timezone', 'response_language', 'tone').",
-						},
-						"content": map[string]interface{}{
-							"type":        "string",
-							"description": "The preference value.",
-						},
+			Name:        "save_memory",
+			Description: "Save a stable user preference (e.g. timezone, language, format, communication style). For durable facts about the user, use save_fact instead.",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"key": map[string]interface{}{
+						"type":        "string",
+						"description": "Short snake_case key (e.g. 'timezone', 'response_language', 'tone').",
 					},
-					"required": []string{"key", "content"},
-				},
-			},
-		},
-		{
-			Type: openai.ToolTypeFunction,
-			Function: &openai.FunctionDefinition{
-				Name:        "get_memory",
-				Description: "Retrieve a specific preference by key.",
-				Parameters: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"key": map[string]interface{}{"type": "string"},
+					"content": map[string]interface{}{
+						"type":        "string",
+						"description": "The preference value.",
 					},
-					"required": []string{"key"},
 				},
+				"required": []string{"key", "content"},
 			},
 		},
 		{
-			Type: openai.ToolTypeFunction,
-			Function: &openai.FunctionDefinition{
-				Name:        "list_memories",
-				Description: "List all stored preferences for the user.",
-				Parameters: map[string]interface{}{
-					"type":       "object",
-					"properties": map[string]interface{}{},
+			Name:        "get_memory",
+			Description: "Retrieve a specific preference by key.",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"key": map[string]interface{}{"type": "string"},
 				},
+				"required": []string{"key"},
 			},
 		},
 		{
-			Type: openai.ToolTypeFunction,
-			Function: &openai.FunctionDefinition{
-				Name:        "delete_memory",
-				Description: "Delete a preference by key.",
-				Parameters: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"key": map[string]interface{}{"type": "string"},
+			Name:        "list_memories",
+			Description: "List all stored preferences for the user.",
+			Parameters: map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{},
+			},
+		},
+		{
+			Name:        "delete_memory",
+			Description: "Delete a preference by key.",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"key": map[string]interface{}{"type": "string"},
+				},
+				"required": []string{"key"},
+			},
+		},
+		{
+			Name:        "save_fact",
+			Description: "Save a durable fact about the user, their life, work, or relationships. Use this for things you want to remember across sessions. For preferences (format, language, etc.) use save_memory instead.",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"subject": map[string]interface{}{
+						"type":        "string",
+						"description": "Short snake_case subject (e.g. 'self', 'wife_anna', 'company_acme').",
 					},
-					"required": []string{"key"},
-				},
-			},
-		},
-		{
-			Type: openai.ToolTypeFunction,
-			Function: &openai.FunctionDefinition{
-				Name:        "save_fact",
-				Description: "Save a durable fact about the user, their life, work, or relationships. Use this for things you want to remember across sessions. For preferences (format, language, etc.) use save_memory instead.",
-				Parameters: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"subject": map[string]interface{}{
-							"type":        "string",
-							"description": "Short snake_case subject (e.g. 'self', 'wife_anna', 'company_acme').",
-						},
-						"content": map[string]interface{}{
-							"type":        "string",
-							"description": "One-sentence statement of the fact.",
-						},
+					"content": map[string]interface{}{
+						"type":        "string",
+						"description": "One-sentence statement of the fact.",
 					},
-					"required": []string{"subject", "content"},
 				},
+				"required": []string{"subject", "content"},
 			},
 		},
 		{
-			Type: openai.ToolTypeFunction,
-			Function: &openai.FunctionDefinition{
-				Name:        "forget_about",
-				Description: "Mark all facts about a given subject as revoked (e.g. the user wants you to forget their job).",
-				Parameters: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"subject": map[string]interface{}{"type": "string"},
+			Name:        "forget_about",
+			Description: "Mark all facts about a given subject as revoked (e.g. the user wants you to forget their job).",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"subject": map[string]interface{}{"type": "string"},
+				},
+				"required": []string{"subject"},
+			},
+		},
+		{
+			Name:        "list_episodes",
+			Description: "List stored dialog summaries (episodic memory) for the user. Each entry has an ID, date, and short summary.",
+			Parameters: map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{},
+			},
+		},
+		{
+			Name:        "forget_episode",
+			Description: "Delete a stored episode by its ID. Use after list_episodes to find the right ID.",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"episode_id": map[string]interface{}{
+						"type":        "integer",
+						"description": "The ID of the episode to delete (from list_episodes).",
 					},
-					"required": []string{"subject"},
 				},
-			},
-		},
-		{
-			Type: openai.ToolTypeFunction,
-			Function: &openai.FunctionDefinition{
-				Name:        "list_episodes",
-				Description: "List stored dialog summaries (episodic memory) for the user. Each entry has an ID, date, and short summary.",
-				Parameters: map[string]interface{}{
-					"type":       "object",
-					"properties": map[string]interface{}{},
-				},
-			},
-		},
-		{
-			Type: openai.ToolTypeFunction,
-			Function: &openai.FunctionDefinition{
-				Name:        "forget_episode",
-				Description: "Delete a stored episode by its ID. Use after list_episodes to find the right ID.",
-				Parameters: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"episode_id": map[string]interface{}{
-							"type":        "integer",
-							"description": "The ID of the episode to delete (from list_episodes).",
-						},
-					},
-					"required": []string{"episode_id"},
-				},
+				"required": []string{"episode_id"},
 			},
 		},
 	}
 }
 
-func (s *MemoryService) HandleToolCall(ctx context.Context, mctx TurnContext, toolCall openai.ToolCall) (string, error) {
-	switch toolCall.Function.Name {
+func (s *MemoryService) HandleToolCall(ctx context.Context, mctx TurnContext, toolCall llm.ToolCall) (string, error) {
+	switch toolCall.Name {
 	case "list_memories":
 		return s.handleListMemories(mctx.UserID)
 	case "list_episodes":
 		return s.handleListEpisodes(mctx.UserID)
 	}
 
-	if strings.TrimSpace(toolCall.Function.Arguments) == "" {
-		return "", fmt.Errorf("empty arguments for tool call: %s", toolCall.Function.Name)
+	if strings.TrimSpace(toolCall.Arguments) == "" {
+		return "", fmt.Errorf("empty arguments for tool call: %s", toolCall.Name)
 	}
 
 	var probe map[string]interface{}
-	if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &probe); err != nil {
-		return "", fmt.Errorf("invalid JSON arguments for %s: %w - arguments: %s", toolCall.Function.Name, err, toolCall.Function.Arguments)
+	if err := json.Unmarshal([]byte(toolCall.Arguments), &probe); err != nil {
+		return "", fmt.Errorf("invalid JSON arguments for %s: %w - arguments: %s", toolCall.Name, err, toolCall.Arguments)
 	}
 
-	switch toolCall.Function.Name {
+	switch toolCall.Name {
 	case "save_memory":
-		return s.handleSaveMemory(mctx, toolCall.Function.Arguments)
+		return s.handleSaveMemory(mctx, toolCall.Arguments)
 	case "get_memory":
-		return s.handleGetMemory(mctx.UserID, toolCall.Function.Arguments)
+		return s.handleGetMemory(mctx.UserID, toolCall.Arguments)
 	case "delete_memory":
-		return s.handleDeleteMemory(mctx.UserID, toolCall.Function.Arguments)
+		return s.handleDeleteMemory(mctx.UserID, toolCall.Arguments)
 	case "save_fact":
-		return s.handleSaveFact(ctx, mctx, toolCall.Function.Arguments)
+		return s.handleSaveFact(ctx, mctx, toolCall.Arguments)
 	case "forget_about":
-		return s.handleForgetAbout(mctx.UserID, toolCall.Function.Arguments)
+		return s.handleForgetAbout(mctx.UserID, toolCall.Arguments)
 	case "forget_episode":
-		return s.handleForgetEpisode(mctx.UserID, toolCall.Function.Arguments)
+		return s.handleForgetEpisode(mctx.UserID, toolCall.Arguments)
 	default:
-		return "", fmt.Errorf("unknown tool call: %s", toolCall.Function.Name)
+		return "", fmt.Errorf("unknown tool call: %s", toolCall.Name)
 	}
 }
 
