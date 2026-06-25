@@ -1,6 +1,10 @@
 package adapters
 
-import "vadimgribanov.com/tg-gpt/internal/llm"
+import (
+	"sort"
+
+	"vadimgribanov.com/tg-gpt/internal/llm"
+)
 
 type StreamAccumulator struct {
 	accumulatedResponse string
@@ -69,5 +73,8 @@ func (s *StreamAccumulator) GetToolCalls() []llm.ToolCall {
 	for _, toolCall := range s.toolCalls {
 		toolCalls = append(toolCalls, toolCall)
 	}
+	sort.Slice(toolCalls, func(i, j int) bool {
+		return toolCalls[i].Index < toolCalls[j].Index
+	})
 	return toolCalls
 }

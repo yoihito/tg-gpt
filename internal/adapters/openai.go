@@ -85,15 +85,23 @@ func toOpenAIChatMessages(messages []llm.Message) []openai.ChatCompletionMessage
 			if msg.ToolResult == nil {
 				continue
 			}
+			content := msg.ToolResult.Output
+			if content == "" {
+				content = " "
+			}
 			out = append(out, openai.ChatCompletionMessage{
 				Role:       openai.ChatMessageRoleTool,
 				ToolCallID: msg.ToolResult.CallID,
-				Content:    msg.ToolResult.Output,
+				Content:    content,
 			})
 		case llm.RoleAssistant:
+			content := msg.Content
+			if content == "" && len(msg.ToolCalls) > 0 {
+				content = " "
+			}
 			out = append(out, openai.ChatCompletionMessage{
 				Role:      openai.ChatMessageRoleAssistant,
-				Content:   msg.Content,
+				Content:   content,
 				ToolCalls: toOpenAIToolCalls(msg.ToolCalls),
 			})
 		case llm.RoleSystem:

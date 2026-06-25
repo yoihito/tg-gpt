@@ -1,8 +1,12 @@
 package services
 
 import (
+	"encoding/json"
 	"reflect"
 	"testing"
+
+	"vadimgribanov.com/tg-gpt/internal/llm"
+	"vadimgribanov.com/tg-gpt/internal/models"
 )
 
 func TestRRFFuseAgreement(t *testing.T) {
@@ -63,4 +67,65 @@ func TestContentHashStability(t *testing.T) {
 	if a == c {
 		t.Errorf("different content should produce different hash")
 	}
+}
+
+func TestAppendTraceMessagesSkipsIncompleteToolCallGroup(t *testing.T) {
+	events := []models.TraceEvent{
+		traceEvent(t, models.EventTypeUserMsg, models.UserMsgPayload{Content: "search this"}),
+		traceEvent(t, models.EventTypeModelMsg, models.ModelMsgPayload{
+			Content: "",
+			ToolCalls: []llm.ToolCall{
+				{ID: "call_1", Name: "web_search", Arguments: `{"query":"x"}`},
+			},
+		}),
+		traceEvent(t, models.EventTypeUserMsg, models.UserMsgPayload{Content: "try again"}),
+	}
+
+	got := appendTraceMessages(nil, events)
+	if len(got) != 2 {
+		t.Fatalf("expected incomplete tool-call group to be skipped, got %#v", got)
+	}
+	if got[0].Role != llm.RoleUser || got[0].Content != "search this" {
+		t.Fatalf("unexpected first message: %#v", got[0])
+	}
+	if got[1].Role != llm.RoleUser || got[1].Content != "try again" {
+		t.Fatalf("unexpected second message: %#v", got[1])
+	}
+}
+
+func TestAppendTraceMessagesKeepsCompleteToolCallGroup(t *testing.T) {
+	events := []models.TraceEvent{
+		traceEvent(t, models.EventTypeUserMsg, models.UserMsgPayload{Content: "search this"}),
+		traceEvent(t, models.EventTypeModelMsg, models.ModelMsgPayload{
+			Content: "",
+			ToolCalls: []llm.ToolCall{
+				{ID: "call_1", Name: "web_search", Arguments: `{"query":"x"}`},
+			},
+		}),
+		traceEvent(t, models.EventTypeToolResult, models.ToolResultPayload{
+			ToolCallID: "call_1",
+			Name:       "web_search",
+			Result:     "result",
+		}),
+	}
+
+	got := appendTraceMessages(nil, events)
+	if len(got) != 3 {
+		t.Fatalf("expected complete tool-call group, got %#v", got)
+	}
+	if got[1].Role != llm.RoleAssistant || len(got[1].ToolCalls) != 1 {
+		t.Fatalf("unexpected assistant message: %#v", got[1])
+	}
+	if got[2].Role != llm.RoleTool || got[2].ToolResult == nil || got[2].ToolResult.CallID != "call_1" {
+		t.Fatalf("unexpected tool result: %#v", got[2])
+	}
+}
+
+func traceEvent(t *testing.T, eventType string, payload any) models.TraceEvent {
+	t.Helper()
+	data, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return models.TraceEvent{EventType: eventType, Payload: data}
 }

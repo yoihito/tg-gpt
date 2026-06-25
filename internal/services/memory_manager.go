@@ -436,11 +436,60 @@ func (m *MemoryManager) AssemblePrompt(systemHeader string, retrieved RetrievedM
 			break
 		}
 	}
-	for _, e := range retrieved.RecentTrace[start:] {
-		msg, ok := traceEventToMessage(e)
-		if ok {
-			messages = append(messages, msg)
+	messages = appendTraceMessages(messages, retrieved.RecentTrace[start:])
+	return messages
+}
+
+func appendTraceMessages(messages []llm.Message, events []models.TraceEvent) []llm.Message {
+	for i := 0; i < len(events); {
+		msg, ok := traceEventToMessage(events[i])
+		if !ok {
+			i++
+			continue
 		}
+
+		if msg.Role == llm.RoleTool {
+			i++
+			continue
+		}
+
+		if msg.Role != llm.RoleAssistant || len(msg.ToolCalls) == 0 {
+			messages = append(messages, msg)
+			i++
+			continue
+		}
+
+		required := make(map[string]struct{}, len(msg.ToolCalls))
+		for _, call := range msg.ToolCalls {
+			required[call.ID] = struct{}{}
+		}
+
+		group := []llm.Message{msg}
+		j := i + 1
+		for ; j < len(events); j++ {
+			next, ok := traceEventToMessage(events[j])
+			if !ok {
+				continue
+			}
+			if next.Role != llm.RoleTool {
+				break
+			}
+			group = append(group, next)
+			if next.ToolResult != nil {
+				delete(required, next.ToolResult.CallID)
+			}
+			if len(required) == 0 {
+				j++
+				break
+			}
+		}
+
+		if len(required) == 0 {
+			messages = append(messages, group...)
+		} else {
+			slog.Warn("Skipping incomplete tool-call trace group", "missing_tool_results", len(required))
+		}
+		i = j
 	}
 	return messages
 }

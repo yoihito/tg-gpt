@@ -111,12 +111,14 @@ func main() {
 	}
 
 	reminderService := services.NewReminderService(reminderRepo, userRepo, prefRepo, memoryManager, b)
+	webSearchService := services.NewWebSearchService(os.Getenv("TAVILY_API_KEY"))
 	textService := services.NewTextService(
 		llmClientProxy,
 		userRepo,
 		memoryService,
 		memoryManager,
 		reminderService,
+		webSearchService,
 		dialogTimeout,
 		appConfig.DefaultModel.ModelId,
 	)
