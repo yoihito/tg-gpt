@@ -30,6 +30,24 @@ func NewTelegramStreamer(c tele.Context, replyTo *tele.Message) *TelegramStreame
 	}
 }
 
+func (t *TelegramStreamer) HasOutput() bool {
+	return t.currentMessage != nil || strings.TrimSpace(t.accumulatedMessage) != ""
+}
+
+func (t *TelegramStreamer) SendStatus(text string) error {
+	ctx := t.c.Get("requestContext").(context.Context)
+	if t.HasOutput() || strings.TrimSpace(text) == "" {
+		return nil
+	}
+	msg, err := t.c.Bot().Reply(t.replyTo, text, &tele.SendOptions{ParseMode: tele.ModeDefault})
+	if err != nil {
+		slog.ErrorContext(ctx, "Error sending status message", "error", err, "message", text)
+		return err
+	}
+	t.currentMessage = msg
+	return nil
+}
+
 func (t *TelegramStreamer) SendEvent(event llm.StreamEvent) error {
 	ctx := t.c.Get("requestContext").(context.Context)
 	slog.DebugContext(ctx, "Streaming event", "event", event)

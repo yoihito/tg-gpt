@@ -273,6 +273,12 @@ func (h *TextService) handleLLMRequestWithTools(
 				slog.ErrorContext(ctx, "Error appending model_msg with tool calls", "error", err)
 				return "", err
 			}
+			if streamer != nil && containsToolCall(toolCalls, "web_search") && !streamer.HasOutput() {
+				if err := streamer.SendStatus("Searching..."); err != nil {
+					slog.ErrorContext(ctx, "Error sending search status", "error", err)
+					return "", err
+				}
+			}
 
 			history = append(history, llm.Message{
 				Role:      llm.RoleAssistant,
@@ -342,4 +348,13 @@ func (h *TextService) handleLLMRequestWithTools(
 	go h.memoryManager.EndTurn(context.WithoutCancel(ctx), mctx, queryText, accumulatedResponse)
 
 	return accumulatedResponse, nil
+}
+
+func containsToolCall(toolCalls []llm.ToolCall, name string) bool {
+	for _, toolCall := range toolCalls {
+		if toolCall.Name == name {
+			return true
+		}
+	}
+	return false
 }

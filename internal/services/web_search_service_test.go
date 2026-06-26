@@ -1,9 +1,14 @@
 package services
 
 import (
+	"context"
 	"encoding/json"
+	"io"
+	"net/http"
 	"strings"
 	"testing"
+
+	"vadimgribanov.com/tg-gpt/internal/llm"
 )
 
 func TestClampMaxResults(t *testing.T) {
@@ -87,4 +92,44 @@ func TestFormatTavilyResponseBoundsContent(t *testing.T) {
 	if !strings.Contains(parsed.Results[0].Content, "[truncated]") {
 		t.Fatalf("expected truncated content, got %q", parsed.Results[0].Content)
 	}
+}
+
+func TestWebSearchEmptyTavilyResponseReturnsToolResult(t *testing.T) {
+	service := NewWebSearchService("test-key")
+	service.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Body:       io.NopCloser(strings.NewReader("")),
+			Header:     make(http.Header),
+		}, nil
+	})}
+
+	result, err := service.HandleToolCall(context.Background(), llm.ToolCall{
+		Name:      "web_search",
+		Arguments: `{"query":"test"}`,
+	})
+	if err != nil {
+		t.Fatalf("expected tool-level failure result, got error: %v", err)
+	}
+
+	var parsed struct {
+		Query string `json:"query"`
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(result), &parsed); err != nil {
+		t.Fatalf("result is not JSON: %v\n%s", err, result)
+	}
+	if parsed.Query != "test" {
+		t.Fatalf("query: got %q", parsed.Query)
+	}
+	if !strings.Contains(parsed.Error, "empty response") {
+		t.Fatalf("error: got %q", parsed.Error)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
 }

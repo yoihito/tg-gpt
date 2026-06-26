@@ -20,6 +20,7 @@ const (
 	hardWebSearchMaxResults      = 8
 	maxWebSearchResultContentLen = 1500
 	maxWebSearchOutputLen        = 8000
+	webSearchHTTPTimeout         = 30 * time.Second
 )
 
 type WebSearchService struct {
@@ -30,7 +31,7 @@ type WebSearchService struct {
 func NewWebSearchService(apiKey string) *WebSearchService {
 	return &WebSearchService{
 		apiKey: strings.TrimSpace(apiKey),
-		client: &http.Client{Timeout: 10 * time.Second},
+		client: &http.Client{Timeout: webSearchHTTPTimeout},
 	}
 }
 
@@ -95,7 +96,7 @@ func (s *WebSearchService) HandleToolCall(ctx context.Context, toolCall llm.Tool
 
 	resp, err := s.search(ctx, args)
 	if err != nil {
-		return "", err
+		return formatWebSearchFailure(args.Query, err), nil
 	}
 	return formatTavilyResponse(args, resp), nil
 }
@@ -171,8 +172,12 @@ func (s *WebSearchService) search(ctx context.Context, args webSearchArgs) (tavi
 	if err != nil {
 		return tavilySearchResponse{}, fmt.Errorf("read tavily response: %w", err)
 	}
+	body = bytes.TrimSpace(body)
 	if httpResp.StatusCode >= 300 {
 		return tavilySearchResponse{}, fmt.Errorf("tavily search failed: %s: %s", httpResp.Status, strings.TrimSpace(string(body)))
+	}
+	if len(body) == 0 {
+		return tavilySearchResponse{}, fmt.Errorf("tavily search returned an empty response")
 	}
 
 	var out tavilySearchResponse
@@ -217,6 +222,23 @@ func formatTavilyResponse(args webSearchArgs, resp tavilySearchResponse) string 
 		return "Failed to format search results."
 	}
 	return truncateString(string(data), maxWebSearchOutputLen)
+}
+
+func formatWebSearchFailure(query string, err error) string {
+	out := struct {
+		Query  string `json:"query"`
+		Error  string `json:"error"`
+		Notice string `json:"notice"`
+	}{
+		Query:  query,
+		Error:  truncateString(err.Error(), 1000),
+		Notice: "Web search failed. Do not claim current facts from this failed search; either answer from existing context with uncertainty or tell the user search is temporarily unavailable.",
+	}
+	data, marshalErr := json.MarshalIndent(out, "", "  ")
+	if marshalErr != nil {
+		return "Web search failed."
+	}
+	return string(data)
 }
 
 func clampMaxResults(n int) int {
