@@ -9,6 +9,7 @@ import (
 	"time"
 
 	tele "gopkg.in/telebot.v3"
+	"vadimgribanov.com/tg-gpt/internal/llm"
 	"vadimgribanov.com/tg-gpt/internal/middleware"
 	"vadimgribanov.com/tg-gpt/internal/models"
 	"vadimgribanov.com/tg-gpt/internal/repositories"
@@ -21,6 +22,7 @@ func RegisterHandlers(
 	rateLimiter *middleware.RateLimiter,
 	textService *services.TextService,
 	voiceService *services.VoiceService,
+	conversationRunner *services.ConversationRunner,
 	userRepo *repositories.UserRepo,
 	memoryManager *services.MemoryManager,
 	llmClientProxy *services.LLMClientProxy,
@@ -29,18 +31,19 @@ func RegisterHandlers(
 		rateLimiter,
 		textService,
 		voiceService,
+		conversationRunner,
 		userRepo,
 		memoryManager,
 		llmClientProxy,
 	)
 
 	bot.Handle("/cancel", func(c tele.Context) error {
-		rateLimiter.CancelRequest(c.Get("user").(models.User))
-		return nil
+		user := c.Get("user").(models.User)
+		rateLimiter.CancelRequest(user)
+		return conversationRunner.CancelCurrentDialog(c.Get("requestContext").(context.Context), user)
 	})
 
 	protected := bot.Group()
-	protected.Use(rateLimiter.Middleware())
 	protected.Handle("/start", func(c tele.Context) error {
 		return c.Send("Hello! I'm a bot that can talk to you. Just send me a voice message or text and I will respond to you.")
 	})
@@ -58,6 +61,7 @@ type BotHandler struct {
 	rateLimiter    *middleware.RateLimiter
 	textService    *services.TextService
 	voiceService   *services.VoiceService
+	runner         *services.ConversationRunner
 	userRepo       *repositories.UserRepo
 	memoryManager  *services.MemoryManager
 	llmClientProxy *services.LLMClientProxy
@@ -67,6 +71,7 @@ func NewBotHandler(
 	rateLimiter *middleware.RateLimiter,
 	textService *services.TextService,
 	voiceService *services.VoiceService,
+	conversationRunner *services.ConversationRunner,
 	userRepo *repositories.UserRepo,
 	memoryManager *services.MemoryManager,
 	llmClientProxy *services.LLMClientProxy,
@@ -75,6 +80,7 @@ func NewBotHandler(
 		rateLimiter:    rateLimiter,
 		textService:    textService,
 		voiceService:   voiceService,
+		runner:         conversationRunner,
 		userRepo:       userRepo,
 		memoryManager:  memoryManager,
 		llmClientProxy: llmClientProxy,
@@ -93,15 +99,15 @@ func (h *BotHandler) HandleText(c tele.Context) error {
 	userInput := c.Message().Text
 	streamer := telegram_utils.NewTelegramStreamer(c, c.Message())
 
-	err = h.textService.OnStreamableTextHandler(
+	err = h.runner.Submit(
 		ctx,
 		user,
 		int64(c.Message().ID),
-		userInput,
+		llmUserMessage(userInput),
 		streamer,
 	)
 	if err != nil {
-		slog.ErrorContext(ctx, "Error streaming text", "error", err)
+		slog.ErrorContext(ctx, "Error submitting text", "error", err)
 		c.Send("Failed to answer the message")
 		return err
 	}
@@ -135,11 +141,11 @@ func (h *BotHandler) HandleVoice(c tele.Context) error {
 
 	streamer := telegram_utils.NewTelegramStreamer(c, c.Message())
 
-	return h.textService.OnStreamableTextHandler(
+	return h.runner.Submit(
 		ctx,
 		user,
 		int64(c.Message().ID),
-		transcriptionText,
+		llmUserMessage(transcriptionText),
 		streamer,
 	)
 }
@@ -173,12 +179,11 @@ func (h *BotHandler) HandlePhoto(c tele.Context) error {
 	}
 
 	streamer := telegram_utils.NewTelegramStreamer(c, c.Message())
-	return h.textService.OnStreamableVisionHandler(
+	return h.runner.Submit(
 		ctx,
 		user,
 		int64(c.Message().ID),
-		userInput,
-		fmt.Sprintf("data:image/jpeg;base64,%s", encodedStr),
+		llmVisionMessage(userInput, fmt.Sprintf("data:image/jpeg;base64,%s", encodedStr)),
 		streamer,
 	)
 }
@@ -191,6 +196,9 @@ func (h *BotHandler) RetryLastMessage(c tele.Context) error {
 	}
 
 	user := c.Get("user").(models.User)
+	if h.runner.IsActive(user.Id, user.CurrentDialogId) {
+		return c.Send("Cannot retry while a response is being generated. Use /cancel first.")
+	}
 	userMsg, tgMsgID, err := h.memoryManager.PopForRetry(user.Id, user.CurrentDialogId)
 	if err != nil {
 		return c.Send("No messages found")
@@ -254,6 +262,9 @@ func (h *BotHandler) NewDialog(c tele.Context) error {
 
 	user := c.Get("user").(models.User)
 	oldDialogID := user.CurrentDialogId
+	if err := h.runner.CancelDialog(ctx, user.Id, oldDialogID); err != nil {
+		return err
+	}
 	go h.memoryManager.CloseDialog(context.WithoutCancel(ctx), user.Id, oldDialogID)
 
 	_, ok, err := h.userRepo.StartNewDialogCAS(user.Id, oldDialogID, time.Now().Unix())
@@ -265,4 +276,18 @@ func (h *BotHandler) NewDialog(c tele.Context) error {
 	}
 	return c.Send("New dialog started")
 
+}
+
+func llmUserMessage(text string) llm.Message {
+	return llm.Message{Role: llm.RoleUser, Content: text}
+}
+
+func llmVisionMessage(text string, imageURL string) llm.Message {
+	return llm.Message{
+		Role: llm.RoleUser,
+		Parts: []llm.ContentPart{
+			{Type: llm.ContentPartText, Text: text},
+			{Type: llm.ContentPartImageURL, ImageURL: imageURL},
+		},
+	}
 }

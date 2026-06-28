@@ -135,6 +135,12 @@ func extractQueryText(msg llm.Message) string {
 	return ""
 }
 
+type UserInput struct {
+	TraceID     int64
+	TgMessageID int64
+	Message     llm.Message
+}
+
 func (h *TextService) handleLLMRequest(ctx context.Context, user models.User, tgUserMessageId int64, newMessage llm.Message, streamer *telegram_utils.TelegramStreamer) (string, error) {
 	return h.handleLLMRequestWithTools(ctx, user, tgUserMessageId, newMessage, streamer, h.getDefaultTools(), "")
 }
@@ -157,6 +163,43 @@ func (h *TextService) getScheduledActionTools() []llm.Tool {
 	return h.webSearchService.GetWebSearchTools()
 }
 
+func (h *TextService) RunAttachedTurn(
+	ctx context.Context,
+	user models.User,
+	mctx TurnContext,
+	inputs []UserInput,
+	streamer *telegram_utils.TelegramStreamer,
+	drainNewInputs func(context.Context) ([]UserInput, error),
+) (string, error) {
+	return h.runAttachedTurnWithTools(ctx, user, mctx, inputs, streamer, h.getDefaultTools(), "", drainNewInputs)
+}
+
+func (h *TextService) PrepareUserForInput(ctx context.Context, user models.User) (models.User, error) {
+	now := time.Now().Unix()
+	if now-user.LastInteraction > h.dialogTimeout {
+		oldDialogID := user.CurrentDialogId
+		go h.memoryManager.CloseDialog(context.WithoutCancel(ctx), user.Id, oldDialogID)
+		newDialogID, ok, err := h.usersRepo.StartNewDialogCAS(user.Id, oldDialogID, now)
+		if err != nil {
+			return models.User{}, err
+		}
+		if ok {
+			user.CurrentDialogId = newDialogID
+		} else {
+			reloaded, err := h.reloadUser(user.Id)
+			if err != nil {
+				return models.User{}, err
+			}
+			user = reloaded
+		}
+	}
+	user.LastInteraction = now
+	if err := h.usersRepo.Touch(user.Id, now); err != nil {
+		return models.User{}, err
+	}
+	return user, nil
+}
+
 func (h *TextService) handleLLMRequestWithTools(
 	ctx context.Context,
 	user models.User,
@@ -166,25 +209,11 @@ func (h *TextService) handleLLMRequestWithTools(
 	tools []llm.Tool,
 	systemPromptSuffix string,
 ) (string, error) {
-	now := time.Now().Unix()
-	if now-user.LastInteraction > h.dialogTimeout {
-		oldDialogID := user.CurrentDialogId
-		go h.memoryManager.CloseDialog(context.WithoutCancel(ctx), user.Id, oldDialogID)
-		newDialogID, ok, err := h.usersRepo.StartNewDialogCAS(user.Id, oldDialogID, now)
-		if err != nil {
-			return "", err
-		}
-		if ok {
-			user.CurrentDialogId = newDialogID
-		} else {
-			reloaded, err := h.reloadUser(user.Id)
-			if err != nil {
-				return "", err
-			}
-			user = reloaded
-		}
+	var err error
+	user, err = h.PrepareUserForInput(ctx, user)
+	if err != nil {
+		return "", err
 	}
-	user.LastInteraction = now
 
 	modelToUse := user.CurrentModel
 	if !h.client.IsClientRegistered(modelToUse) {
@@ -198,17 +227,43 @@ func (h *TextService) handleLLMRequestWithTools(
 		}
 	}
 
-	if err := h.usersRepo.Touch(user.Id, now); err != nil {
-		return "", err
-	}
-
 	mctx, err := h.memoryManager.BeginTurn(user.Id, user.CurrentDialogId, newMessage, tgUserMessageId)
 	if err != nil {
 		slog.ErrorContext(ctx, "Error beginning turn", "error", err)
 		return "", err
 	}
 
-	queryText := extractQueryText(newMessage)
+	return h.runAttachedTurnWithTools(ctx, user, mctx, []UserInput{
+		{
+			TraceID:     mctx.UserTraceID,
+			TgMessageID: tgUserMessageId,
+			Message:     newMessage,
+		},
+	}, streamer, tools, systemPromptSuffix, nil)
+}
+
+func (h *TextService) runAttachedTurnWithTools(
+	ctx context.Context,
+	user models.User,
+	mctx TurnContext,
+	inputs []UserInput,
+	streamer *telegram_utils.TelegramStreamer,
+	tools []llm.Tool,
+	systemPromptSuffix string,
+	drainNewInputs func(context.Context) ([]UserInput, error),
+) (string, error) {
+	modelToUse := user.CurrentModel
+	if !h.client.IsClientRegistered(modelToUse) {
+		slog.WarnContext(ctx, "User's current model not supported, falling back to default",
+			"currentModel", modelToUse,
+			"defaultModel", h.defaultModel)
+		modelToUse = h.defaultModel
+		if err := h.usersRepo.SetCurrentModel(user.Id, h.defaultModel); err != nil {
+			return "", err
+		}
+	}
+
+	queryText := joinUserInputText(inputs)
 	retrieved, err := h.memoryManager.Retrieve(ctx, mctx, queryText)
 	if err != nil {
 		slog.ErrorContext(ctx, "Error retrieving memory", "error", err)
@@ -217,6 +272,7 @@ func (h *TextService) handleLLMRequestWithTools(
 
 	systemHeader := fmt.Sprintf(AssistantPrompt, time.Now().Format(time.RFC3339)) + systemPromptSuffix
 	history := h.memoryManager.AssemblePrompt(systemHeader, retrieved)
+	history = appendMissingCurrentInputs(history, retrieved.RecentTrace, inputs)
 
 	accumulatedInputTokens := int64(0)
 	accumulatedOutputTokens := int64(0)
@@ -333,6 +389,20 @@ func (h *TextService) handleLLMRequestWithTools(
 					return "", toolErr
 				}
 			}
+			if drainNewInputs != nil {
+				newInputs, err := drainNewInputs(ctx)
+				if err != nil {
+					slog.ErrorContext(ctx, "Error draining pending user inputs", "error", err)
+					return "", err
+				}
+				for _, input := range newInputs {
+					inputs = append(inputs, input)
+					history = append(history, midTurnSystemMessage(input.Message))
+				}
+				if len(newInputs) > 0 {
+					queryText = joinUserInputText(inputs)
+				}
+			}
 		} else {
 			if _, err := h.memoryManager.AppendModelMsg(mctx, accumulatedResponse, nil, modelToUse, 0); err != nil {
 				slog.ErrorContext(ctx, "Error appending model_msg", "error", err)
@@ -351,6 +421,52 @@ func (h *TextService) handleLLMRequestWithTools(
 	go h.memoryManager.EndTurn(context.WithoutCancel(ctx), mctx, queryText, accumulatedResponse)
 
 	return accumulatedResponse, nil
+}
+
+func appendMissingCurrentInputs(history []llm.Message, recent []models.TraceEvent, inputs []UserInput) []llm.Message {
+	recentIDs := make(map[int64]struct{}, len(recent))
+	for _, event := range recent {
+		recentIDs[event.ID] = struct{}{}
+	}
+	for _, input := range inputs {
+		if _, ok := recentIDs[input.TraceID]; ok {
+			continue
+		}
+		history = append(history, input.Message)
+	}
+	return history
+}
+
+func midTurnSystemMessage(msg llm.Message) llm.Message {
+	text := extractQueryText(msg)
+	if text == "" {
+		text = "[non-text user input]"
+	}
+	return llm.Message{
+		Role: llm.RoleSystem,
+		Content: fmt.Sprintf(
+			"The user sent this additional message while you were working:\n%s\n\nTreat it as additional input for the current answer, not as a replacement for earlier user requests or tool results.",
+			text,
+		),
+	}
+}
+
+func joinUserInputText(inputs []UserInput) string {
+	if len(inputs) == 0 {
+		return ""
+	}
+	out := ""
+	for _, input := range inputs {
+		text := extractQueryText(input.Message)
+		if text == "" {
+			continue
+		}
+		if out != "" {
+			out += "\n\n"
+		}
+		out += text
+	}
+	return out
 }
 
 func (h *TextService) reloadUser(userID int64) (models.User, error) {

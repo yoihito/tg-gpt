@@ -61,6 +61,7 @@ func main() {
 	factRepo := repositories.NewFactRepo(db)
 	episodeRepo := repositories.NewEpisodeRepo(db)
 	reminderRepo := repositories.NewReminderRepo(db)
+	pendingInputRepo := repositories.NewPendingInputRepo(db)
 
 	allowedUserIDsStr := os.Getenv("ALLOWED_USER_ID")
 	allowedUserIDs := make([]int64, 0)
@@ -126,6 +127,7 @@ func main() {
 	voiceService := &services.VoiceService{
 		Client: llmClientProxy.OpenaiClient,
 	}
+	conversationRunner := services.NewConversationRunner(db, pendingInputRepo, traceRepo, textService)
 
 	b.Use(func(next tele.HandlerFunc) tele.HandlerFunc {
 		return func(c tele.Context) error {
@@ -156,6 +158,7 @@ func main() {
 		&rateLimiter,
 		textService,
 		voiceService,
+		conversationRunner,
 		userRepo,
 		memoryManager,
 		llmClientProxy,
