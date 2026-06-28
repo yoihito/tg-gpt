@@ -515,8 +515,7 @@ func (s *ReminderService) fireReminder(ctx context.Context, reminder models.Remi
 		return
 	}
 
-	user.Touch()
-	if err := s.userRepo.UpdateUser(user); err != nil {
+	if err := s.userRepo.Touch(user.Id, time.Now().Unix()); err != nil {
 		slog.ErrorContext(ctx, "Failed to update user last interaction", "error", err, "user_id", reminder.UserID)
 	}
 

@@ -1,6 +1,7 @@
 package database
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log/slog"
@@ -42,12 +43,26 @@ func NewDB(dbPath string) (*DB, error) {
 	return &DB{db}, nil
 }
 
+func (db *DB) WithTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (db *DB) Migrate() error {
 	slog.Info("Running database migrations")
 
 	schemaMigrations := []string{
 		createUsersTable,
 		createTraceEventsTable,
+		createPendingUserInputsTable,
 		createPreferenceMemoryTable,
 		createFactMemoryTable,
 		createFactMemoryFTS,
@@ -277,6 +292,26 @@ CREATE TABLE IF NOT EXISTS trace_events (
 );
 CREATE INDEX IF NOT EXISTS idx_trace_user_dialog ON trace_events(user_id, dialog_id, turn_index);
 CREATE INDEX IF NOT EXISTS idx_trace_user_created ON trace_events(user_id, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_trace_turn_unique ON trace_events(user_id, dialog_id, turn_index);
+`
+
+const createPendingUserInputsTable = `
+CREATE TABLE IF NOT EXISTS pending_user_inputs (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	user_id INTEGER NOT NULL,
+	dialog_id INTEGER NOT NULL,
+	tg_message_id INTEGER NOT NULL,
+	payload TEXT NOT NULL,
+	status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','attached','discarded')),
+	attached_trace_id INTEGER,
+	created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+	updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+	FOREIGN KEY (user_id) REFERENCES users(id),
+	FOREIGN KEY (attached_trace_id) REFERENCES trace_events(id),
+	UNIQUE(user_id, dialog_id, tg_message_id)
+);
+CREATE INDEX IF NOT EXISTS idx_pending_user_dialog_status
+	ON pending_user_inputs(user_id, dialog_id, status, tg_message_id, id);
 `
 
 const createPreferenceMemoryTable = `

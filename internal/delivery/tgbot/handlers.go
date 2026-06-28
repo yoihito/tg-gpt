@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"time"
 
 	tele "gopkg.in/telebot.v3"
 	"vadimgribanov.com/tg-gpt/internal/middleware"
@@ -234,8 +235,7 @@ func (h *BotHandler) ChangeModel(c tele.Context) error {
 		return c.Send("Model not found")
 	}
 	user.CurrentModel = modelName
-	err := h.userRepo.UpdateUser(user)
-	if err != nil {
+	if err := h.userRepo.SetCurrentModel(user.Id, modelName); err != nil {
 		return err
 	}
 	return c.Send(fmt.Sprintf("Model changed to %s", modelName))
@@ -256,10 +256,12 @@ func (h *BotHandler) NewDialog(c tele.Context) error {
 	oldDialogID := user.CurrentDialogId
 	go h.memoryManager.CloseDialog(context.WithoutCancel(ctx), user.Id, oldDialogID)
 
-	user.StartNewDialog()
-	err := h.userRepo.UpdateUser(user)
+	_, ok, err := h.userRepo.StartNewDialogCAS(user.Id, oldDialogID, time.Now().Unix())
 	if err != nil {
 		return err
+	}
+	if !ok {
+		return c.Send("Dialog already changed")
 	}
 	return c.Send("New dialog started")
 

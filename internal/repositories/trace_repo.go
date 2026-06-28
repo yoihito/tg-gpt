@@ -78,6 +78,64 @@ func (r *TraceRepo) Append(in AppendEventInput) (int64, error) {
 	return id, nil
 }
 
+func (r *TraceRepo) AppendBatchTx(tx *sql.Tx, userID, dialogID int64, events []AppendEventInput) ([]int64, error) {
+	if len(events) == 0 {
+		return nil, nil
+	}
+
+	var nextIdx int64
+	err := tx.QueryRow(
+		`SELECT COALESCE(MAX(turn_index), -1) + 1 FROM trace_events WHERE user_id = ? AND dialog_id = ?`,
+		userID, dialogID,
+	).Scan(&nextIdx)
+	if err != nil {
+		return nil, fmt.Errorf("compute turn_index: %w", err)
+	}
+
+	ids := make([]int64, 0, len(events))
+	for i, event := range events {
+		event.UserID = userID
+		event.DialogID = dialogID
+		id, err := appendTraceEventTx(tx, event, nextIdx+int64(i))
+		if err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
+func appendTraceEventTx(tx *sql.Tx, in AppendEventInput, turnIndex int64) (int64, error) {
+	payloadBytes, err := json.Marshal(in.Payload)
+	if err != nil {
+		return 0, fmt.Errorf("marshal payload: %w", err)
+	}
+
+	var tgMsgID sql.NullInt64
+	if in.TgMessageID != nil {
+		tgMsgID = sql.NullInt64{Int64: *in.TgMessageID, Valid: true}
+	}
+	var model sql.NullString
+	if in.Model != "" {
+		model = sql.NullString{String: in.Model, Valid: true}
+	}
+
+	res, err := tx.Exec(
+		`INSERT INTO trace_events (user_id, dialog_id, turn_index, event_type, payload, tg_message_id, model)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		in.UserID, in.DialogID, turnIndex, in.EventType, string(payloadBytes), tgMsgID, model,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("insert trace_event: %w", err)
+	}
+
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
 // GetAllForDialog returns every event for (user_id, dialog_id) in turn order.
 // Used by CloseDialog summarization.
 func (r *TraceRepo) GetAllForDialog(userID, dialogID int64) ([]models.TraceEvent, error) {

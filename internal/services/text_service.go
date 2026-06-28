@@ -53,10 +53,12 @@ type LLMClient interface {
 }
 
 type UsersRepo interface {
-	UpdateUser(user models.User) error
+	Touch(userID int64, ts int64) error
+	AddTokenUsage(userID int64, inputTokens, outputTokens int64) error
+	SetCurrentModel(userID int64, model string) error
+	StartNewDialogCAS(userID, expectedDialogID, ts int64) (int64, bool, error)
 }
 
-const EOFStatus = "EOF"
 const AssistantPrompt = `You are a helpful assistant. Your name is Johnny. You can save things you learn about the user (preferences and facts) and create, list, or cancel reminders.
 
 IMPORTANT:
@@ -68,21 +70,6 @@ IMPORTANT:
 - IT IS VERY IMPORTANT to capture all the smallest details about the user.
 
 Today is %s. Give short concise answers.`
-
-type Result struct {
-	Status      string
-	StreamEvent llm.StreamEvent
-	Err         error
-}
-
-type MessagePartType string
-
-const (
-	MessagePartTypeText  MessagePartType = "text"
-	MessagePartTypeImage MessagePartType = "image"
-)
-
-type StreamedResponse struct{}
 
 func (h *TextService) RetryWithMessage(
 	ctx context.Context,
@@ -179,12 +166,25 @@ func (h *TextService) handleLLMRequestWithTools(
 	tools []llm.Tool,
 	systemPromptSuffix string,
 ) (string, error) {
-	if time.Now().Unix()-user.LastInteraction > h.dialogTimeout {
+	now := time.Now().Unix()
+	if now-user.LastInteraction > h.dialogTimeout {
 		oldDialogID := user.CurrentDialogId
 		go h.memoryManager.CloseDialog(context.WithoutCancel(ctx), user.Id, oldDialogID)
-		user.StartNewDialog()
+		newDialogID, ok, err := h.usersRepo.StartNewDialogCAS(user.Id, oldDialogID, now)
+		if err != nil {
+			return "", err
+		}
+		if ok {
+			user.CurrentDialogId = newDialogID
+		} else {
+			reloaded, err := h.reloadUser(user.Id)
+			if err != nil {
+				return "", err
+			}
+			user = reloaded
+		}
 	}
-	user.Touch()
+	user.LastInteraction = now
 
 	modelToUse := user.CurrentModel
 	if !h.client.IsClientRegistered(modelToUse) {
@@ -193,9 +193,12 @@ func (h *TextService) handleLLMRequestWithTools(
 			"defaultModel", h.defaultModel)
 		modelToUse = h.defaultModel
 		user.CurrentModel = h.defaultModel
+		if err := h.usersRepo.SetCurrentModel(user.Id, h.defaultModel); err != nil {
+			return "", err
+		}
 	}
 
-	if err := h.usersRepo.UpdateUser(user); err != nil {
+	if err := h.usersRepo.Touch(user.Id, now); err != nil {
 		return "", err
 	}
 
@@ -341,13 +344,24 @@ func (h *TextService) handleLLMRequestWithTools(
 
 	user.NumberOfInputTokens += accumulatedInputTokens
 	user.NumberOfOutputTokens += accumulatedOutputTokens
-	if err := h.usersRepo.UpdateUser(user); err != nil {
+	if err := h.usersRepo.AddTokenUsage(user.Id, accumulatedInputTokens, accumulatedOutputTokens); err != nil {
 		slog.ErrorContext(ctx, "Error updating user token counts", "error", err)
 	}
 
 	go h.memoryManager.EndTurn(context.WithoutCancel(ctx), mctx, queryText, accumulatedResponse)
 
 	return accumulatedResponse, nil
+}
+
+func (h *TextService) reloadUser(userID int64) (models.User, error) {
+	type userGetter interface {
+		GetUser(userID int64) (models.User, error)
+	}
+	repo, ok := h.usersRepo.(userGetter)
+	if !ok {
+		return models.User{}, fmt.Errorf("users repo cannot reload user after dialog race")
+	}
+	return repo.GetUser(userID)
 }
 
 func containsToolCall(toolCalls []llm.ToolCall, name string) bool {

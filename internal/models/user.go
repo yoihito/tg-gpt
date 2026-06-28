@@ -1,7 +1,5 @@
 package models
 
-import "time"
-
 type User struct {
 	Id                   int64
 	FirstName            string
@@ -15,12 +13,4 @@ type User struct {
 	LastInteraction      int64
 	Active               bool
 	CurrentModel         string
-}
-
-func (u *User) StartNewDialog() {
-	u.CurrentDialogId++
-}
-
-func (u *User) Touch() {
-	u.LastInteraction = time.Now().Unix()
 }
