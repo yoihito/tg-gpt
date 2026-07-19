@@ -5,7 +5,8 @@ import (
 	"fmt"
 	"os"
 
-	openai "github.com/sashabaranov/go-openai"
+	"github.com/openai/openai-go/v3"
+	"github.com/openai/openai-go/v3/option"
 	"vadimgribanov.com/tg-gpt/internal/adapters"
 	"vadimgribanov.com/tg-gpt/internal/config"
 	"vadimgribanov.com/tg-gpt/internal/llm"
@@ -28,10 +29,10 @@ func NewLLMClientProxy() *LLMClientProxy {
 
 func NewClientProxyFromConfig(config *config.Config) *LLMClientProxy {
 	proxy := NewLLMClientProxy()
-	client := openai.NewClient(os.Getenv("OPENAI_API_KEY"))
-	proxy.OpenaiClient = client
+	client := openai.NewClient(option.WithAPIKey(os.Getenv("OPENAI_API_KEY")))
+	proxy.OpenaiClient = &client
 	anthropicClient := anthropic.NewClient(os.Getenv("ANTHROPIC_API_KEY"))
-	proxy.registerProvider(adapters.NewOpenaiAdapter(client))
+	proxy.registerProvider(adapters.NewOpenaiAdapter(&client))
 	proxy.registerProvider(adapters.NewAnthropicAdapter(anthropicClient))
 	for _, model := range config.Models {
 		proxy.registerAvailableModel(model)

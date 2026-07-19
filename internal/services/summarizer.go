@@ -4,12 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
+	"time"
 
-	"github.com/sashabaranov/go-openai"
+	"github.com/openai/openai-go/v3"
+	"github.com/openai/openai-go/v3/responses"
+	"github.com/openai/openai-go/v3/shared"
 	"vadimgribanov.com/tg-gpt/internal/llm"
 	"vadimgribanov.com/tg-gpt/internal/models"
 )
+
+const openaiSummarizerTimeout = 90 * time.Second
 
 type Summarizer struct {
 	client *openai.Client
@@ -37,20 +43,32 @@ func (s *Summarizer) Summarize(ctx context.Context, events []models.TraceEvent) 
 		return "", nil
 	}
 
-	resp, err := s.client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
-		Model: s.model,
-		Messages: []openai.ChatCompletionMessage{
-			{Role: openai.ChatMessageRoleSystem, Content: summarizerSystemPrompt},
-			{Role: openai.ChatMessageRoleUser, Content: "Dialog:\n\n" + transcript},
+	ctx, cancel := context.WithTimeout(ctx, openaiSummarizerTimeout)
+	defer cancel()
+
+	slog.InfoContext(ctx, "OpenAI summarizer: starting",
+		"model", s.model,
+		"events", len(events),
+		"transcript_len", len(transcript),
+		"timeout", openaiSummarizerTimeout.String(),
+	)
+	resp, err := s.client.Responses.New(ctx, responses.ResponseNewParams{
+		Model:        shared.ResponsesModel(s.model),
+		Instructions: openai.String(summarizerSystemPrompt),
+		Input: responses.ResponseNewParamsInputUnion{
+			OfString: openai.String("Dialog:\n\n" + transcript),
 		},
 	})
 	if err != nil {
+		slog.ErrorContext(ctx, "OpenAI summarizer: failed", "model", s.model, "error", err)
 		return "", fmt.Errorf("summarizer completion: %w", err)
 	}
-	if len(resp.Choices) == 0 {
-		return "", fmt.Errorf("summarizer: empty choices")
-	}
-	return strings.TrimSpace(resp.Choices[0].Message.Content), nil
+	summary := strings.TrimSpace(resp.OutputText())
+	slog.InfoContext(ctx, "OpenAI summarizer: completed",
+		"model", s.model,
+		"summary_len", len(summary),
+	)
+	return summary, nil
 }
 
 func renderTranscript(events []models.TraceEvent) string {

@@ -86,12 +86,14 @@ func (t *TelegramStreamer) Flush() error {
 
 	var err error
 	if t.currentMessage == nil {
+		slog.DebugContext(ctx, "Telegram streamer: sending message", "message_len", len(t.accumulatedMessage))
 		t.currentMessage, err = t.c.Bot().Reply(t.replyTo, FixMarkdown(t.accumulatedMessage), &tele.SendOptions{ParseMode: tele.ModeMarkdown})
 		if err != nil {
 			t.currentMessage, err = t.c.Bot().Reply(t.replyTo, t.accumulatedMessage, &tele.SendOptions{ParseMode: tele.ModeDefault})
 			slog.ErrorContext(ctx, "Error sending message", "error", err, "message", t.accumulatedMessage)
 		}
 	} else {
+		slog.DebugContext(ctx, "Telegram streamer: editing message", "message_len", len(t.accumulatedMessage))
 		_, err = t.c.Bot().Edit(t.currentMessage, FixMarkdown(t.accumulatedMessage), &tele.SendOptions{ParseMode: tele.ModeMarkdown})
 		if err != nil {
 			_, err = t.c.Bot().Edit(t.currentMessage, t.accumulatedMessage, &tele.SendOptions{ParseMode: tele.ModeDefault})
@@ -107,6 +109,7 @@ func (t *TelegramStreamer) Flush() error {
 		}
 		return errors.Join(err, noticeErr)
 	}
+	slog.DebugContext(ctx, "Telegram streamer: flushed", "message_len", len(t.accumulatedMessage))
 	return nil
 }
 

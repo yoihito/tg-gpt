@@ -210,6 +210,12 @@ func (h *TextService) handleLLMRequestWithTools(
 	systemPromptSuffix string,
 ) (string, error) {
 	var err error
+	slog.InfoContext(ctx, "LLM request: preparing user",
+		"user_id", user.Id,
+		"dialog_id", user.CurrentDialogId,
+		"current_model", user.CurrentModel,
+		"tool_count", len(tools),
+	)
 	user, err = h.PrepareUserForInput(ctx, user)
 	if err != nil {
 		return "", err
@@ -227,6 +233,11 @@ func (h *TextService) handleLLMRequestWithTools(
 		}
 	}
 
+	slog.InfoContext(ctx, "LLM request: beginning turn",
+		"user_id", user.Id,
+		"dialog_id", user.CurrentDialogId,
+		"model", modelToUse,
+	)
 	mctx, err := h.memoryManager.BeginTurn(user.Id, user.CurrentDialogId, newMessage, tgUserMessageId)
 	if err != nil {
 		slog.ErrorContext(ctx, "Error beginning turn", "error", err)
@@ -264,11 +275,25 @@ func (h *TextService) runAttachedTurnWithTools(
 	}
 
 	queryText := joinUserInputText(inputs)
+	slog.InfoContext(ctx, "LLM request: retrieving memory",
+		"user_id", user.Id,
+		"dialog_id", mctx.DialogID,
+		"input_count", len(inputs),
+		"query_len", len(queryText),
+	)
 	retrieved, err := h.memoryManager.Retrieve(ctx, mctx, queryText)
 	if err != nil {
 		slog.ErrorContext(ctx, "Error retrieving memory", "error", err)
 		return "", err
 	}
+	slog.InfoContext(ctx, "LLM request: memory retrieved",
+		"user_id", user.Id,
+		"dialog_id", mctx.DialogID,
+		"facts", len(retrieved.Facts),
+		"episodes", len(retrieved.Episodes),
+		"preferences", len(retrieved.Preferences),
+		"recent_trace", len(retrieved.RecentTrace),
+	)
 
 	systemHeader := fmt.Sprintf(AssistantPrompt, time.Now().Format(time.RFC3339)) + systemPromptSuffix
 	history := h.memoryManager.AssemblePrompt(systemHeader, retrieved)
@@ -282,7 +307,17 @@ func (h *TextService) runAttachedTurnWithTools(
 		allowedTools[tool.Name] = struct{}{}
 	}
 
+	iteration := 0
 	for {
+		iteration++
+		slog.InfoContext(ctx, "LLM request: creating stream",
+			"user_id", user.Id,
+			"dialog_id", mctx.DialogID,
+			"model", modelToUse,
+			"iteration", iteration,
+			"history_messages", len(history),
+			"tool_count", len(tools),
+		)
 		stream, err := h.client.Stream(ctx, llm.Request{
 			Model:      modelToUse,
 			Messages:   history,
@@ -293,11 +328,37 @@ func (h *TextService) runAttachedTurnWithTools(
 			slog.ErrorContext(ctx, "Got an error while creating chat completion stream", "error", err)
 			return "", err
 		}
+		slog.InfoContext(ctx, "LLM request: stream created",
+			"user_id", user.Id,
+			"dialog_id", mctx.DialogID,
+			"iteration", iteration,
+		)
 		defer stream.Close()
 
 		accumulator := adapters.NewStreamAccumulator()
+		eventCount := 0
+		textDeltaCount := 0
+		toolEventCount := 0
 		for stream.Next() {
 			event := stream.Event()
+			eventCount++
+			if event.TextDelta != "" {
+				textDeltaCount++
+			}
+			if event.ToolCall != nil || len(event.ToolCalls) > 0 {
+				toolEventCount++
+			}
+			if eventCount == 1 {
+				slog.InfoContext(ctx, "LLM request: first stream event received",
+					"user_id", user.Id,
+					"dialog_id", mctx.DialogID,
+					"iteration", iteration,
+					"has_text", event.TextDelta != "",
+					"has_tool_call", event.ToolCall != nil || len(event.ToolCalls) > 0,
+					"has_usage", event.Usage != nil,
+					"done", event.Done,
+				)
+			}
 			accumulator.AddEvent(event)
 			if streamer != nil {
 				if err := streamer.SendEvent(event); err != nil {
@@ -306,23 +367,42 @@ func (h *TextService) runAttachedTurnWithTools(
 				}
 			}
 		}
+		slog.InfoContext(ctx, "LLM request: stream ended",
+			"user_id", user.Id,
+			"dialog_id", mctx.DialogID,
+			"iteration", iteration,
+			"events", eventCount,
+			"text_events", textDeltaCount,
+			"tool_events", toolEventCount,
+		)
 
-		if err := stream.Err(); err != nil {
-			if errors.Is(err, io.EOF) {
-				if streamer != nil {
-					if err := streamer.Flush(); err != nil {
-						slog.ErrorContext(ctx, "Got an error while flushing stream", "error", err)
-						return "", err
-					}
-				}
-			} else {
-				slog.ErrorContext(ctx, "Got an error while receiving chat completion stream", "error", err)
+		if err := stream.Err(); err != nil && !errors.Is(err, io.EOF) {
+			slog.ErrorContext(ctx, "Got an error while receiving chat completion stream", "error", err)
+			return "", err
+		}
+		if streamer != nil {
+			slog.InfoContext(ctx, "LLM request: flushing streamer",
+				"user_id", user.Id,
+				"dialog_id", mctx.DialogID,
+				"iteration", iteration,
+			)
+			if err := streamer.Flush(); err != nil {
+				slog.ErrorContext(ctx, "Got an error while flushing stream", "error", err)
 				return "", err
 			}
 		}
 		accumulatedInputTokens += accumulator.InputTokens()
 		accumulatedOutputTokens += accumulator.OutputTokens()
 		accumulatedResponse = accumulator.AccumulatedResponse()
+		slog.InfoContext(ctx, "LLM request: stream accumulated",
+			"user_id", user.Id,
+			"dialog_id", mctx.DialogID,
+			"iteration", iteration,
+			"response_len", len(accumulatedResponse),
+			"has_tool_calls", accumulator.HasToolCalls(),
+			"input_tokens", accumulator.InputTokens(),
+			"output_tokens", accumulator.OutputTokens(),
+		)
 
 		if accumulator.HasToolCalls() {
 			toolCalls := accumulator.GetToolCalls()
@@ -349,6 +429,13 @@ func (h *TextService) runAttachedTurnWithTools(
 				var result string
 				var toolErr error
 
+				slog.InfoContext(ctx, "LLM request: handling tool call",
+					"user_id", user.Id,
+					"dialog_id", mctx.DialogID,
+					"iteration", iteration,
+					"tool", toolCall.Name,
+					"call_id", toolCall.ID,
+				)
 				if _, ok := allowedTools[toolCall.Name]; !ok {
 					toolErr = fmt.Errorf("tool is not available in this mode: %s", toolCall.Name)
 					result = "Tool is not available in this mode."
@@ -370,6 +457,15 @@ func (h *TextService) runAttachedTurnWithTools(
 						result = "Unknown tool"
 					}
 				}
+				slog.InfoContext(ctx, "LLM request: tool call finished",
+					"user_id", user.Id,
+					"dialog_id", mctx.DialogID,
+					"iteration", iteration,
+					"tool", toolCall.Name,
+					"call_id", toolCall.ID,
+					"result_len", len(result),
+					"error", toolErr,
+				)
 
 				if _, err := h.memoryManager.AppendToolResult(mctx, toolCall.ID, toolCall.Name, result); err != nil {
 					slog.ErrorContext(ctx, "Error appending tool_result", "error", err)
@@ -404,6 +500,11 @@ func (h *TextService) runAttachedTurnWithTools(
 				}
 			}
 		} else {
+			slog.InfoContext(ctx, "LLM request: appending final model message",
+				"user_id", user.Id,
+				"dialog_id", mctx.DialogID,
+				"response_len", len(accumulatedResponse),
+			)
 			if _, err := h.memoryManager.AppendModelMsg(mctx, accumulatedResponse, nil, modelToUse, 0); err != nil {
 				slog.ErrorContext(ctx, "Error appending model_msg", "error", err)
 				return "", err
@@ -418,6 +519,13 @@ func (h *TextService) runAttachedTurnWithTools(
 		slog.ErrorContext(ctx, "Error updating user token counts", "error", err)
 	}
 
+	slog.InfoContext(ctx, "LLM request: completed",
+		"user_id", user.Id,
+		"dialog_id", mctx.DialogID,
+		"response_len", len(accumulatedResponse),
+		"input_tokens", accumulatedInputTokens,
+		"output_tokens", accumulatedOutputTokens,
+	)
 	go h.memoryManager.EndTurn(context.WithoutCancel(ctx), mctx, queryText, accumulatedResponse)
 
 	return accumulatedResponse, nil

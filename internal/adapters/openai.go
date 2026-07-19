@@ -2,10 +2,17 @@ package adapters
 
 import (
 	"context"
+	"fmt"
+	"log/slog"
+	"time"
 
-	"github.com/sashabaranov/go-openai"
+	"github.com/openai/openai-go/v3"
+	"github.com/openai/openai-go/v3/responses"
+	"github.com/openai/openai-go/v3/shared"
 	"vadimgribanov.com/tg-gpt/internal/llm"
 )
+
+const openaiStreamTimeout = 2 * time.Minute
 
 type OpenaiAdapter struct {
 	client *openai.Client
@@ -28,37 +35,85 @@ func (a *OpenaiAdapter) Capabilities(model string) llm.Capabilities {
 }
 
 func (a *OpenaiAdapter) Stream(ctx context.Context, request llm.Request) (llm.Stream, error) {
-	openaiReq := openai.ChatCompletionRequest{
-		Model:         request.Model,
-		Messages:      toOpenAIChatMessages(request.Messages),
-		Tools:         toOpenAITools(request.Tools),
-		StreamOptions: &openai.StreamOptions{IncludeUsage: true},
-	}
-	if request.ToolChoice != "" {
-		openaiReq.ToolChoice = string(request.ToolChoice)
-	}
-
-	stream, err := a.client.CreateChatCompletionStream(ctx, openaiReq)
-	if err != nil {
+	ctx, cancel := context.WithTimeout(ctx, openaiStreamTimeout)
+	slog.InfoContext(ctx, "OpenAI responses stream: starting",
+		"model", request.Model,
+		"messages", len(request.Messages),
+		"tools", len(request.Tools),
+		"timeout", openaiStreamTimeout.String(),
+	)
+	stream := a.client.Responses.NewStreaming(ctx, toOpenAIResponseRequest(request))
+	if err := stream.Err(); err != nil {
+		cancel()
+		slog.ErrorContext(ctx, "OpenAI responses stream: start failed", "error", err)
 		return nil, err
 	}
-	return &OpenaiStreamAdapter{stream: stream}, nil
+	slog.InfoContext(ctx, "OpenAI responses stream: started",
+		"model", request.Model,
+		"messages", len(request.Messages),
+		"tools", len(request.Tools),
+	)
+	return &OpenaiStreamAdapter{ctx: ctx, stream: stream, cancel: cancel}, nil
+}
+
+func toOpenAIResponseRequest(request llm.Request) responses.ResponseNewParams {
+	params := responses.ResponseNewParams{
+		Model: shared.ResponsesModel(request.Model),
+		Input: responses.ResponseNewParamsInputUnion{
+			OfInputItemList: toOpenAIResponseInput(request.Messages),
+		},
+		Tools:             toOpenAIResponseTools(request.Tools),
+		ParallelToolCalls: openai.Bool(false),
+		Store:             openai.Bool(false),
+		Reasoning: shared.ReasoningParam{
+			Effort: shared.ReasoningEffortLow,
+		},
+	}
+	return params
 }
 
 type OpenaiStreamAdapter struct {
-	stream  *openai.ChatCompletionStream
-	current llm.StreamEvent
-	err     error
+	ctx      context.Context
+	stream   responseStream
+	cancel   context.CancelFunc
+	pending  []llm.StreamEvent
+	current  llm.StreamEvent
+	err      error
+	sentText bool
+}
+
+type responseStream interface {
+	Next() bool
+	Current() responses.ResponseStreamEventUnion
+	Err() error
+	Close() error
 }
 
 func (a *OpenaiStreamAdapter) Next() bool {
-	response, err := a.stream.Recv()
-	if err != nil {
-		a.err = err
-		return false
+	if len(a.pending) > 0 {
+		a.current = a.pending[0]
+		a.pending = a.pending[1:]
+		return true
 	}
-	a.current = fromOpenAIStreamResponse(response)
-	return true
+	for a.stream.Next() {
+		event := a.stream.Current()
+		slog.DebugContext(a.ctx, "OpenAI responses stream: event", "type", event.Type)
+		if converted, ok := a.fromResponseStreamEvent(event); ok {
+			a.current = converted
+			return true
+		}
+		if event.Type == "error" {
+			a.err = fmt.Errorf("openai response stream error: %s", event.Message)
+			return false
+		}
+	}
+	a.err = a.stream.Err()
+	if a.err != nil {
+		slog.ErrorContext(a.ctx, "OpenAI responses stream: ended with error", "error", a.err)
+	} else {
+		slog.InfoContext(a.ctx, "OpenAI responses stream: ended")
+	}
+	return false
 }
 
 func (a *OpenaiStreamAdapter) Event() llm.StreamEvent {
@@ -73,134 +128,116 @@ func (a *OpenaiStreamAdapter) Close() error {
 	if a.stream == nil {
 		return nil
 	}
-	a.stream.Close()
-	return nil
+	err := a.stream.Close()
+	if a.cancel != nil {
+		a.cancel()
+	}
+	return err
 }
 
-func toOpenAIChatMessages(messages []llm.Message) []openai.ChatCompletionMessage {
-	out := make([]openai.ChatCompletionMessage, 0, len(messages))
+func toOpenAIResponseInput(messages []llm.Message) responses.ResponseInputParam {
+	out := make(responses.ResponseInputParam, 0, len(messages))
 	for _, msg := range messages {
 		switch msg.Role {
 		case llm.RoleTool:
 			if msg.ToolResult == nil {
 				continue
 			}
-			content := msg.ToolResult.Output
-			if content == "" {
-				content = " "
+			output := msg.ToolResult.Output
+			if output == "" {
+				output = " "
 			}
-			out = append(out, openai.ChatCompletionMessage{
-				Role:       openai.ChatMessageRoleTool,
-				ToolCallID: msg.ToolResult.CallID,
-				Content:    content,
-			})
+			out = append(out, responses.ResponseInputItemParamOfFunctionCallOutput(msg.ToolResult.CallID, output))
 		case llm.RoleAssistant:
-			content := msg.Content
-			if content == "" && len(msg.ToolCalls) > 0 {
-				content = " "
+			if msg.Content != "" {
+				out = append(out, responses.ResponseInputItemParamOfMessage(msg.Content, responses.EasyInputMessageRoleAssistant))
 			}
-			out = append(out, openai.ChatCompletionMessage{
-				Role:      openai.ChatMessageRoleAssistant,
-				Content:   content,
-				ToolCalls: toOpenAIToolCalls(msg.ToolCalls),
-			})
+			for _, call := range msg.ToolCalls {
+				out = append(out, responses.ResponseInputItemParamOfFunctionCall(call.Arguments, call.ID, call.Name))
+			}
 		case llm.RoleSystem:
-			out = append(out, openai.ChatCompletionMessage{
-				Role:    openai.ChatMessageRoleSystem,
-				Content: msg.Content,
-			})
+			out = append(out, responses.ResponseInputItemParamOfMessage(msg.Content, responses.EasyInputMessageRoleSystem))
 		default:
-			oai := openai.ChatCompletionMessage{Role: openai.ChatMessageRoleUser, Content: msg.Content}
 			if len(msg.Parts) > 0 {
-				oai.Content = ""
-				oai.MultiContent = toOpenAIMessageParts(msg.Parts)
+				out = append(out, responses.ResponseInputItemParamOfMessage(toOpenAIResponseContent(msg.Parts), responses.EasyInputMessageRoleUser))
+			} else {
+				out = append(out, responses.ResponseInputItemParamOfMessage(msg.Content, responses.EasyInputMessageRoleUser))
 			}
-			out = append(out, oai)
 		}
 	}
 	return out
 }
 
-func toOpenAIMessageParts(parts []llm.ContentPart) []openai.ChatMessagePart {
-	out := make([]openai.ChatMessagePart, 0, len(parts))
+func toOpenAIResponseContent(parts []llm.ContentPart) responses.ResponseInputMessageContentListParam {
+	out := make(responses.ResponseInputMessageContentListParam, 0, len(parts))
 	for _, part := range parts {
 		switch part.Type {
 		case llm.ContentPartImageURL:
-			out = append(out, openai.ChatMessagePart{
-				Type: openai.ChatMessagePartTypeImageURL,
-				ImageURL: &openai.ChatMessageImageURL{
-					URL:    part.ImageURL,
-					Detail: openai.ImageURLDetailLow,
-				},
-			})
+			image := responses.ResponseInputContentParamOfInputImage(responses.ResponseInputImageDetailLow)
+			image.OfInputImage.ImageURL = openai.String(part.ImageURL)
+			out = append(out, image)
 		default:
-			out = append(out, openai.ChatMessagePart{
-				Type: openai.ChatMessagePartTypeText,
-				Text: part.Text,
-			})
+			out = append(out, responses.ResponseInputContentParamOfInputText(part.Text))
 		}
 	}
 	return out
 }
 
-func toOpenAITools(tools []llm.Tool) []openai.Tool {
-	out := make([]openai.Tool, 0, len(tools))
+func toOpenAIResponseTools(tools []llm.Tool) []responses.ToolUnionParam {
+	out := make([]responses.ToolUnionParam, 0, len(tools))
 	for _, tool := range tools {
-		out = append(out, openai.Tool{
-			Type: openai.ToolTypeFunction,
-			Function: &openai.FunctionDefinition{
-				Name:        tool.Name,
-				Description: tool.Description,
-				Parameters:  tool.Parameters,
-			},
-		})
+		function := responses.ToolParamOfFunction(tool.Name, tool.Parameters, tool.Strict)
+		if function.OfFunction != nil && tool.Description != "" {
+			function.OfFunction.Description = openai.String(tool.Description)
+		}
+		out = append(out, function)
 	}
 	return out
 }
 
-func toOpenAIToolCalls(calls []llm.ToolCall) []openai.ToolCall {
-	out := make([]openai.ToolCall, 0, len(calls))
-	for _, call := range calls {
-		index := call.Index
-		out = append(out, openai.ToolCall{
-			ID:    call.ID,
-			Type:  openai.ToolTypeFunction,
-			Index: &index,
-			Function: openai.FunctionCall{
-				Name:      call.Name,
-				Arguments: call.Arguments,
+func (a *OpenaiStreamAdapter) fromResponseStreamEvent(event responses.ResponseStreamEventUnion) (llm.StreamEvent, bool) {
+	switch event.Type {
+	case "response.output_text.delta":
+		a.sentText = true
+		return llm.StreamEvent{TextDelta: event.Delta}, true
+	case "response.output_item.done":
+		done := event.AsResponseOutputItemDone()
+		if done.Item.Type != "function_call" {
+			return llm.StreamEvent{}, false
+		}
+		return llm.StreamEvent{
+			ToolCall: &llm.ToolCall{
+				ID:        done.Item.CallID,
+				Index:     int(done.OutputIndex),
+				Name:      done.Item.Name,
+				Arguments: done.Item.Arguments.OfString,
 			},
-		})
-	}
-	return out
-}
-
-func fromOpenAIStreamResponse(response openai.ChatCompletionStreamResponse) llm.StreamEvent {
-	var event llm.StreamEvent
-	if len(response.Choices) > 0 {
-		delta := response.Choices[0].Delta
-		event.TextDelta = delta.Content
-		if len(delta.ToolCalls) > 0 {
-			event.ToolCalls = make([]llm.ToolCall, 0, len(delta.ToolCalls))
-			for _, tc := range delta.ToolCalls {
-				idx := 0
-				if tc.Index != nil {
-					idx = *tc.Index
-				}
-				event.ToolCalls = append(event.ToolCalls, llm.ToolCall{
-					ID:        tc.ID,
-					Index:     idx,
-					Name:      tc.Function.Name,
-					Arguments: tc.Function.Arguments,
-				})
+		}, true
+	case "response.completed":
+		completed := event.AsResponseCompleted()
+		usage := llm.StreamEvent{
+			Usage: &llm.Usage{
+				InputTokens:  completed.Response.Usage.InputTokens,
+				OutputTokens: completed.Response.Usage.OutputTokens,
+			},
+			Done: true,
+		}
+		if !a.sentText {
+			if text := completed.Response.OutputText(); text != "" {
+				a.pending = append(a.pending, usage)
+				a.sentText = true
+				return llm.StreamEvent{TextDelta: text}, true
 			}
 		}
+		return usage, true
+	case "response.failed":
+		failed := event.AsResponseFailed()
+		a.err = fmt.Errorf("openai response failed: %s", failed.Response.Error.Message)
+		return llm.StreamEvent{}, false
+	case "response.incomplete":
+		incomplete := event.AsResponseIncomplete()
+		a.err = fmt.Errorf("openai response incomplete: %s", incomplete.Response.IncompleteDetails.Reason)
+		return llm.StreamEvent{}, false
 	}
-	if response.Usage != nil {
-		event.Usage = &llm.Usage{
-			InputTokens:  int64(response.Usage.PromptTokens),
-			OutputTokens: int64(response.Usage.CompletionTokens),
-		}
-	}
-	return event
+	return llm.StreamEvent{}, false
 }

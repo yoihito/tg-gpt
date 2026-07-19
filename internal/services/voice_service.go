@@ -3,22 +3,34 @@ package services
 import (
 	"context"
 	"io"
+	"log/slog"
+	"time"
 
-	"github.com/sashabaranov/go-openai"
+	"github.com/openai/openai-go/v3"
 )
+
+const openaiTranscriptionTimeout = 2 * time.Minute
 
 type VoiceService struct {
 	Client *openai.Client
 }
 
 func (h *VoiceService) OnVoiceHandler(ctx context.Context, voiceFileReader io.ReadCloser) (string, error) {
-	response, err := h.Client.CreateTranscription(ctx, openai.AudioRequest{
-		Reader:   voiceFileReader,
-		FilePath: "voice.ogg",
-		Model:    openai.Whisper1,
+	ctx, cancel := context.WithTimeout(ctx, openaiTranscriptionTimeout)
+	defer cancel()
+
+	slog.InfoContext(ctx, "OpenAI transcription: starting",
+		"model", openai.AudioModelWhisper1,
+		"timeout", openaiTranscriptionTimeout.String(),
+	)
+	response, err := h.Client.Audio.Transcriptions.New(ctx, openai.AudioTranscriptionNewParams{
+		File:  openai.File(voiceFileReader, "voice.ogg", "audio/ogg"),
+		Model: openai.AudioModelWhisper1,
 	})
 	if err != nil {
+		slog.ErrorContext(ctx, "OpenAI transcription: failed", "error", err)
 		return "", err
 	}
+	slog.InfoContext(ctx, "OpenAI transcription: completed", "text_len", len(response.Text))
 	return response.Text, nil
 }

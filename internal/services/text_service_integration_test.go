@@ -11,7 +11,8 @@ import (
 	"testing"
 	"time"
 
-	openai "github.com/sashabaranov/go-openai"
+	"github.com/openai/openai-go/v3"
+	"github.com/openai/openai-go/v3/option"
 	"vadimgribanov.com/tg-gpt/internal/database"
 	"vadimgribanov.com/tg-gpt/internal/llm"
 	"vadimgribanov.com/tg-gpt/internal/models"
@@ -210,21 +211,29 @@ func newTextServiceIntegrationHarness(t *testing.T, streams [][]llm.StreamEvent)
 
 	openaiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":"test","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"{\"candidates\":[]}"}}]}`))
+		switch r.URL.Path {
+		case "/v1/responses":
+			_, _ = w.Write([]byte(`{"id":"resp_test","object":"response","created_at":0,"status":"completed","model":"test","output":[{"id":"msg_test","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"{\"candidates\":[]}" }]}],"usage":{"input_tokens":1,"input_tokens_details":{"cached_tokens":0},"output_tokens":1,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":2}}`))
+		case "/v1/embeddings":
+			_, _ = w.Write([]byte(`{"object":"list","model":"test-embedding","data":[{"object":"embedding","index":0,"embedding":[1.0,0.0,0.0]}],"usage":{"prompt_tokens":1,"total_tokens":1}}`))
+		default:
+			http.NotFound(w, r)
+		}
 	}))
 	t.Cleanup(openaiServer.Close)
-	openaiConfig := openai.DefaultConfig("test-token")
-	openaiConfig.BaseURL = openaiServer.URL + "/v1"
-	openaiClient := openai.NewClientWithConfig(openaiConfig)
+	openaiClient := openai.NewClient(
+		option.WithAPIKey("test-token"),
+		option.WithBaseURL(openaiServer.URL+"/v1"),
+	)
 
 	memoryManager := NewMemoryManager(
 		traceRepo,
 		prefRepo,
 		factRepo,
 		episodeRepo,
-		NewEmbedder(openaiClient, "test-embedding"),
-		NewExtractor(openaiClient, "test-extractor"),
-		NewSummarizer(openaiClient, "test-summarizer"),
+		NewEmbedder(&openaiClient, "test-embedding"),
+		NewExtractor(&openaiClient, "test-extractor"),
+		NewSummarizer(&openaiClient, "test-summarizer"),
 		MemoryConfig{
 			FactConfidenceMin:   0.8,
 			PrefConfidenceMin:   0.8,

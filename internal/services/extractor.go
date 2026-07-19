@@ -4,10 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
+	"time"
 
-	"github.com/sashabaranov/go-openai"
+	"github.com/openai/openai-go/v3"
+	"github.com/openai/openai-go/v3/responses"
+	"github.com/openai/openai-go/v3/shared"
 )
+
+const openaiExtractorTimeout = 45 * time.Second
 
 type Extractor struct {
 	client *openai.Client
@@ -84,29 +90,40 @@ func (e *Extractor) Extract(ctx context.Context, in ExtractInput) ([]Candidate, 
 		userPart.WriteString(in.RecentContext)
 		userPart.WriteString("\n\n")
 	}
+	userPart.WriteString("Return JSON only.\n\n")
 	userPart.WriteString("User message:\n")
 	userPart.WriteString(in.UserMessage)
 	userPart.WriteString("\n\nAssistant response:\n")
 	userPart.WriteString(in.AssistantMessage)
 
-	resp, err := e.client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
-		Model: e.model,
-		Messages: []openai.ChatCompletionMessage{
-			{Role: openai.ChatMessageRoleSystem, Content: extractorSystemPrompt},
-			{Role: openai.ChatMessageRoleUser, Content: userPart.String()},
+	ctx, cancel := context.WithTimeout(ctx, openaiExtractorTimeout)
+	defer cancel()
+
+	slog.InfoContext(ctx, "OpenAI extractor: starting",
+		"model", e.model,
+		"user_message_len", len(in.UserMessage),
+		"assistant_message_len", len(in.AssistantMessage),
+		"timeout", openaiExtractorTimeout.String(),
+	)
+	resp, err := e.client.Responses.New(ctx, responses.ResponseNewParams{
+		Model:        shared.ResponsesModel(e.model),
+		Instructions: openai.String(extractorSystemPrompt),
+		Input: responses.ResponseNewParamsInputUnion{
+			OfString: openai.String(userPart.String()),
 		},
-		ResponseFormat: &openai.ChatCompletionResponseFormat{
-			Type: openai.ChatCompletionResponseFormatTypeJSONObject,
+		Text: responses.ResponseTextConfigParam{
+			Format: responses.ResponseFormatTextConfigUnionParam{
+				OfJSONObject: &shared.ResponseFormatJSONObjectParam{},
+			},
 		},
 	})
 	if err != nil {
+		slog.ErrorContext(ctx, "OpenAI extractor: failed", "model", e.model, "error", err)
 		return nil, fmt.Errorf("extractor completion: %w", err)
 	}
-	if len(resp.Choices) == 0 {
-		return nil, fmt.Errorf("extractor: empty choices")
-	}
-	raw := strings.TrimSpace(resp.Choices[0].Message.Content)
+	raw := strings.TrimSpace(resp.OutputText())
 	if raw == "" {
+		slog.InfoContext(ctx, "OpenAI extractor: completed empty", "model", e.model)
 		return nil, nil
 	}
 
@@ -116,5 +133,10 @@ func (e *Extractor) Extract(ctx context.Context, in ExtractInput) ([]Candidate, 
 	if err := json.Unmarshal([]byte(raw), &out); err != nil {
 		return nil, fmt.Errorf("extractor parse: %w (raw=%q)", err, raw)
 	}
+	slog.InfoContext(ctx, "OpenAI extractor: completed",
+		"model", e.model,
+		"raw_len", len(raw),
+		"candidates", len(out.Candidates),
+	)
 	return out.Candidates, nil
 }
