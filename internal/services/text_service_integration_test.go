@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -137,6 +138,89 @@ func TestTextServiceIntegrationToolLoopPersistsProtocolOrderedTrace(t *testing.T
 	}
 	if gotSuffix[2].ToolResult == nil || gotSuffix[2].ToolResult.CallID != "call_1" {
 		t.Fatalf("second request tool result: %#v", gotSuffix[2])
+	}
+}
+
+func TestTextServiceIntegrationToolErrorContinuesTurn(t *testing.T) {
+	h := newTextServiceIntegrationHarness(t, [][]llm.StreamEvent{
+		{
+			{ToolCalls: []llm.ToolCall{{
+				ID:        "call_1",
+				Index:     0,
+				Name:      "save_memory",
+				Arguments: "not json",
+			}}},
+		},
+		{
+			{TextDelta: "Sorry, let me try that again."},
+		},
+	})
+
+	resp, err := h.textService.handleLLMRequest(context.Background(), h.user, 401, llm.Message{
+		Role:    llm.RoleUser,
+		Content: "remember something",
+	}, nil)
+	if err != nil {
+		t.Fatalf("expected the turn to survive a malformed tool call, got: %v", err)
+	}
+	if resp != "Sorry, let me try that again." {
+		t.Fatalf("final response: got %q", resp)
+	}
+
+	events := h.traceEvents(t, h.user.CurrentDialogId)
+	wantTypes := []string{
+		models.EventTypeUserMsg,
+		models.EventTypeModelMsg,
+		models.EventTypeToolResult,
+		models.EventTypeModelMsg,
+	}
+	if len(events) != len(wantTypes) {
+		t.Fatalf("trace events len: got %d want %d: %#v", len(events), len(wantTypes), events)
+	}
+	for i, want := range wantTypes {
+		if events[i].EventType != want {
+			t.Fatalf("event %d type: got %q want %q", i, events[i].EventType, want)
+		}
+	}
+	toolResultPayload := decodePayload[models.ToolResultPayload](t, events[2].Payload)
+	if toolResultPayload.ToolCallID != "call_1" || toolResultPayload.Result == "" {
+		t.Fatalf("tool result payload: %#v", toolResultPayload)
+	}
+
+	requests := h.llmClient.requestsSnapshot()
+	if len(requests) != 2 {
+		t.Fatalf("llm requests: got %d want 2", len(requests))
+	}
+}
+
+func TestTextServiceIntegrationMaxToolIterationsStopsTurnGracefully(t *testing.T) {
+	streams := make([][]llm.StreamEvent, 0, maxToolIterations)
+	for i := 0; i < maxToolIterations; i++ {
+		streams = append(streams, []llm.StreamEvent{
+			{ToolCalls: []llm.ToolCall{{
+				ID:        fmt.Sprintf("call_%d", i),
+				Index:     0,
+				Name:      "list_memories",
+				Arguments: "{}",
+			}}},
+		})
+	}
+	h := newTextServiceIntegrationHarness(t, streams)
+
+	resp, err := h.textService.handleLLMRequest(context.Background(), h.user, 501, llm.Message{
+		Role:    llm.RoleUser,
+		Content: "keep looping forever",
+	}, nil)
+	if err != nil {
+		t.Fatalf("expected a graceful stop at the iteration cap, got error: %v", err)
+	}
+	if resp == "" {
+		t.Fatal("expected a non-empty message when the iteration cap is hit")
+	}
+
+	requests := h.llmClient.requestsSnapshot()
+	if len(requests) != maxToolIterations {
+		t.Fatalf("llm requests: got %d want %d (cap should stop before requesting again)", len(requests), maxToolIterations)
 	}
 }
 

@@ -24,7 +24,7 @@ func NewTextService(
 	dialogTimeout int64,
 	defaultModel string,
 ) *TextService {
-	return &TextService{
+	h := &TextService{
 		client:           client,
 		usersRepo:        usersRepo,
 		memoryService:    memoryService,
@@ -34,18 +34,28 @@ func NewTextService(
 		dialogTimeout:    dialogTimeout,
 		defaultModel:     defaultModel,
 	}
+	h.defaultTools = h.buildDefaultToolSet()
+	h.scheduledActionTools = h.buildScheduledActionToolSet()
+	return h
 }
 
 type TextService struct {
-	client           LLMClient
-	usersRepo        UsersRepo
-	memoryService    *MemoryService
-	memoryManager    *MemoryManager
-	reminderService  *ReminderService
-	webSearchService *WebSearchService
-	dialogTimeout    int64
-	defaultModel     string
+	client               LLMClient
+	usersRepo            UsersRepo
+	memoryService        *MemoryService
+	memoryManager        *MemoryManager
+	reminderService      *ReminderService
+	webSearchService     *WebSearchService
+	dialogTimeout        int64
+	defaultModel         string
+	defaultTools         *ToolSet
+	scheduledActionTools *ToolSet
 }
+
+// maxToolIterations bounds how many stream+tool-call rounds a single turn can
+// run before it's forced to stop. Without a cap, a model stuck repeatedly
+// sending bad tool calls would loop until the context is cancelled.
+const maxToolIterations = 25
 
 type LLMClient interface {
 	Stream(ctx context.Context, request llm.Request) (llm.Stream, error)
@@ -120,7 +130,7 @@ func (h *TextService) RunScheduledAction(ctx context.Context, user models.User, 
 			prompt,
 		),
 	}
-	return h.handleLLMRequestWithTools(ctx, user, 0, msg, nil, h.getScheduledActionTools(), "\n\nScheduled action mode: execute the scheduled task now and return the result directly. Only the web_search tool is available.")
+	return h.handleLLMRequestWithTools(ctx, user, 0, msg, nil, h.scheduledActionTools, "\n\nScheduled action mode: execute the scheduled task now and return the result directly. Only the web_search tool is available.")
 }
 
 func extractQueryText(msg llm.Message) string {
@@ -142,25 +152,33 @@ type UserInput struct {
 }
 
 func (h *TextService) handleLLMRequest(ctx context.Context, user models.User, tgUserMessageId int64, newMessage llm.Message, streamer *telegram_utils.TelegramStreamer) (string, error) {
-	return h.handleLLMRequestWithTools(ctx, user, tgUserMessageId, newMessage, streamer, h.getDefaultTools(), "")
+	return h.handleLLMRequestWithTools(ctx, user, tgUserMessageId, newMessage, streamer, h.defaultTools, "")
 }
 
-func (h *TextService) getDefaultTools() []llm.Tool {
-	tools := append(
-		h.memoryService.GetMemoryTools(),
-		h.reminderService.GetReminderTools()...,
-	)
+func (h *TextService) buildDefaultToolSet() *ToolSet {
+	ts := NewToolSet()
+	ts.RegisterAll(h.memoryService.GetMemoryTools(), func(ctx context.Context, mctx TurnContext, _ models.User, call llm.ToolCall) (string, error) {
+		return h.memoryService.HandleToolCall(ctx, mctx, call)
+	})
+	ts.RegisterAll(h.reminderService.GetReminderTools(), func(_ context.Context, _ TurnContext, user models.User, call llm.ToolCall) (string, error) {
+		return h.reminderService.HandleToolCall(user.Id, call)
+	})
 	if h.webSearchService != nil {
-		tools = append(tools, h.webSearchService.GetWebSearchTools()...)
+		ts.RegisterAll(h.webSearchService.GetWebSearchTools(), func(ctx context.Context, _ TurnContext, _ models.User, call llm.ToolCall) (string, error) {
+			return h.webSearchService.HandleToolCall(ctx, call)
+		})
 	}
-	return tools
+	return ts
 }
 
-func (h *TextService) getScheduledActionTools() []llm.Tool {
-	if h.webSearchService == nil {
-		return nil
+func (h *TextService) buildScheduledActionToolSet() *ToolSet {
+	ts := NewToolSet()
+	if h.webSearchService != nil {
+		ts.RegisterAll(h.webSearchService.GetWebSearchTools(), func(ctx context.Context, _ TurnContext, _ models.User, call llm.ToolCall) (string, error) {
+			return h.webSearchService.HandleToolCall(ctx, call)
+		})
 	}
-	return h.webSearchService.GetWebSearchTools()
+	return ts
 }
 
 func (h *TextService) RunAttachedTurn(
@@ -171,7 +189,7 @@ func (h *TextService) RunAttachedTurn(
 	streamer *telegram_utils.TelegramStreamer,
 	drainNewInputs func(context.Context) ([]UserInput, error),
 ) (string, error) {
-	return h.runAttachedTurnWithTools(ctx, user, mctx, inputs, streamer, h.getDefaultTools(), "", drainNewInputs)
+	return h.runAttachedTurnWithTools(ctx, user, mctx, inputs, streamer, h.defaultTools, "", drainNewInputs)
 }
 
 func (h *TextService) PrepareUserForInput(ctx context.Context, user models.User) (models.User, error) {
@@ -206,7 +224,7 @@ func (h *TextService) handleLLMRequestWithTools(
 	tgUserMessageId int64,
 	newMessage llm.Message,
 	streamer *telegram_utils.TelegramStreamer,
-	tools []llm.Tool,
+	toolSet *ToolSet,
 	systemPromptSuffix string,
 ) (string, error) {
 	var err error
@@ -214,7 +232,7 @@ func (h *TextService) handleLLMRequestWithTools(
 		"user_id", user.Id,
 		"dialog_id", user.CurrentDialogId,
 		"current_model", user.CurrentModel,
-		"tool_count", len(tools),
+		"tool_count", len(toolSet.Defs()),
 	)
 	user, err = h.PrepareUserForInput(ctx, user)
 	if err != nil {
@@ -250,7 +268,7 @@ func (h *TextService) handleLLMRequestWithTools(
 			TgMessageID: tgUserMessageId,
 			Message:     newMessage,
 		},
-	}, streamer, tools, systemPromptSuffix, nil)
+	}, streamer, toolSet, systemPromptSuffix, nil)
 }
 
 func (h *TextService) runAttachedTurnWithTools(
@@ -259,7 +277,7 @@ func (h *TextService) runAttachedTurnWithTools(
 	mctx TurnContext,
 	inputs []UserInput,
 	streamer *telegram_utils.TelegramStreamer,
-	tools []llm.Tool,
+	toolSet *ToolSet,
 	systemPromptSuffix string,
 	drainNewInputs func(context.Context) ([]UserInput, error),
 ) (string, error) {
@@ -302,26 +320,35 @@ func (h *TextService) runAttachedTurnWithTools(
 	accumulatedInputTokens := int64(0)
 	accumulatedOutputTokens := int64(0)
 	accumulatedResponse := ""
-	allowedTools := make(map[string]struct{}, len(tools))
-	for _, tool := range tools {
-		allowedTools[tool.Name] = struct{}{}
-	}
 
 	iteration := 0
 	for {
 		iteration++
+		if iteration > maxToolIterations {
+			slog.ErrorContext(ctx, "LLM request: exceeded max tool iterations; ending turn",
+				"user_id", user.Id,
+				"dialog_id", mctx.DialogID,
+				"max_iterations", maxToolIterations,
+			)
+			accumulatedResponse = "I hit an internal limit handling this request (too many tool calls in a row). Please try again or rephrase your request."
+			if _, err := h.memoryManager.AppendModelMsg(mctx, accumulatedResponse, nil, modelToUse, 0); err != nil {
+				slog.ErrorContext(ctx, "Error appending model_msg after max iterations", "error", err)
+				return "", err
+			}
+			break
+		}
 		slog.InfoContext(ctx, "LLM request: creating stream",
 			"user_id", user.Id,
 			"dialog_id", mctx.DialogID,
 			"model", modelToUse,
 			"iteration", iteration,
 			"history_messages", len(history),
-			"tool_count", len(tools),
+			"tool_count", len(toolSet.Defs()),
 		)
 		stream, err := h.client.Stream(ctx, llm.Request{
 			Model:      modelToUse,
 			Messages:   history,
-			Tools:      tools,
+			Tools:      toolSet.Defs(),
 			ToolChoice: llm.ToolChoiceAuto,
 		})
 		if err != nil {
@@ -333,7 +360,6 @@ func (h *TextService) runAttachedTurnWithTools(
 			"dialog_id", mctx.DialogID,
 			"iteration", iteration,
 		)
-		defer stream.Close()
 
 		accumulator := adapters.NewStreamAccumulator()
 		eventCount := 0
@@ -376,6 +402,13 @@ func (h *TextService) runAttachedTurnWithTools(
 			"tool_events", toolEventCount,
 		)
 
+		// Close as soon as we're done reading rather than deferring: a defer
+		// inside this loop would only fire when the whole function returns,
+		// leaving every prior iteration's stream open for the rest of the turn.
+		if closeErr := stream.Close(); closeErr != nil {
+			slog.WarnContext(ctx, "Error closing stream", "error", closeErr)
+		}
+
 		if err := stream.Err(); err != nil && !errors.Is(err, io.EOF) {
 			slog.ErrorContext(ctx, "Got an error while receiving chat completion stream", "error", err)
 			return "", err
@@ -391,8 +424,10 @@ func (h *TextService) runAttachedTurnWithTools(
 				return "", err
 			}
 		}
-		accumulatedInputTokens += accumulator.InputTokens()
-		accumulatedOutputTokens += accumulator.OutputTokens()
+		iterInputTokens := accumulator.InputTokens()
+		iterOutputTokens := accumulator.OutputTokens()
+		accumulatedInputTokens += iterInputTokens
+		accumulatedOutputTokens += iterOutputTokens
 		accumulatedResponse = accumulator.AccumulatedResponse()
 		slog.InfoContext(ctx, "LLM request: stream accumulated",
 			"user_id", user.Id,
@@ -400,9 +435,20 @@ func (h *TextService) runAttachedTurnWithTools(
 			"iteration", iteration,
 			"response_len", len(accumulatedResponse),
 			"has_tool_calls", accumulator.HasToolCalls(),
-			"input_tokens", accumulator.InputTokens(),
-			"output_tokens", accumulator.OutputTokens(),
+			"input_tokens", iterInputTokens,
+			"output_tokens", iterOutputTokens,
 		)
+		// Persist usage per iteration rather than once at the end, so tokens
+		// already spent (and billed by the provider) aren't lost if a later
+		// iteration in this same turn errors out.
+		if iterInputTokens != 0 || iterOutputTokens != 0 {
+			if err := h.usersRepo.AddTokenUsage(user.Id, iterInputTokens, iterOutputTokens); err != nil {
+				slog.ErrorContext(ctx, "Error updating user token counts", "error", err)
+			} else {
+				user.NumberOfInputTokens += iterInputTokens
+				user.NumberOfOutputTokens += iterOutputTokens
+			}
+		}
 
 		if accumulator.HasToolCalls() {
 			toolCalls := accumulator.GetToolCalls()
@@ -426,9 +472,6 @@ func (h *TextService) runAttachedTurnWithTools(
 			})
 
 			for _, toolCall := range toolCalls {
-				var result string
-				var toolErr error
-
 				slog.InfoContext(ctx, "LLM request: handling tool call",
 					"user_id", user.Id,
 					"dialog_id", mctx.DialogID,
@@ -436,26 +479,20 @@ func (h *TextService) runAttachedTurnWithTools(
 					"tool", toolCall.Name,
 					"call_id", toolCall.ID,
 				)
-				if _, ok := allowedTools[toolCall.Name]; !ok {
-					toolErr = fmt.Errorf("tool is not available in this mode: %s", toolCall.Name)
-					result = "Tool is not available in this mode."
-				} else {
-					switch toolCall.Name {
-					case "save_memory", "get_memory", "list_memories", "delete_memory", "save_fact", "forget_about", "list_episodes", "forget_episode":
-						result, toolErr = h.memoryService.HandleToolCall(ctx, mctx, toolCall)
-					case "create_one_shot_reminder", "create_recurring_reminder", "list_reminders", "cancel_reminder":
-						result, toolErr = h.reminderService.HandleToolCall(user.Id, toolCall)
-					case "web_search":
-						if h.webSearchService == nil {
-							result = "Web search is not configured."
-							toolErr = fmt.Errorf("web search is not configured")
-						} else {
-							result, toolErr = h.webSearchService.HandleToolCall(ctx, toolCall)
-						}
-					default:
-						toolErr = fmt.Errorf("unknown tool: %s", toolCall.Name)
-						result = "Unknown tool"
-					}
+				result, toolErr := toolSet.Execute(ctx, mctx, user, toolCall)
+				// toolErr is not fatal to the turn: the failure text is already
+				// in `result`, which goes into history below as the tool's
+				// output, so the model can see it and self-correct (e.g. retry
+				// with valid arguments) instead of the whole turn dying here.
+				if toolErr != nil {
+					slog.WarnContext(ctx, "Tool call returned an error; continuing turn with error result",
+						"user_id", user.Id,
+						"dialog_id", mctx.DialogID,
+						"iteration", iteration,
+						"tool", toolCall.Name,
+						"call_id", toolCall.ID,
+						"error", toolErr,
+					)
 				}
 				slog.InfoContext(ctx, "LLM request: tool call finished",
 					"user_id", user.Id,
@@ -464,7 +501,6 @@ func (h *TextService) runAttachedTurnWithTools(
 					"tool", toolCall.Name,
 					"call_id", toolCall.ID,
 					"result_len", len(result),
-					"error", toolErr,
 				)
 
 				if _, err := h.memoryManager.AppendToolResult(mctx, toolCall.ID, toolCall.Name, result); err != nil {
@@ -480,10 +516,6 @@ func (h *TextService) runAttachedTurnWithTools(
 						Output: result,
 					},
 				})
-				if toolErr != nil {
-					slog.ErrorContext(ctx, "Error handling tool call", "error", toolErr)
-					return "", toolErr
-				}
 			}
 			if drainNewInputs != nil {
 				newInputs, err := drainNewInputs(ctx)
@@ -511,12 +543,6 @@ func (h *TextService) runAttachedTurnWithTools(
 			}
 			break
 		}
-	}
-
-	user.NumberOfInputTokens += accumulatedInputTokens
-	user.NumberOfOutputTokens += accumulatedOutputTokens
-	if err := h.usersRepo.AddTokenUsage(user.Id, accumulatedInputTokens, accumulatedOutputTokens); err != nil {
-		slog.ErrorContext(ctx, "Error updating user token counts", "error", err)
 	}
 
 	slog.InfoContext(ctx, "LLM request: completed",
