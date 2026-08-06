@@ -26,6 +26,16 @@ func (p *UsagePlugin) AfterModelCall(ctx context.Context, rc *RunContext, conten
 	if usage.InputTokens == 0 && usage.OutputTokens == 0 {
 		return nil
 	}
+	// Logged per model call (not just per turn) so cache effectiveness is visible in
+	// production: cached_input_tokens should be 0 on the first message of a dialog and
+	// climb toward input_tokens on later turns once the stable prefix is being reused.
+	slog.InfoContext(ctx, "LLM usage",
+		"user_id", rc.User.Id,
+		"model", rc.Model,
+		"input_tokens", usage.InputTokens,
+		"cached_input_tokens", usage.CachedInputTokens,
+		"output_tokens", usage.OutputTokens,
+	)
 	if err := p.usersRepo.AddTokenUsage(rc.User.Id, usage.InputTokens, usage.OutputTokens); err != nil {
 		slog.ErrorContext(ctx, "Error updating user token counts", "error", err)
 	}

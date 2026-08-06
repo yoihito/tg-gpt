@@ -84,7 +84,44 @@ func TestAsToolDelegatesToSubAgent(t *testing.T) {
 	}
 }
 
-func TestRunnerEmitsCapMessageAsStreamDelta(t *testing.T) {
+func TestRunnerReportsCachedInputTokens(t *testing.T) {
+	client := &fakeLLMClient{
+		models: map[string]struct{}{"model": {}},
+		streams: [][]llm.StreamEvent{
+			{
+				{TextDelta: "hi"},
+				{Usage: &llm.Usage{InputTokens: 100, CachedInputTokens: 80, OutputTokens: 5}},
+			},
+		},
+	}
+	def := Definition{
+		Model: "model",
+		BuildSystemPrompt: func(ctx context.Context) (string, error) {
+			return "system", nil
+		},
+		Tools: NewToolSet(),
+	}
+	runner := NewRunner(client)
+
+	stream, err := runner.Run(context.Background(), def, models.User{Id: 1}, TurnContext{UserID: 1, DialogID: 1}, []UserInput{
+		{Message: llm.Message{Role: llm.RoleUser, Content: "hello"}},
+	}, RunOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for stream.Next() {
+	}
+	if err := stream.Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	result := stream.Result()
+	if result.InputTokens != 100 || result.CachedInputTokens != 80 || result.OutputTokens != 5 {
+		t.Fatalf("usage not propagated correctly: %#v", result)
+	}
+}
+
+func TestRunnerEmitsCapMessageAsNotice(t *testing.T) {
 	streams := make([][]llm.StreamEvent, 0, maxToolIterations)
 	for i := 0; i < maxToolIterations; i++ {
 		streams = append(streams, []llm.StreamEvent{
@@ -120,22 +157,22 @@ func TestRunnerEmitsCapMessageAsStreamDelta(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var deltas []string
+	var notices []string
 	for stream.Next() {
 		ev := stream.Event()
-		if ev.Kind == RunEventStreamDelta && ev.StreamEvent.TextDelta != "" {
-			deltas = append(deltas, ev.StreamEvent.TextDelta)
+		if ev.Kind == RunEventNotice {
+			notices = append(notices, ev.StreamEvent.TextDelta)
 		}
 	}
 	if err := stream.Err(); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if len(deltas) == 0 {
-		t.Fatal("expected the iteration-cap message to be emitted as a real stream delta, not just persisted to trace")
+	if len(notices) != 1 {
+		t.Fatalf("expected exactly one RunEventNotice carrying the cap message, got %d", len(notices))
 	}
-	if last := deltas[len(deltas)-1]; last != capMessage {
-		t.Fatalf("last delta: got %q want cap message", last)
+	if notices[0] != capMessage {
+		t.Fatalf("notice text: got %q want cap message", notices[0])
 	}
 	if stream.Result().Response != capMessage {
 		t.Fatalf("result response: got %q", stream.Result().Response)

@@ -2,6 +2,7 @@ package adapters
 
 import (
 	"context"
+	"strings"
 
 	"vadimgribanov.com/tg-gpt/internal/llm"
 	"vadimgribanov.com/tg-gpt/internal/vendors/anthropic"
@@ -25,10 +26,16 @@ func (a *AnthropicAdapter) Capabilities(model string) llm.Capabilities {
 
 func (a *AnthropicAdapter) Stream(ctx context.Context, request llm.Request) (llm.Stream, error) {
 	anthropicMessages := []anthropic.Message{}
-	systemPrompt := ""
+	// The Messages API takes one top-level system string, but llm.Request can carry
+	// several role-system messages (base instructions, mid-turn notices, retrieval
+	// context appended after the stable prefix for cache-friendliness) — concatenate
+	// them in order rather than letting a later one silently replace an earlier one.
+	var systemParts []string
 	for _, message := range request.Messages {
 		if message.Role == llm.RoleSystem {
-			systemPrompt = message.Content
+			if message.Content != "" {
+				systemParts = append(systemParts, message.Content)
+			}
 			continue
 		}
 		if message.ToolResult != nil {
@@ -39,6 +46,7 @@ func (a *AnthropicAdapter) Stream(ctx context.Context, request llm.Request) (llm
 			Content: message.Content,
 		})
 	}
+	systemPrompt := strings.Join(systemParts, "\n\n")
 
 	stream, err := a.client.CreateMessagesStream(ctx, anthropic.CreateMessageRequest{
 		System:    systemPrompt,

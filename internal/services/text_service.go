@@ -87,11 +87,20 @@ Today is %s. Give short concise answers.`
 const scheduledActionPromptSuffix = "\n\nScheduled action mode: execute the scheduled task now and return the result directly. Only the web_search tool is available."
 
 func defaultSystemPrompt(ctx context.Context) (string, error) {
-	return fmt.Sprintf(AssistantPrompt, time.Now().Format(time.RFC3339)), nil
+	// Day granularity, not a full timestamp: this message is always first in the
+	// request, so its stability is what lets a provider cache everything built on top
+	// of it (preferences, trace replay). A timestamp that changes every second would
+	// invalidate that cache on every single call for a "Today is ..." sentence that
+	// only ever needs day precision.
+	return fmt.Sprintf(AssistantPrompt, time.Now().UTC().Format("2006-01-02")), nil
 }
 
 func scheduledActionSystemPrompt(ctx context.Context) (string, error) {
-	return fmt.Sprintf(AssistantPrompt, time.Now().Format(time.RFC3339)) + scheduledActionPromptSuffix, nil
+	base, err := defaultSystemPrompt(ctx)
+	if err != nil {
+		return "", err
+	}
+	return base + scheduledActionPromptSuffix, nil
 }
 
 func (h *TextService) RetryWithMessage(
@@ -176,22 +185,23 @@ func (h *TextService) buildDefaultToolSet() *ToolSet {
 	ts.RegisterAll(h.reminderService.GetReminderTools(), func(_ context.Context, _ TurnContext, user models.User, call llm.ToolCall) (string, error) {
 		return h.reminderService.HandleToolCall(user.Id, call)
 	})
-	if h.webSearchService != nil {
-		ts.RegisterAll(h.webSearchService.GetWebSearchTools(), func(ctx context.Context, _ TurnContext, _ models.User, call llm.ToolCall) (string, error) {
-			return h.webSearchService.HandleToolCall(ctx, call)
-		})
-	}
+	h.registerWebSearchTools(ts)
 	return ts
 }
 
 func (h *TextService) buildScheduledActionToolSet() *ToolSet {
 	ts := NewToolSet()
-	if h.webSearchService != nil {
-		ts.RegisterAll(h.webSearchService.GetWebSearchTools(), func(ctx context.Context, _ TurnContext, _ models.User, call llm.ToolCall) (string, error) {
-			return h.webSearchService.HandleToolCall(ctx, call)
-		})
-	}
+	h.registerWebSearchTools(ts)
 	return ts
+}
+
+func (h *TextService) registerWebSearchTools(ts *ToolSet) {
+	if h.webSearchService == nil {
+		return
+	}
+	ts.RegisterAll(h.webSearchService.GetWebSearchTools(), func(ctx context.Context, _ TurnContext, _ models.User, call llm.ToolCall) (string, error) {
+		return h.webSearchService.HandleToolCall(ctx, call)
+	})
 }
 
 func (h *TextService) RunAttachedTurn(
@@ -322,7 +332,7 @@ func (h *TextService) runTurn(
 	for stream.Next() {
 		event := stream.Event()
 		switch event.Kind {
-		case RunEventStreamDelta:
+		case RunEventStreamDelta, RunEventNotice:
 			if streamer != nil {
 				if err := streamer.SendEvent(event.StreamEvent); err != nil {
 					slog.ErrorContext(ctx, "Got an error while sending chunk", "error", err)
@@ -337,8 +347,8 @@ func (h *TextService) runTurn(
 				}
 			}
 		case RunEventToolCallStarted:
-			if streamer != nil && event.ToolCall.Name == "web_search" && !streamer.HasOutput() {
-				if err := streamer.SendStatus("Searching..."); err != nil {
+			if streamer != nil && event.StatusMessage != "" && !streamer.HasOutput() {
+				if err := streamer.SendStatus(event.StatusMessage); err != nil {
 					slog.ErrorContext(ctx, "Error sending search status", "error", err)
 					return "", err
 				}
@@ -356,6 +366,7 @@ func (h *TextService) runTurn(
 		"dialog_id", mctx.DialogID,
 		"response_len", len(result.Response),
 		"input_tokens", result.InputTokens,
+		"cached_input_tokens", result.CachedInputTokens,
 		"output_tokens", result.OutputTokens,
 	)
 	return result.Response, nil

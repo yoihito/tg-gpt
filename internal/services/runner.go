@@ -44,27 +44,30 @@ const (
 	// RunEventStreamDelta passes through a provider-level stream event (text/tool-call
 	// deltas, usage) in real time, exactly as received.
 	RunEventStreamDelta RunEventKind = iota
+	// RunEventNotice carries agent-generated text that did not come from the model (e.g.
+	// the iteration-cap message) — kept distinct from RunEventStreamDelta so callers and
+	// plugins never mistake a Runner-authored notice for something the model said.
+	RunEventNotice
 	// RunEventIterationEnd signals one model-call round finished draining (whether or not
 	// it produced tool calls); callers driving a live UI should flush buffered output now.
 	RunEventIterationEnd
-	// RunEventToolCallStarted signals a tool call is about to execute.
+	// RunEventToolCallStarted signals a tool call is about to execute. StatusMessage is the
+	// tool definition's own status text (see llm.Tool.StatusMessage), if it set one.
 	RunEventToolCallStarted
-	// RunEventToolCallFinished signals a tool call finished executing.
-	RunEventToolCallFinished
 )
 
 type RunEvent struct {
-	Kind        RunEventKind
-	StreamEvent llm.StreamEvent
-	ToolCall    llm.ToolCall
-	ToolResult  string
-	ToolErr     error
+	Kind          RunEventKind
+	StreamEvent   llm.StreamEvent
+	ToolCall      llm.ToolCall
+	StatusMessage string
 }
 
 type RunResult struct {
-	Response     string
-	InputTokens  int64
-	OutputTokens int64
+	Response          string
+	InputTokens       int64
+	CachedInputTokens int64
+	OutputTokens      int64
 }
 
 // RunStream mirrors llm.Stream's Next/Event/Err shape on purpose: it's a familiar,
@@ -113,7 +116,6 @@ type runPhase int
 
 const (
 	phaseStartIteration runPhase = iota
-	phaseCapDelta
 	phaseStreamModel
 	phaseIterationEnd
 	phaseToolCallStart
@@ -124,12 +126,13 @@ const (
 )
 
 type runStreamImpl struct {
-	ctx     context.Context
-	runner  *Runner
-	def     Definition
-	opts    RunOptions
-	maxIter int
-	rc      *RunContext
+	ctx       context.Context
+	runner    *Runner
+	def       Definition
+	opts      RunOptions
+	maxIter   int
+	iteration int
+	rc        *RunContext
 
 	phase       runPhase
 	current     llm.Stream
@@ -138,9 +141,10 @@ type runStreamImpl struct {
 	pendingToolCalls []llm.ToolCall
 	toolIdx          int
 
-	totalInputTokens  int64
-	totalOutputTokens int64
-	finalResponse     string
+	totalInputTokens       int64
+	totalCachedInputTokens int64
+	totalOutputTokens      int64
+	finalResponse          string
 
 	event  RunEvent
 	err    error
@@ -154,37 +158,34 @@ func (s *runStreamImpl) Next() bool {
 			return false
 
 		case phaseStartIteration:
-			s.rc.Iteration++
-			if s.rc.Iteration == 1 {
+			s.iteration++
+			if s.iteration == 1 {
 				sysPrompt, err := s.def.BuildSystemPrompt(s.ctx)
 				if err != nil {
 					return s.fail(err)
 				}
 				s.rc.SystemPrompt = sysPrompt
 				s.rc.History = defaultHistory(sysPrompt, s.rc.Inputs)
-				for _, p := range s.runner.plugins {
-					if h, ok := p.(BeforeTurnHook); ok {
-						if err := h.BeforeTurn(s.ctx, s.rc); err != nil {
-							return s.fail(err)
-						}
-					}
+				if err := dispatch(s.runner.plugins, func(h BeforeTurnHook) error {
+					return h.BeforeTurn(s.ctx, s.rc)
+				}); err != nil {
+					return s.fail(err)
 				}
 			}
 
-			if s.rc.Iteration > s.maxIter {
+			if s.iteration > s.maxIter {
 				if err := s.finalizeIteration(capMessage, nil, llm.Usage{}); err != nil {
 					return s.fail(err)
 				}
-				s.phase = phaseCapDelta
-				continue
+				s.event = RunEvent{Kind: RunEventNotice, StreamEvent: llm.StreamEvent{TextDelta: capMessage}}
+				s.phase = phaseIterationEnd
+				return true
 			}
 
-			for _, p := range s.runner.plugins {
-				if h, ok := p.(BeforeModelCallHook); ok {
-					if err := h.BeforeModelCall(s.ctx, s.rc); err != nil {
-						return s.fail(err)
-					}
-				}
+			if err := dispatch(s.runner.plugins, func(h BeforeModelCallHook) error {
+				return h.BeforeModelCall(s.ctx, s.rc)
+			}); err != nil {
+				return s.fail(err)
 			}
 
 			stream, err := s.runner.client.Stream(s.ctx, llm.Request{
@@ -201,11 +202,6 @@ func (s *runStreamImpl) Next() bool {
 			s.phase = phaseStreamModel
 			continue
 
-		case phaseCapDelta:
-			s.event = RunEvent{Kind: RunEventStreamDelta, StreamEvent: llm.StreamEvent{TextDelta: s.finalResponse}}
-			s.phase = phaseIterationEnd
-			return true
-
 		case phaseStreamModel:
 			if s.current.Next() {
 				ev := s.current.Event()
@@ -221,7 +217,11 @@ func (s *runStreamImpl) Next() bool {
 			}
 			content := s.accumulator.AccumulatedResponse()
 			toolCalls := s.accumulator.GetToolCalls()
-			usage := llm.Usage{InputTokens: s.accumulator.InputTokens(), OutputTokens: s.accumulator.OutputTokens()}
+			usage := llm.Usage{
+				InputTokens:       s.accumulator.InputTokens(),
+				CachedInputTokens: s.accumulator.CachedInputTokens(),
+				OutputTokens:      s.accumulator.OutputTokens(),
+			}
 			if err := s.finalizeIteration(content, toolCalls, usage); err != nil {
 				return s.fail(err)
 			}
@@ -238,26 +238,27 @@ func (s *runStreamImpl) Next() bool {
 			return true
 
 		case phaseToolCallStart:
-			s.event = RunEvent{Kind: RunEventToolCallStarted, ToolCall: s.pendingToolCalls[s.toolIdx]}
+			call := s.pendingToolCalls[s.toolIdx]
+			statusMessage := ""
+			if def, ok := s.def.Tools.Lookup(call.Name); ok {
+				statusMessage = def.StatusMessage
+			}
+			s.event = RunEvent{Kind: RunEventToolCallStarted, ToolCall: call, StatusMessage: statusMessage}
 			s.phase = phaseToolCallFinish
 			return true
 
 		case phaseToolCallFinish:
 			call := s.pendingToolCalls[s.toolIdx]
-			for _, p := range s.runner.plugins {
-				if h, ok := p.(BeforeToolCallHook); ok {
-					if err := h.BeforeToolCall(s.ctx, s.rc, call); err != nil {
-						return s.fail(err)
-					}
-				}
+			if err := dispatch(s.runner.plugins, func(h BeforeToolCallHook) error {
+				return h.BeforeToolCall(s.ctx, s.rc, call)
+			}); err != nil {
+				return s.fail(err)
 			}
 			result, toolErr := s.def.Tools.Execute(s.ctx, s.rc.TurnCtx, s.rc.User, call)
-			for _, p := range s.runner.plugins {
-				if h, ok := p.(AfterToolCallHook); ok {
-					if err := h.AfterToolCall(s.ctx, s.rc, call, result, toolErr); err != nil {
-						return s.fail(err)
-					}
-				}
+			if err := dispatch(s.runner.plugins, func(h AfterToolCallHook) error {
+				return h.AfterToolCall(s.ctx, s.rc, call, result, toolErr)
+			}); err != nil {
+				return s.fail(err)
 			}
 			s.rc.History = append(s.rc.History, llm.Message{
 				Role: llm.RoleTool,
@@ -267,14 +268,13 @@ func (s *runStreamImpl) Next() bool {
 					Output: result,
 				},
 			})
-			s.event = RunEvent{Kind: RunEventToolCallFinished, ToolCall: call, ToolResult: result, ToolErr: toolErr}
 			s.toolIdx++
 			if s.toolIdx >= len(s.pendingToolCalls) {
 				s.phase = phaseDrainInputs
 			} else {
 				s.phase = phaseToolCallStart
 			}
-			return true
+			continue
 
 		case phaseDrainInputs:
 			if s.opts.DrainInputs != nil {
@@ -291,15 +291,14 @@ func (s *runStreamImpl) Next() bool {
 			continue
 
 		case phaseFinishTurn:
-			for _, p := range s.runner.plugins {
-				if h, ok := p.(AfterTurnHook); ok {
-					h.AfterTurn(s.ctx, s.rc, s.finalResponse)
-				}
-			}
+			dispatchVoid(s.runner.plugins, func(h AfterTurnHook) {
+				h.AfterTurn(s.ctx, s.rc, s.finalResponse)
+			})
 			s.result = RunResult{
-				Response:     s.finalResponse,
-				InputTokens:  s.totalInputTokens,
-				OutputTokens: s.totalOutputTokens,
+				Response:          s.finalResponse,
+				InputTokens:       s.totalInputTokens,
+				CachedInputTokens: s.totalCachedInputTokens,
+				OutputTokens:      s.totalOutputTokens,
 			}
 			s.phase = phaseDone
 			return false
@@ -321,17 +320,16 @@ func (s *runStreamImpl) fail(err error) bool {
 // history. Used for both real model-call iterations and the synthetic cap-hit iteration.
 func (s *runStreamImpl) finalizeIteration(content string, toolCalls []llm.ToolCall, usage llm.Usage) error {
 	s.totalInputTokens += usage.InputTokens
+	s.totalCachedInputTokens += usage.CachedInputTokens
 	s.totalOutputTokens += usage.OutputTokens
 	s.finalResponse = content
 	s.pendingToolCalls = toolCalls
 	s.toolIdx = 0
 
-	for _, p := range s.runner.plugins {
-		if h, ok := p.(AfterModelCallHook); ok {
-			if err := h.AfterModelCall(s.ctx, s.rc, content, toolCalls, usage); err != nil {
-				return err
-			}
-		}
+	if err := dispatch(s.runner.plugins, func(h AfterModelCallHook) error {
+		return h.AfterModelCall(s.ctx, s.rc, content, toolCalls, usage)
+	}); err != nil {
+		return err
 	}
 
 	msg := llm.Message{Role: llm.RoleAssistant, Content: content}

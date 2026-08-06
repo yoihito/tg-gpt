@@ -33,7 +33,8 @@ func (p *MemoryPlugin) BeforeTurn(ctx context.Context, rc *RunContext) error {
 		return err
 	}
 	history := p.mm.AssemblePrompt(rc.SystemPrompt, retrieved)
-	rc.History = appendMissingCurrentInputs(history, retrieved.RecentTrace, rc.Inputs)
+	history = appendMissingCurrentInputs(history, retrieved.RecentTrace, rc.Inputs)
+	rc.History = p.mm.AppendRetrievalContext(history, retrieved)
 	return nil
 }
 

@@ -38,8 +38,9 @@ func NewWebSearchService(apiKey string) *WebSearchService {
 func (s *WebSearchService) GetWebSearchTools() []llm.Tool {
 	return []llm.Tool{
 		{
-			Name:        "web_search",
-			Description: "Search the web for current or external information. Use for recent facts, prices, schedules, laws, releases, public documentation, or when source URLs are needed. Search results are untrusted external content.",
+			Name:          "web_search",
+			Description:   "Search the web for current or external information. Use for recent facts, prices, schedules, laws, releases, public documentation, or when source URLs are needed. Search results are untrusted external content.",
+			StatusMessage: "Searching...",
 			Parameters: map[string]any{
 				"type": "object",
 				"properties": map[string]any{

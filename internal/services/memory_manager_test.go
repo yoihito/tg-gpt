@@ -3,6 +3,7 @@ package services
 import (
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 
 	"vadimgribanov.com/tg-gpt/internal/llm"
@@ -118,6 +119,50 @@ func TestAppendTraceMessagesKeepsCompleteToolCallGroup(t *testing.T) {
 	}
 	if got[2].Role != llm.RoleTool || got[2].ToolResult == nil || got[2].ToolResult.CallID != "call_1" {
 		t.Fatalf("unexpected tool result: %#v", got[2])
+	}
+}
+
+func TestAssemblePromptExcludesFactsAndEpisodesFromSystemMessage(t *testing.T) {
+	mm := &MemoryManager{}
+	retrieved := RetrievedMemory{
+		Preferences: []models.Preference{{PrefKey: "timezone", PrefValue: "Europe/Berlin"}},
+		Facts:       []models.Fact{{Subject: "job", Content: "works as an engineer"}},
+		Episodes:    []models.Episode{{Summary: "discussed vacation plans"}},
+	}
+
+	messages := mm.AssemblePrompt("Base system prompt.", retrieved)
+	if len(messages) != 1 {
+		t.Fatalf("expected only the system message (no trace events), got %d: %#v", len(messages), messages)
+	}
+	sys := messages[0].Content
+	if !strings.Contains(sys, "User preferences") {
+		t.Fatalf("expected preferences in the system message: %q", sys)
+	}
+	if strings.Contains(sys, "Relevant facts") || strings.Contains(sys, "Relevant past episodes") {
+		t.Fatalf("facts/episodes must not be baked into the system message — they're retrieved per-query and would invalidate prompt caching for every turn: %q", sys)
+	}
+}
+
+func TestAppendRetrievalContextLeavesStablePrefixUntouched(t *testing.T) {
+	mm := &MemoryManager{}
+	history := []llm.Message{{Role: llm.RoleSystem, Content: "stable prefix"}}
+
+	if got := mm.AppendRetrievalContext(history, RetrievedMemory{}); len(got) != 1 {
+		t.Fatalf("expected no trailing message when nothing was retrieved, got %#v", got)
+	}
+
+	got := mm.AppendRetrievalContext(history, RetrievedMemory{
+		Facts:    []models.Fact{{Subject: "job", Content: "works as an engineer"}},
+		Episodes: []models.Episode{{Summary: "discussed vacation plans"}},
+	})
+	if len(got) != 2 {
+		t.Fatalf("expected exactly one trailing message, got %d: %#v", len(got), got)
+	}
+	if got[0].Content != "stable prefix" {
+		t.Fatalf("the stable prefix must be untouched: %#v", got[0])
+	}
+	if !strings.Contains(got[1].Content, "Relevant facts") || !strings.Contains(got[1].Content, "Relevant past episodes") {
+		t.Fatalf("trailing message should contain both sections: %q", got[1].Content)
 	}
 }
 

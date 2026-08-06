@@ -76,6 +76,9 @@ type Tool struct {
 	Description string         `json:"description"`
 	Parameters  map[string]any `json:"parameters"`
 	Strict      bool           `json:"strict,omitempty"`
+	// StatusMessage, if set, is shown to the user while this tool is running (e.g.
+	// "Searching..."). It's local UI metadata, never sent to the provider.
+	StatusMessage string `json:"-"`
 }
 
 type ToolChoice string
@@ -137,8 +140,13 @@ type ToolResult struct {
 }
 
 type Usage struct {
-	InputTokens  int64
-	OutputTokens int64
+	InputTokens int64
+	// CachedInputTokens is the portion of InputTokens served from the provider's prompt
+	// cache (OpenAI: input_tokens_details.cached_tokens). 0 means either nothing was
+	// cached or the provider/adapter doesn't report it (e.g. Anthropic today, which has
+	// no cache_control breakpoints configured).
+	CachedInputTokens int64
+	OutputTokens      int64
 }
 
 type StreamEvent struct {

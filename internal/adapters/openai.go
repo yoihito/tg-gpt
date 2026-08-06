@@ -217,8 +217,9 @@ func (a *OpenaiStreamAdapter) fromResponseStreamEvent(event responses.ResponseSt
 		completed := event.AsResponseCompleted()
 		usage := llm.StreamEvent{
 			Usage: &llm.Usage{
-				InputTokens:  completed.Response.Usage.InputTokens,
-				OutputTokens: completed.Response.Usage.OutputTokens,
+				InputTokens:       completed.Response.Usage.InputTokens,
+				CachedInputTokens: completed.Response.Usage.InputTokensDetails.CachedTokens,
+				OutputTokens:      completed.Response.Usage.OutputTokens,
 			},
 			Done: true,
 		}

@@ -9,6 +9,7 @@ import (
 type StreamAccumulator struct {
 	accumulatedResponse string
 	promptTokens        int64
+	cachedPromptTokens  int64
 	completionTokens    int64
 	toolCalls           map[int]llm.ToolCall
 }
@@ -31,6 +32,7 @@ func (s *StreamAccumulator) AddEvent(event llm.StreamEvent) {
 	}
 	if event.Usage != nil {
 		s.promptTokens += event.Usage.InputTokens
+		s.cachedPromptTokens += event.Usage.CachedInputTokens
 		s.completionTokens += event.Usage.OutputTokens
 	}
 }
@@ -62,6 +64,10 @@ func (s *StreamAccumulator) OutputTokens() int64 {
 
 func (s *StreamAccumulator) InputTokens() int64 {
 	return s.promptTokens
+}
+
+func (s *StreamAccumulator) CachedInputTokens() int64 {
+	return s.cachedPromptTokens
 }
 
 func (s *StreamAccumulator) HasToolCalls() bool {

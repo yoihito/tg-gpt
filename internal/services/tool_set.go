@@ -41,6 +41,16 @@ func (s *ToolSet) Defs() []llm.Tool {
 	return s.defs
 }
 
+// Lookup returns the registered definition for a tool name, if any.
+func (s *ToolSet) Lookup(name string) (llm.Tool, bool) {
+	for _, def := range s.defs {
+		if def.Name == name {
+			return def, true
+		}
+	}
+	return llm.Tool{}, false
+}
+
 func (s *ToolSet) Execute(ctx context.Context, mctx TurnContext, user models.User, call llm.ToolCall) (string, error) {
 	handler, ok := s.handlers[call.Name]
 	if !ok {

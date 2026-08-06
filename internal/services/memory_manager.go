@@ -398,9 +398,13 @@ func rrfFuse(a, b []int64, topN int) []int64 {
 	return out
 }
 
-// AssemblePrompt builds the LLM message list. systemHeader is the caller's base system
-// prompt (constants + dynamic bits like the current date). MemoryManager appends a
-// memory block to the system message and converts recent trace events into chat messages.
+// AssemblePrompt builds the stable part of the LLM message list: systemHeader (the
+// caller's base system prompt — constants + dynamic bits like the current date) plus
+// preferences, which are per-user but not per-query, so they stay byte-identical across
+// turns whose retrieval differs but whose actual conversation doesn't. Query-dependent
+// retrieval (facts, episodes) is deliberately NOT included here — see
+// AppendRetrievalContext — so this prefix (and the trace replay after it) stays eligible
+// for the provider's prompt cache instead of being invalidated by every new query.
 func (m *MemoryManager) AssemblePrompt(systemHeader string, retrieved RetrievedMemory) []llm.Message {
 	var sys strings.Builder
 	sys.WriteString(systemHeader)
@@ -409,19 +413,6 @@ func (m *MemoryManager) AssemblePrompt(systemHeader string, retrieved RetrievedM
 		sys.WriteString("\n\n## User preferences\n")
 		for _, p := range retrieved.Preferences {
 			fmt.Fprintf(&sys, "- %s: %s\n", p.PrefKey, p.PrefValue)
-		}
-	}
-	if len(retrieved.Facts) > 0 {
-		sys.WriteString("\n## Relevant facts\n")
-		for _, f := range retrieved.Facts {
-			fmt.Fprintf(&sys, "- [%s] %s\n", f.Subject, f.Content)
-		}
-	}
-	if len(retrieved.Episodes) > 0 {
-		sys.WriteString("\n## Relevant past episodes\n")
-		for _, e := range retrieved.Episodes {
-			date := time.Unix(e.EndedAt, 0).Format("2006-01-02")
-			fmt.Fprintf(&sys, "- %s: %s\n", date, e.Summary)
 		}
 	}
 
@@ -438,6 +429,36 @@ func (m *MemoryManager) AssemblePrompt(systemHeader string, retrieved RetrievedM
 	}
 	messages = appendTraceMessages(messages, retrieved.RecentTrace[start:])
 	return messages
+}
+
+// AppendRetrievalContext appends facts/episodes as a trailing message, if there are any.
+// These come from a per-query semantic search, so they differ on nearly every turn.
+// Placing them after everything else — including the current turn's own input, appended
+// separately via appendMissingCurrentInputs — keeps that volatility from invalidating a
+// cached prefix of the (usually much larger, and often unchanged) system+trace history
+// before them.
+func (m *MemoryManager) AppendRetrievalContext(history []llm.Message, retrieved RetrievedMemory) []llm.Message {
+	var sys strings.Builder
+	if len(retrieved.Facts) > 0 {
+		sys.WriteString("## Relevant facts\n")
+		for _, f := range retrieved.Facts {
+			fmt.Fprintf(&sys, "- [%s] %s\n", f.Subject, f.Content)
+		}
+	}
+	if len(retrieved.Episodes) > 0 {
+		if sys.Len() > 0 {
+			sys.WriteString("\n")
+		}
+		sys.WriteString("## Relevant past episodes\n")
+		for _, e := range retrieved.Episodes {
+			date := time.Unix(e.EndedAt, 0).Format("2006-01-02")
+			fmt.Fprintf(&sys, "- %s: %s\n", date, e.Summary)
+		}
+	}
+	if sys.Len() == 0 {
+		return history
+	}
+	return append(history, llm.Message{Role: llm.RoleSystem, Content: sys.String()})
 }
 
 func appendTraceMessages(messages []llm.Message, events []models.TraceEvent) []llm.Message {

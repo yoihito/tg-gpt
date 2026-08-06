@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"fmt"
 
 	"vadimgribanov.com/tg-gpt/internal/llm"
 	"vadimgribanov.com/tg-gpt/internal/models"
@@ -61,5 +62,27 @@ type RunContext struct {
 	Inputs       []UserInput
 	History      []llm.Message
 	SystemPrompt string
-	Iteration    int
+}
+
+// dispatch calls fn on every plugin implementing hook interface H, stopping at (and
+// wrapping, so the failing plugin is identifiable) the first error.
+func dispatch[H any](plugins []Plugin, fn func(H) error) error {
+	for _, p := range plugins {
+		if h, ok := p.(H); ok {
+			if err := fn(h); err != nil {
+				return fmt.Errorf("plugin %q: %w", p.Name(), err)
+			}
+		}
+	}
+	return nil
+}
+
+// dispatchVoid is dispatch for hooks with no error return (e.g. AfterTurnHook, which
+// runs after the response is already decided and so cannot abort anything).
+func dispatchVoid[H any](plugins []Plugin, fn func(H)) {
+	for _, p := range plugins {
+		if h, ok := p.(H); ok {
+			fn(h)
+		}
+	}
 }
