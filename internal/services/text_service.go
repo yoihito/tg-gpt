@@ -63,6 +63,7 @@ type TextService struct {
 type LLMClient interface {
 	Stream(ctx context.Context, request llm.Request) (llm.Stream, error)
 	IsClientRegistered(modelId string) bool
+	Capabilities(modelId string) llm.Capabilities
 }
 
 type UsersRepo interface {

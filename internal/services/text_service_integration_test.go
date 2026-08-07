@@ -393,6 +393,13 @@ func (c *fakeLLMClient) IsClientRegistered(modelID string) bool {
 	return ok
 }
 
+// Capabilities reports full support for every registered model: none of the existing
+// callers of this fake exercise capability gating, so the permissive default keeps them
+// unaffected.
+func (c *fakeLLMClient) Capabilities(modelID string) llm.Capabilities {
+	return llm.Capabilities{FunctionTools: true, Vision: true, ToolChoice: true}
+}
+
 func (c *fakeLLMClient) Stream(ctx context.Context, request llm.Request) (llm.Stream, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

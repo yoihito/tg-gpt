@@ -2,11 +2,27 @@ package services
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"strings"
 
 	"vadimgribanov.com/tg-gpt/internal/llm"
 	"vadimgribanov.com/tg-gpt/internal/models"
 )
+
+// ValidateToolArguments checks that a tool call's raw JSON arguments are present and
+// well-formed, returning an error a handler can surface as-is. Tools that take no
+// arguments should skip this check rather than call it.
+func ValidateToolArguments(name, arguments string) error {
+	if strings.TrimSpace(arguments) == "" {
+		return fmt.Errorf("empty arguments for tool call: %s", name)
+	}
+	var probe map[string]interface{}
+	if err := json.Unmarshal([]byte(arguments), &probe); err != nil {
+		return fmt.Errorf("invalid JSON arguments for %s: %w - arguments: %s", name, err, arguments)
+	}
+	return nil
+}
 
 // ToolHandler executes one tool call and returns its result. Domain/validation
 // failures should be encoded in the returned string (so the model can see and

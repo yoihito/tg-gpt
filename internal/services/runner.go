@@ -19,6 +19,8 @@ const maxToolIterations = 25
 
 const capMessage = "I hit an internal limit handling this request (too many tool calls in a row). Please try again or rephrase your request."
 
+const visionUnsupportedMessage = "The current model can't read images. Switch to a vision-capable model with /change_model, or resend without the image."
+
 // Runner executes a Definition. Plugins are fixed at construction time — every Definition
 // run through a given Runner gets the same cross-cutting behavior (memory, usage, etc.).
 // Runner holds no per-call mutable state, so Run is safe to call concurrently or
@@ -171,6 +173,15 @@ func (s *runStreamImpl) Next() bool {
 				}); err != nil {
 					return s.fail(err)
 				}
+
+				if caps := s.runner.client.Capabilities(s.rc.Model); !caps.Vision && historyHasImage(s.rc.History) {
+					if err := s.finalizeIteration(visionUnsupportedMessage, nil, llm.Usage{}); err != nil {
+						return s.fail(err)
+					}
+					s.event = RunEvent{Kind: RunEventNotice, StreamEvent: llm.StreamEvent{TextDelta: visionUnsupportedMessage}}
+					s.phase = phaseIterationEnd
+					return true
+				}
 			}
 
 			if s.iteration > s.maxIter {
@@ -188,10 +199,17 @@ func (s *runStreamImpl) Next() bool {
 				return s.fail(err)
 			}
 
+			tools := s.def.Tools.Defs()
+			if caps := s.runner.client.Capabilities(s.rc.Model); !caps.FunctionTools && len(tools) > 0 {
+				slog.WarnContext(s.ctx, "Model does not support function tools; omitting tools for this call",
+					"model", s.rc.Model, "tool_count", len(tools))
+				tools = nil
+			}
+
 			stream, err := s.runner.client.Stream(s.ctx, llm.Request{
 				Model:      s.rc.Model,
 				Messages:   s.rc.History,
-				Tools:      s.def.Tools.Defs(),
+				Tools:      tools,
 				ToolChoice: llm.ToolChoiceAuto,
 			})
 			if err != nil {
@@ -338,6 +356,17 @@ func (s *runStreamImpl) finalizeIteration(content string, toolCalls []llm.ToolCa
 	}
 	s.rc.History = append(s.rc.History, msg)
 	return nil
+}
+
+func historyHasImage(history []llm.Message) bool {
+	for _, msg := range history {
+		for _, part := range msg.Parts {
+			if part.Type == llm.ContentPartImageURL {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func defaultHistory(systemPrompt string, inputs []UserInput) []llm.Message {

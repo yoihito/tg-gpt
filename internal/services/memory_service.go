@@ -134,13 +134,8 @@ func (s *MemoryService) HandleToolCall(ctx context.Context, mctx TurnContext, to
 		return s.handleListEpisodes(mctx.UserID)
 	}
 
-	if strings.TrimSpace(toolCall.Arguments) == "" {
-		return "", fmt.Errorf("empty arguments for tool call: %s", toolCall.Name)
-	}
-
-	var probe map[string]interface{}
-	if err := json.Unmarshal([]byte(toolCall.Arguments), &probe); err != nil {
-		return "", fmt.Errorf("invalid JSON arguments for %s: %w - arguments: %s", toolCall.Name, err, toolCall.Arguments)
+	if err := ValidateToolArguments(toolCall.Name, toolCall.Arguments); err != nil {
+		return "", err
 	}
 
 	switch toolCall.Name {

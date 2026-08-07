@@ -80,3 +80,14 @@ func (p *LLMClientProxy) Stream(ctx context.Context, request llm.Request) (llm.S
 	}
 	return client.Stream(ctx, request)
 }
+
+// Capabilities reports what modelId supports. Unknown models report the zero value
+// (nothing supported) rather than erroring, since callers use this to decide what to
+// omit from a request, not to validate the model itself.
+func (p *LLMClientProxy) Capabilities(modelId string) llm.Capabilities {
+	client, err := p.getClient(modelId)
+	if err != nil {
+		return llm.Capabilities{}
+	}
+	return client.Capabilities(modelId)
+}
