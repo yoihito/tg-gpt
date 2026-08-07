@@ -23,13 +23,13 @@ type ScheduledActionRunner interface {
 }
 
 type ReminderService struct {
-	reminderRepo  *repositories.ReminderRepo
-	userRepo      *repositories.UserRepo
-	prefRepo      *repositories.PreferenceRepo
-	memoryManager *MemoryManager
-	timeParser    *utils.TimeParser
-	bot           *tele.Bot
-	actionRunner  ScheduledActionRunner
+	reminderRepo *repositories.ReminderRepo
+	userRepo     *repositories.UserRepo
+	prefRepo     *repositories.PreferenceRepo
+	trace        *TraceStore
+	timeParser   *utils.TimeParser
+	bot          *tele.Bot
+	actionRunner ScheduledActionRunner
 
 	ticker    *time.Ticker
 	stopChan  chan struct{}
@@ -42,17 +42,17 @@ func NewReminderService(
 	reminderRepo *repositories.ReminderRepo,
 	userRepo *repositories.UserRepo,
 	prefRepo *repositories.PreferenceRepo,
-	memoryManager *MemoryManager,
+	trace *TraceStore,
 	bot *tele.Bot,
 ) *ReminderService {
 	return &ReminderService{
-		reminderRepo:  reminderRepo,
-		userRepo:      userRepo,
-		prefRepo:      prefRepo,
-		memoryManager: memoryManager,
-		timeParser:    utils.NewTimeParser(),
-		bot:           bot,
-		stopChan:      make(chan struct{}),
+		reminderRepo: reminderRepo,
+		userRepo:     userRepo,
+		prefRepo:     prefRepo,
+		trace:        trace,
+		timeParser:   utils.NewTimeParser(),
+		bot:          bot,
+		stopChan:     make(chan struct{}),
 	}
 }
 
@@ -516,7 +516,7 @@ func (s *ReminderService) fireReminder(ctx context.Context, reminder models.Remi
 	}
 
 	syntheticUserText := fmt.Sprintf("[Reminder triggered for: %s]", reminder.Message)
-	if err := s.memoryManager.RecordReminderFire(user.Id, user.CurrentDialogId, syntheticUserText, naturalMessage, int64(sentMsg.ID)); err != nil {
+	if err := s.trace.RecordReminderFire(user.Id, user.CurrentDialogId, syntheticUserText, naturalMessage, int64(sentMsg.ID)); err != nil {
 		slog.ErrorContext(ctx, "Failed to save reminder to trace", "error", err, "reminder_id", reminder.ID)
 	}
 

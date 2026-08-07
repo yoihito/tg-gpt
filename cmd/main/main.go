@@ -84,21 +84,30 @@ func main() {
 	extractor := services.NewExtractor(llmClientProxy.OpenaiClient, appConfig.Memory.Extractor.Model)
 	summarizer := services.NewSummarizer(llmClientProxy.OpenaiClient, appConfig.Memory.Extractor.Model)
 
-	memoryManager := services.NewMemoryManager(
-		traceRepo, prefRepo, factRepo, episodeRepo,
-		embedder, extractor, summarizer,
-		services.MemoryConfig{
+	traceStore := services.NewTraceStore(traceRepo)
+	retriever := services.NewRetriever(
+		traceRepo, prefRepo, factRepo, episodeRepo, embedder,
+		services.RetrievalConfig{
+			FactsTopK:         appConfig.Memory.Retrieval.FactsTopK,
+			EpisodesTopK:      appConfig.Memory.Retrieval.EpisodesTopK,
+			RecentTraceEvents: appConfig.Memory.Retrieval.RecentTraceEvents,
+		},
+	)
+	consolidator := services.NewMemoryConsolidator(
+		prefRepo, factRepo, embedder, extractor,
+		services.ConsolidationConfig{
 			FactConfidenceMin:   appConfig.Memory.Thresholds.FactConfidenceMin,
 			PrefConfidenceMin:   appConfig.Memory.Thresholds.PreferenceConfidenceMin,
 			SemanticDedupCosine: appConfig.Memory.Thresholds.SemanticDedupCosine,
-			FactsTopK:           appConfig.Memory.Retrieval.FactsTopK,
-			EpisodesTopK:        appConfig.Memory.Retrieval.EpisodesTopK,
-			EpisodeMinTurns:     appConfig.Memory.Episode.MinTurns,
-			RecentTraceEvents:   appConfig.Memory.Retrieval.RecentTraceEvents,
 		},
 	)
+	episodeStore := services.NewEpisodeStore(
+		traceRepo, episodeRepo, summarizer, embedder,
+		services.EpisodeConfig{MinTurns: appConfig.Memory.Episode.MinTurns},
+	)
+	memoryPlugin := services.NewMemoryPlugin(traceStore, retriever, consolidator)
 
-	memoryService := services.NewMemoryService(prefRepo, memoryManager)
+	memoryService := services.NewMemoryService(prefRepo, consolidator, episodeStore)
 
 	pref := tele.Settings{
 		Token:  os.Getenv("TOKEN"),
@@ -111,13 +120,15 @@ func main() {
 		return
 	}
 
-	reminderService := services.NewReminderService(reminderRepo, userRepo, prefRepo, memoryManager, b)
+	reminderService := services.NewReminderService(reminderRepo, userRepo, prefRepo, traceStore, b)
 	webSearchService := services.NewWebSearchService(os.Getenv("TAVILY_API_KEY"))
 	textService := services.NewTextService(
 		llmClientProxy,
 		userRepo,
 		memoryService,
-		memoryManager,
+		traceStore,
+		episodeStore,
+		memoryPlugin,
 		reminderService,
 		webSearchService,
 		dialogTimeout,
@@ -160,7 +171,8 @@ func main() {
 		voiceService,
 		turnDispatcher,
 		userRepo,
-		memoryManager,
+		traceStore,
+		episodeStore,
 		llmClientProxy,
 	)
 

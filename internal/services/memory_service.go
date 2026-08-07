@@ -14,12 +14,13 @@ import (
 )
 
 type MemoryService struct {
-	prefs         *repositories.PreferenceRepo
-	memoryManager *MemoryManager
+	prefs        *repositories.PreferenceRepo
+	consolidator *MemoryConsolidator
+	episodes     *EpisodeStore
 }
 
-func NewMemoryService(prefs *repositories.PreferenceRepo, memoryManager *MemoryManager) *MemoryService {
-	return &MemoryService{prefs: prefs, memoryManager: memoryManager}
+func NewMemoryService(prefs *repositories.PreferenceRepo, consolidator *MemoryConsolidator, episodes *EpisodeStore) *MemoryService {
+	return &MemoryService{prefs: prefs, consolidator: consolidator, episodes: episodes}
 }
 
 func (s *MemoryService) GetMemoryTools() []llm.Tool {
@@ -217,7 +218,7 @@ func (s *MemoryService) handleListMemories(userID int64) (string, error) {
 }
 
 func (s *MemoryService) handleListEpisodes(userID int64) (string, error) {
-	episodes, err := s.memoryManager.ListEpisodes(userID)
+	episodes, err := s.episodes.ListEpisodes(userID)
 	if err != nil {
 		return "", err
 	}
@@ -260,7 +261,7 @@ func (s *MemoryService) handleSaveFact(ctx context.Context, mctx TurnContext, ar
 	if args.Subject == "" || args.Content == "" {
 		return "subject and content are required", nil
 	}
-	err := s.memoryManager.PromoteExplicit(ctx, mctx, Candidate{
+	err := s.consolidator.PromoteExplicit(ctx, mctx, Candidate{
 		Type:       CandidateFact,
 		Subject:    args.Subject,
 		Content:    args.Content,
@@ -283,7 +284,7 @@ func (s *MemoryService) handleForgetAbout(userID int64, arguments string) (strin
 	if args.Subject == "" {
 		return "subject is required", nil
 	}
-	n, err := s.memoryManager.RevokeFactsBySubject(userID, args.Subject)
+	n, err := s.consolidator.RevokeFactsBySubject(userID, args.Subject)
 	if err != nil {
 		return "", err
 	}
@@ -300,7 +301,7 @@ func (s *MemoryService) handleForgetEpisode(userID int64, arguments string) (str
 	if args.EpisodeID == 0 {
 		return "episode_id is required", nil
 	}
-	if err := s.memoryManager.DeleteEpisode(userID, args.EpisodeID); err != nil {
+	if err := s.episodes.DeleteEpisode(userID, args.EpisodeID); err != nil {
 		return "", err
 	}
 	return fmt.Sprintf("Episode deleted: %d", args.EpisodeID), nil

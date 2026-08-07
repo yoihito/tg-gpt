@@ -15,7 +15,9 @@ func NewTextService(
 	client LLMClient,
 	usersRepo UsersRepo,
 	memoryService *MemoryService,
-	memoryManager *MemoryManager,
+	trace *TraceStore,
+	episodes *EpisodeStore,
+	memoryPlugin *MemoryPlugin,
 	reminderService *ReminderService,
 	webSearchService *WebSearchService,
 	dialogTimeout int64,
@@ -25,14 +27,15 @@ func NewTextService(
 		client:           client,
 		usersRepo:        usersRepo,
 		memoryService:    memoryService,
-		memoryManager:    memoryManager,
+		trace:            trace,
+		episodes:         episodes,
 		reminderService:  reminderService,
 		webSearchService: webSearchService,
 		dialogTimeout:    dialogTimeout,
 		defaultModel:     defaultModel,
 	}
 
-	h.runner = NewRunner(client, NewMemoryPlugin(memoryManager), NewUsagePlugin(usersRepo))
+	h.runner = NewRunner(client, memoryPlugin, NewUsagePlugin(usersRepo))
 	h.defaultAgent = Definition{
 		Name:              "assistant",
 		BuildSystemPrompt: defaultSystemPrompt,
@@ -50,7 +53,8 @@ type TextService struct {
 	client               LLMClient
 	usersRepo            UsersRepo
 	memoryService        *MemoryService
-	memoryManager        *MemoryManager
+	trace                *TraceStore
+	episodes             *EpisodeStore
 	reminderService      *ReminderService
 	webSearchService     *WebSearchService
 	dialogTimeout        int64
@@ -226,7 +230,7 @@ func (h *TextService) PrepareUserForInput(ctx context.Context, user models.User)
 	now := time.Now().Unix()
 	if now-user.LastInteraction > h.dialogTimeout {
 		oldDialogID := user.CurrentDialogId
-		go h.memoryManager.CloseDialog(context.WithoutCancel(ctx), user.Id, oldDialogID)
+		go h.episodes.CloseDialog(context.WithoutCancel(ctx), user.Id, oldDialogID)
 		newDialogID, ok, err := h.usersRepo.StartNewDialogCAS(user.Id, oldDialogID, now)
 		if err != nil {
 			return models.User{}, err
@@ -296,7 +300,7 @@ func (h *TextService) runSingleInputTurn(
 		"dialog_id", user.CurrentDialogId,
 		"model", modelToUse,
 	)
-	mctx, err := h.memoryManager.BeginTurn(user.Id, user.CurrentDialogId, newMessage, tgUserMessageId)
+	mctx, err := h.trace.BeginTurn(user.Id, user.CurrentDialogId, newMessage, tgUserMessageId)
 	if err != nil {
 		slog.ErrorContext(ctx, "Error beginning turn", "error", err)
 		return "", err

@@ -238,7 +238,7 @@ func TestTextServiceIntegrationRetryReplacesLastExchange(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	userMsg, tgMsgID, err := h.memoryManager.PopForRetry(h.user.Id, h.user.CurrentDialogId)
+	userMsg, tgMsgID, err := h.traceStore.PopForRetry(h.user.Id, h.user.CurrentDialogId)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -261,13 +261,13 @@ func TestTextServiceIntegrationRetryReplacesLastExchange(t *testing.T) {
 }
 
 type textServiceIntegrationHarness struct {
-	db            *database.DB
-	user          models.User
-	userRepo      *repositories.UserRepo
-	traceRepo     *repositories.TraceRepo
-	memoryManager *MemoryManager
-	textService   *TextService
-	llmClient     *fakeLLMClient
+	db          *database.DB
+	user        models.User
+	userRepo    *repositories.UserRepo
+	traceRepo   *repositories.TraceRepo
+	traceStore  *TraceStore
+	textService *TextService
+	llmClient   *fakeLLMClient
 }
 
 func newTextServiceIntegrationHarness(t *testing.T, streams [][]llm.StreamEvent) *textServiceIntegrationHarness {
@@ -310,26 +310,26 @@ func newTextServiceIntegrationHarness(t *testing.T, streams [][]llm.StreamEvent)
 		option.WithBaseURL(openaiServer.URL+"/v1"),
 	)
 
-	memoryManager := NewMemoryManager(
-		traceRepo,
-		prefRepo,
-		factRepo,
-		episodeRepo,
-		NewEmbedder(&openaiClient, "test-embedding"),
-		NewExtractor(&openaiClient, "test-extractor"),
-		NewSummarizer(&openaiClient, "test-summarizer"),
-		MemoryConfig{
-			FactConfidenceMin:   0.8,
-			PrefConfidenceMin:   0.8,
-			SemanticDedupCosine: 0.95,
-			FactsTopK:           3,
-			EpisodesTopK:        3,
-			EpisodeMinTurns:     2,
-			RecentTraceEvents:   20,
-		},
-	)
-	memoryService := NewMemoryService(prefRepo, memoryManager)
-	reminderService := NewReminderService(reminderRepo, userRepo, prefRepo, memoryManager, nil)
+	embedder := NewEmbedder(&openaiClient, "test-embedding")
+	extractor := NewExtractor(&openaiClient, "test-extractor")
+	summarizer := NewSummarizer(&openaiClient, "test-summarizer")
+
+	traceStore := NewTraceStore(traceRepo)
+	retriever := NewRetriever(traceRepo, prefRepo, factRepo, episodeRepo, embedder, RetrievalConfig{
+		FactsTopK:         3,
+		EpisodesTopK:      3,
+		RecentTraceEvents: 20,
+	})
+	consolidator := NewMemoryConsolidator(prefRepo, factRepo, embedder, extractor, ConsolidationConfig{
+		FactConfidenceMin:   0.8,
+		PrefConfidenceMin:   0.8,
+		SemanticDedupCosine: 0.95,
+	})
+	episodeStore := NewEpisodeStore(traceRepo, episodeRepo, summarizer, embedder, EpisodeConfig{MinTurns: 2})
+	memoryPlugin := NewMemoryPlugin(traceStore, retriever, consolidator)
+
+	memoryService := NewMemoryService(prefRepo, consolidator, episodeStore)
+	reminderService := NewReminderService(reminderRepo, userRepo, prefRepo, traceStore, nil)
 	llmClient := &fakeLLMClient{
 		models:  map[string]struct{}{"test-model": {}},
 		streams: streams,
@@ -338,7 +338,9 @@ func newTextServiceIntegrationHarness(t *testing.T, streams [][]llm.StreamEvent)
 		llmClient,
 		userRepo,
 		memoryService,
-		memoryManager,
+		traceStore,
+		episodeStore,
+		memoryPlugin,
 		reminderService,
 		nil,
 		int64(time.Hour.Seconds()),
@@ -351,13 +353,13 @@ func newTextServiceIntegrationHarness(t *testing.T, streams [][]llm.StreamEvent)
 	}
 
 	return &textServiceIntegrationHarness{
-		db:            db,
-		user:          user,
-		userRepo:      userRepo,
-		traceRepo:     traceRepo,
-		memoryManager: memoryManager,
-		textService:   textService,
-		llmClient:     llmClient,
+		db:          db,
+		user:        user,
+		userRepo:    userRepo,
+		traceRepo:   traceRepo,
+		traceStore:  traceStore,
+		textService: textService,
+		llmClient:   llmClient,
 	}
 }
 

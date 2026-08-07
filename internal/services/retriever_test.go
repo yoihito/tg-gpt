@@ -50,26 +50,6 @@ func TestRRFFuseOneSide(t *testing.T) {
 	}
 }
 
-func TestNormalizeContentCollapsesWhitespace(t *testing.T) {
-	got := normalizeContent("  Hello\tworld\n\n  ")
-	want := "hello world"
-	if got != want {
-		t.Errorf("normalize: got %q want %q", got, want)
-	}
-}
-
-func TestContentHashStability(t *testing.T) {
-	a := contentHash("Hello World")
-	b := contentHash("hello   world")
-	if a != b {
-		t.Errorf("hash should be invariant to case/whitespace: %v vs %v", a, b)
-	}
-	c := contentHash("Hello Wo")
-	if a == c {
-		t.Errorf("different content should produce different hash")
-	}
-}
-
 func TestAppendTraceMessagesSkipsIncompleteToolCallGroup(t *testing.T) {
 	events := []models.TraceEvent{
 		traceEvent(t, models.EventTypeUserMsg, models.UserMsgPayload{Content: "search this"}),
@@ -123,14 +103,14 @@ func TestAppendTraceMessagesKeepsCompleteToolCallGroup(t *testing.T) {
 }
 
 func TestAssemblePromptExcludesFactsAndEpisodesFromSystemMessage(t *testing.T) {
-	mm := &MemoryManager{}
+	r := &Retriever{}
 	retrieved := RetrievedMemory{
 		Preferences: []models.Preference{{PrefKey: "timezone", PrefValue: "Europe/Berlin"}},
 		Facts:       []models.Fact{{Subject: "job", Content: "works as an engineer"}},
 		Episodes:    []models.Episode{{Summary: "discussed vacation plans"}},
 	}
 
-	messages := mm.AssemblePrompt("Base system prompt.", retrieved)
+	messages := r.AssemblePrompt("Base system prompt.", retrieved)
 	if len(messages) != 1 {
 		t.Fatalf("expected only the system message (no trace events), got %d: %#v", len(messages), messages)
 	}
@@ -144,14 +124,14 @@ func TestAssemblePromptExcludesFactsAndEpisodesFromSystemMessage(t *testing.T) {
 }
 
 func TestAppendRetrievalContextLeavesStablePrefixUntouched(t *testing.T) {
-	mm := &MemoryManager{}
+	r := &Retriever{}
 	history := []llm.Message{{Role: llm.RoleSystem, Content: "stable prefix"}}
 
-	if got := mm.AppendRetrievalContext(history, RetrievedMemory{}); len(got) != 1 {
+	if got := r.AppendRetrievalContext(history, RetrievedMemory{}); len(got) != 1 {
 		t.Fatalf("expected no trailing message when nothing was retrieved, got %#v", got)
 	}
 
-	got := mm.AppendRetrievalContext(history, RetrievedMemory{
+	got := r.AppendRetrievalContext(history, RetrievedMemory{
 		Facts:    []models.Fact{{Subject: "job", Content: "works as an engineer"}},
 		Episodes: []models.Episode{{Summary: "discussed vacation plans"}},
 	})

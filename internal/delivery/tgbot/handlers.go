@@ -24,7 +24,8 @@ func RegisterHandlers(
 	voiceService *services.VoiceService,
 	turnDispatcher *services.TurnDispatcher,
 	userRepo *repositories.UserRepo,
-	memoryManager *services.MemoryManager,
+	traceStore *services.TraceStore,
+	episodeStore *services.EpisodeStore,
 	llmClientProxy *services.LLMClientProxy,
 ) {
 	handler := NewBotHandler(
@@ -33,7 +34,8 @@ func RegisterHandlers(
 		voiceService,
 		turnDispatcher,
 		userRepo,
-		memoryManager,
+		traceStore,
+		episodeStore,
 		llmClientProxy,
 	)
 
@@ -63,7 +65,8 @@ type BotHandler struct {
 	voiceService   *services.VoiceService
 	dispatcher     *services.TurnDispatcher
 	userRepo       *repositories.UserRepo
-	memoryManager  *services.MemoryManager
+	traceStore     *services.TraceStore
+	episodeStore   *services.EpisodeStore
 	llmClientProxy *services.LLMClientProxy
 }
 
@@ -73,7 +76,8 @@ func NewBotHandler(
 	voiceService *services.VoiceService,
 	turnDispatcher *services.TurnDispatcher,
 	userRepo *repositories.UserRepo,
-	memoryManager *services.MemoryManager,
+	traceStore *services.TraceStore,
+	episodeStore *services.EpisodeStore,
 	llmClientProxy *services.LLMClientProxy,
 ) *BotHandler {
 	return &BotHandler{
@@ -82,7 +86,8 @@ func NewBotHandler(
 		voiceService:   voiceService,
 		dispatcher:     turnDispatcher,
 		userRepo:       userRepo,
-		memoryManager:  memoryManager,
+		traceStore:     traceStore,
+		episodeStore:   episodeStore,
 		llmClientProxy: llmClientProxy,
 	}
 }
@@ -199,7 +204,7 @@ func (h *BotHandler) RetryLastMessage(c tele.Context) error {
 	if h.dispatcher.IsActive(user.Id, user.CurrentDialogId) {
 		return c.Send("Cannot retry while a response is being generated. Use /cancel first.")
 	}
-	userMsg, tgMsgID, err := h.memoryManager.PopForRetry(user.Id, user.CurrentDialogId)
+	userMsg, tgMsgID, err := h.traceStore.PopForRetry(user.Id, user.CurrentDialogId)
 	if err != nil {
 		return c.Send("No messages found")
 	}
@@ -265,7 +270,7 @@ func (h *BotHandler) NewDialog(c tele.Context) error {
 	if err := h.dispatcher.CancelDialog(ctx, user.Id, oldDialogID); err != nil {
 		return err
 	}
-	go h.memoryManager.CloseDialog(context.WithoutCancel(ctx), user.Id, oldDialogID)
+	go h.episodeStore.CloseDialog(context.WithoutCancel(ctx), user.Id, oldDialogID)
 
 	_, ok, err := h.userRepo.StartNewDialogCAS(user.Id, oldDialogID, time.Now().Unix())
 	if err != nil {
