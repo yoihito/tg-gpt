@@ -78,13 +78,17 @@ func (r *Retriever) Retrieve(ctx context.Context, mctx TurnContext, query string
 	}
 	out.RecentTrace = recent
 
-	if facts, err := r.retrieveFacts(ctx, mctx.UserID, query); err != nil {
+	// Facts and episodes are both scored against the same query embedding; compute it
+	// once here rather than once per kind, since it's a real network round-trip.
+	queryEmb, hasQueryEmb := r.embedQuery(ctx, query)
+
+	if facts, err := r.retrieveFacts(ctx, mctx.UserID, query, queryEmb, hasQueryEmb); err != nil {
 		slog.WarnContext(ctx, "fact retrieval failed; continuing without facts", "error", err)
 	} else {
 		out.Facts = facts
 	}
 
-	if eps, err := r.retrieveEpisodes(ctx, mctx.UserID, query); err != nil {
+	if eps, err := r.retrieveEpisodes(ctx, mctx.UserID, query, queryEmb, hasQueryEmb); err != nil {
 		slog.WarnContext(ctx, "episode retrieval failed; continuing without episodes", "error", err)
 	} else {
 		out.Episodes = eps
@@ -93,7 +97,23 @@ func (r *Retriever) Retrieve(ctx context.Context, mctx TurnContext, query string
 	return out, nil
 }
 
-func (r *Retriever) retrieveEpisodes(ctx context.Context, userID int64, query string) ([]models.Episode, error) {
+// embedQuery computes the embedding shared by fact and episode retrieval. ok is false
+// for queries too short to be meaningful or when embedding fails; callers fall back to
+// lexical-only scoring in either case.
+func (r *Retriever) embedQuery(ctx context.Context, query string) (emb []float32, ok bool) {
+	q := strings.TrimSpace(query)
+	if len(q) < 3 {
+		return nil, false
+	}
+	emb, err := r.embedder.Embed(ctx, q)
+	if err != nil {
+		slog.WarnContext(ctx, "query embedding failed; falling back to lexical only", "error", err)
+		return nil, false
+	}
+	return emb, true
+}
+
+func (r *Retriever) retrieveEpisodes(ctx context.Context, userID int64, query string, queryEmb []float32, hasQueryEmb bool) ([]models.Episode, error) {
 	q := strings.TrimSpace(query)
 	if len(q) < 3 || r.cfg.EpisodesTopK == 0 {
 		return nil, nil
@@ -112,31 +132,26 @@ func (r *Retriever) retrieveEpisodes(ctx context.Context, userID int64, query st
 	}
 
 	var vectorIDs []int64
-	if len(all) > 0 {
-		queryEmb, err := r.embedder.Embed(ctx, q)
-		if err != nil {
-			slog.WarnContext(ctx, "query embedding failed; falling back to lexical only", "error", err)
-		} else {
-			type scored struct {
-				id    int64
-				score float32
+	if len(all) > 0 && hasQueryEmb {
+		type scored struct {
+			id    int64
+			score float32
+		}
+		scoredAll := make([]scored, 0, len(all))
+		for _, e := range all {
+			if e.EmbeddingModel != r.embedder.Model() {
+				continue
 			}
-			scoredAll := make([]scored, 0, len(all))
-			for _, e := range all {
-				if e.EmbeddingModel != r.embedder.Model() {
-					continue
-				}
-				scoredAll = append(scoredAll, scored{id: e.ID, score: vec.Cosine(queryEmb, e.Embedding)})
-			}
-			sort.Slice(scoredAll, func(i, j int) bool { return scoredAll[i].score > scoredAll[j].score })
-			limit := candidateLimit
-			if limit > len(scoredAll) {
-				limit = len(scoredAll)
-			}
-			vectorIDs = make([]int64, 0, limit)
-			for i := 0; i < limit; i++ {
-				vectorIDs = append(vectorIDs, scoredAll[i].id)
-			}
+			scoredAll = append(scoredAll, scored{id: e.ID, score: vec.Cosine(queryEmb, e.Embedding)})
+		}
+		sort.Slice(scoredAll, func(i, j int) bool { return scoredAll[i].score > scoredAll[j].score })
+		limit := candidateLimit
+		if limit > len(scoredAll) {
+			limit = len(scoredAll)
+		}
+		vectorIDs = make([]int64, 0, limit)
+		for i := 0; i < limit; i++ {
+			vectorIDs = append(vectorIDs, scoredAll[i].id)
 		}
 	}
 
@@ -161,7 +176,7 @@ func (r *Retriever) retrieveEpisodes(ctx context.Context, userID int64, query st
 	return ordered, nil
 }
 
-func (r *Retriever) retrieveFacts(ctx context.Context, userID int64, query string) ([]models.Fact, error) {
+func (r *Retriever) retrieveFacts(ctx context.Context, userID int64, query string, queryEmb []float32, hasQueryEmb bool) ([]models.Fact, error) {
 	q := strings.TrimSpace(query)
 	if len(q) < 3 {
 		return nil, nil
@@ -180,31 +195,26 @@ func (r *Retriever) retrieveFacts(ctx context.Context, userID int64, query strin
 	}
 
 	var vectorIDs []int64
-	if len(active) > 0 {
-		queryEmb, err := r.embedder.Embed(ctx, q)
-		if err != nil {
-			slog.WarnContext(ctx, "query embedding failed; falling back to lexical only", "error", err)
-		} else {
-			type scored struct {
-				id    int64
-				score float32
+	if len(active) > 0 && hasQueryEmb {
+		type scored struct {
+			id    int64
+			score float32
+		}
+		scoredAll := make([]scored, 0, len(active))
+		for _, f := range active {
+			if f.EmbeddingModel != r.embedder.Model() {
+				continue
 			}
-			scoredAll := make([]scored, 0, len(active))
-			for _, f := range active {
-				if f.EmbeddingModel != r.embedder.Model() {
-					continue
-				}
-				scoredAll = append(scoredAll, scored{id: f.ID, score: vec.Cosine(queryEmb, f.Embedding)})
-			}
-			sort.Slice(scoredAll, func(i, j int) bool { return scoredAll[i].score > scoredAll[j].score })
-			limit := candidateLimit
-			if limit > len(scoredAll) {
-				limit = len(scoredAll)
-			}
-			vectorIDs = make([]int64, 0, limit)
-			for i := 0; i < limit; i++ {
-				vectorIDs = append(vectorIDs, scoredAll[i].id)
-			}
+			scoredAll = append(scoredAll, scored{id: f.ID, score: vec.Cosine(queryEmb, f.Embedding)})
+		}
+		sort.Slice(scoredAll, func(i, j int) bool { return scoredAll[i].score > scoredAll[j].score })
+		limit := candidateLimit
+		if limit > len(scoredAll) {
+			limit = len(scoredAll)
+		}
+		vectorIDs = make([]int64, 0, limit)
+		for i := 0; i < limit; i++ {
+			vectorIDs = append(vectorIDs, scoredAll[i].id)
 		}
 	}
 

@@ -161,6 +161,8 @@ func (s *runStreamImpl) Next() bool {
 
 		case phaseStartIteration:
 			s.iteration++
+			caps := s.runner.client.Capabilities(s.rc.Model)
+
 			if s.iteration == 1 {
 				sysPrompt, err := s.def.BuildSystemPrompt(s.ctx)
 				if err != nil {
@@ -174,23 +176,13 @@ func (s *runStreamImpl) Next() bool {
 					return s.fail(err)
 				}
 
-				if caps := s.runner.client.Capabilities(s.rc.Model); !caps.Vision && historyHasImage(s.rc.History) {
-					if err := s.finalizeIteration(visionUnsupportedMessage, nil, llm.Usage{}); err != nil {
-						return s.fail(err)
-					}
-					s.event = RunEvent{Kind: RunEventNotice, StreamEvent: llm.StreamEvent{TextDelta: visionUnsupportedMessage}}
-					s.phase = phaseIterationEnd
-					return true
+				if !caps.Vision && historyHasImage(s.rc.History) {
+					return s.abortIteration(visionUnsupportedMessage)
 				}
 			}
 
 			if s.iteration > s.maxIter {
-				if err := s.finalizeIteration(capMessage, nil, llm.Usage{}); err != nil {
-					return s.fail(err)
-				}
-				s.event = RunEvent{Kind: RunEventNotice, StreamEvent: llm.StreamEvent{TextDelta: capMessage}}
-				s.phase = phaseIterationEnd
-				return true
+				return s.abortIteration(capMessage)
 			}
 
 			if err := dispatch(s.runner.plugins, func(h BeforeModelCallHook) error {
@@ -200,7 +192,7 @@ func (s *runStreamImpl) Next() bool {
 			}
 
 			tools := s.def.Tools.Defs()
-			if caps := s.runner.client.Capabilities(s.rc.Model); !caps.FunctionTools && len(tools) > 0 {
+			if !caps.FunctionTools && len(tools) > 0 {
 				slog.WarnContext(s.ctx, "Model does not support function tools; omitting tools for this call",
 					"model", s.rc.Model, "tool_count", len(tools))
 				tools = nil
@@ -332,6 +324,18 @@ func (s *runStreamImpl) fail(err error) bool {
 	s.err = err
 	s.phase = phaseDone
 	return false
+}
+
+// abortIteration ends the turn with a Runner-authored notice instead of calling the
+// model — used whenever a condition (iteration cap, an unsupported capability, ...)
+// means the turn must stop before ever reaching the provider.
+func (s *runStreamImpl) abortIteration(message string) bool {
+	if err := s.finalizeIteration(message, nil, llm.Usage{}); err != nil {
+		return s.fail(err)
+	}
+	s.event = RunEvent{Kind: RunEventNotice, StreamEvent: llm.StreamEvent{TextDelta: message}}
+	s.phase = phaseIterationEnd
+	return true
 }
 
 // finalizeIteration runs AfterModelCallHooks and appends the assistant's message to
