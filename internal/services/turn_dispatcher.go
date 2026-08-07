@@ -14,7 +14,15 @@ import (
 	"vadimgribanov.com/tg-gpt/internal/telegram_utils"
 )
 
-type ConversationRunner struct {
+// TurnDispatcher serializes access to each (user, dialog): at most one turn runs at a
+// time per dialog, concurrent submissions for different dialogs proceed independently,
+// bursts of messages that arrive before a turn starts are coalesced into one, and
+// messages that arrive while a turn is already running are folded into it via
+// Runner's mid-turn drain instead of racing it. It never executes a turn itself — all
+// of that is delegated to TextService/Runner; this is purely the per-dialog scheduling
+// layer above them (the same shape as one actor/grain per conversation, just scoped to
+// this single process rather than a cluster).
+type TurnDispatcher struct {
 	db         *database.DB
 	pending    *repositories.PendingInputRepo
 	trace      *repositories.TraceRepo
@@ -36,13 +44,13 @@ type activeConversation struct {
 	streamers     map[int64]*telegram_utils.TelegramStreamer
 }
 
-func NewConversationRunner(
+func NewTurnDispatcher(
 	db *database.DB,
 	pending *repositories.PendingInputRepo,
 	trace *repositories.TraceRepo,
 	text *TextService,
-) *ConversationRunner {
-	return &ConversationRunner{
+) *TurnDispatcher {
+	return &TurnDispatcher{
 		db:         db,
 		pending:    pending,
 		trace:      trace,
@@ -52,7 +60,7 @@ func NewConversationRunner(
 	}
 }
 
-func (r *ConversationRunner) Submit(
+func (r *TurnDispatcher) Submit(
 	ctx context.Context,
 	user models.User,
 	tgMessageID int64,
@@ -99,11 +107,11 @@ func (r *ConversationRunner) Submit(
 	return nil
 }
 
-func (r *ConversationRunner) CancelCurrentDialog(ctx context.Context, user models.User) error {
+func (r *TurnDispatcher) CancelCurrentDialog(ctx context.Context, user models.User) error {
 	return r.CancelDialog(ctx, user.Id, user.CurrentDialogId)
 }
 
-func (r *ConversationRunner) CancelDialog(ctx context.Context, userID, dialogID int64) error {
+func (r *TurnDispatcher) CancelDialog(ctx context.Context, userID, dialogID int64) error {
 	key := conversationKey{userID: userID, dialogID: dialogID}
 	r.mu.Lock()
 	if active := r.active[key]; active != nil {
@@ -113,14 +121,14 @@ func (r *ConversationRunner) CancelDialog(ctx context.Context, userID, dialogID 
 	return r.pending.DiscardForDialog(ctx, userID, dialogID)
 }
 
-func (r *ConversationRunner) IsActive(userID, dialogID int64) bool {
+func (r *TurnDispatcher) IsActive(userID, dialogID int64) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	_, ok := r.active[conversationKey{userID: userID, dialogID: dialogID}]
 	return ok
 }
 
-func (r *ConversationRunner) run(ctx context.Context, key conversationKey, user models.User, active *activeConversation) {
+func (r *TurnDispatcher) run(ctx context.Context, key conversationKey, user models.User, active *activeConversation) {
 	defer func() {
 		r.mu.Lock()
 		if r.active[key] == active {
@@ -177,7 +185,7 @@ func (r *ConversationRunner) run(ctx context.Context, key conversationKey, user 
 	}
 }
 
-func (r *ConversationRunner) takeStreamer(active *activeConversation, inputs []UserInput) *telegram_utils.TelegramStreamer {
+func (r *TurnDispatcher) takeStreamer(active *activeConversation, inputs []UserInput) *telegram_utils.TelegramStreamer {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for i := len(inputs) - 1; i >= 0; i-- {
@@ -192,7 +200,7 @@ func (r *ConversationRunner) takeStreamer(active *activeConversation, inputs []U
 	return nil
 }
 
-func (r *ConversationRunner) attachPendingInputs(ctx context.Context, userID, dialogID int64) ([]UserInput, error) {
+func (r *TurnDispatcher) attachPendingInputs(ctx context.Context, userID, dialogID int64) ([]UserInput, error) {
 	var attached []UserInput
 	err := r.db.WithTx(ctx, func(tx *sql.Tx) error {
 		pending, err := r.pending.ListPendingForDialogTx(tx, userID, dialogID, r.maxPending)

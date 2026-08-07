@@ -127,7 +127,7 @@ func main() {
 	voiceService := &services.VoiceService{
 		Client: llmClientProxy.OpenaiClient,
 	}
-	conversationRunner := services.NewConversationRunner(db, pendingInputRepo, traceRepo, textService)
+	turnDispatcher := services.NewTurnDispatcher(db, pendingInputRepo, traceRepo, textService)
 
 	b.Use(func(next tele.HandlerFunc) tele.HandlerFunc {
 		return func(c tele.Context) error {
@@ -158,7 +158,7 @@ func main() {
 		&rateLimiter,
 		textService,
 		voiceService,
-		conversationRunner,
+		turnDispatcher,
 		userRepo,
 		memoryManager,
 		llmClientProxy,
