@@ -120,21 +120,22 @@ func main() {
 		return
 	}
 
-	reminderService := services.NewReminderService(reminderRepo, userRepo, prefRepo, traceStore, b)
+	reminderTools := services.NewReminderTools(reminderRepo, prefRepo)
+	reminderScheduler := services.NewReminderScheduler(reminderRepo, userRepo, prefRepo, traceStore, b)
 	webSearchService := services.NewWebSearchService(os.Getenv("TAVILY_API_KEY"))
-	textService := services.NewTextService(
-		llmClientProxy,
-		userRepo,
-		memoryService,
-		traceStore,
-		episodeStore,
-		memoryPlugin,
-		reminderService,
-		webSearchService,
-		dialogTimeout,
-		appConfig.DefaultModel.ModelId,
-	)
-	reminderService.SetScheduledActionRunner(textService)
+	textService := services.NewTextService(services.TextServiceDeps{
+		Client:           llmClientProxy,
+		UsersRepo:        userRepo,
+		MemoryService:    memoryService,
+		Trace:            traceStore,
+		Episodes:         episodeStore,
+		MemoryPlugin:     memoryPlugin,
+		ReminderTools:    reminderTools,
+		WebSearchService: webSearchService,
+		DialogTimeout:    dialogTimeout,
+		DefaultModel:     appConfig.DefaultModel.ModelId,
+	})
+	reminderScheduler.SetScheduledActionRunner(textService)
 	voiceService := &services.VoiceService{
 		Client: llmClientProxy.OpenaiClient,
 	}
@@ -179,12 +180,12 @@ func main() {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	if err := reminderService.StartScheduler(ctx); err != nil {
+	if err := reminderScheduler.StartScheduler(ctx); err != nil {
 		slog.ErrorContext(ctx, "Error starting reminder scheduler", "error", err)
 		return
 	}
 	defer func() {
-		if err := reminderService.StopScheduler(ctx); err != nil {
+		if err := reminderScheduler.StopScheduler(ctx); err != nil {
 			slog.ErrorContext(ctx, "Error stopping reminder scheduler", "error", err)
 		}
 	}()

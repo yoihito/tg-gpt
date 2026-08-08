@@ -7,7 +7,7 @@ import (
 )
 
 // preferenceKeyTimezone is the canonical key under which the user's IANA timezone
-// lives. ReminderService reads it at fire time, so a malformed value silently breaks
+// lives. ReminderScheduler reads it at fire time, so a malformed value silently breaks
 // recurring reminders — strict validation protects both write paths.
 const preferenceKeyTimezone = "timezone"
 

@@ -20,6 +20,12 @@ func (a *AnthropicAdapter) Provider() llm.Provider {
 	return llm.ProviderAnthropic
 }
 
+// Capabilities always reports none: this adapter doesn't build Anthropic tool_use/
+// tool_result content blocks or image blocks, only plain text. Reporting that honestly
+// (rather than claiming FunctionTools/Vision and dropping them post-hoc) is what makes
+// Runner.Run skip sending tools and reject image input for this provider on its own
+// (runner.go's caps.FunctionTools/caps.Vision checks) instead of failing silently deeper
+// in the request.
 func (a *AnthropicAdapter) Capabilities(model string) llm.Capabilities {
 	return llm.Capabilities{}
 }
@@ -39,6 +45,11 @@ func (a *AnthropicAdapter) Stream(ctx context.Context, request llm.Request) (llm
 			continue
 		}
 		if message.ToolResult != nil {
+			// Reachable even though this adapter never sends tools itself: a dialog can
+			// carry tool_result messages from a turn run against a different provider
+			// before the user switched models. Anthropic's Messages API rejects a
+			// tool_result with no matching tool_use in the same request, so these are
+			// dropped rather than forwarded.
 			continue
 		}
 		anthropicMessages = append(anthropicMessages, anthropic.Message{

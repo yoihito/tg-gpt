@@ -22,11 +22,27 @@ import (
 // of that is delegated to TextService/Runner; this is purely the per-dialog scheduling
 // layer above them (the same shape as one actor/grain per conversation, just scoped to
 // this single process rather than a cluster).
+// turnRunner is the seam TurnDispatcher schedules onto — satisfied by *TextService in
+// production. Keeping it as an interface lets the per-dialog scheduling/coalescing
+// logic be tested against a fake, without needing a full TextService (LLM client,
+// memory subsystem, tool set, ...) just to drive concurrent Submit calls.
+type turnRunner interface {
+	PrepareUserForInput(ctx context.Context, user models.User) (models.User, error)
+	RunAttachedTurn(
+		ctx context.Context,
+		user models.User,
+		mctx TurnContext,
+		inputs []UserInput,
+		streamer *telegram_utils.TelegramStreamer,
+		drainNewInputs func(context.Context) ([]UserInput, error),
+	) (string, error)
+}
+
 type TurnDispatcher struct {
 	db         *database.DB
 	pending    *repositories.PendingInputRepo
 	trace      *repositories.TraceRepo
-	text       *TextService
+	text       turnRunner
 	maxPending int
 
 	mu     sync.Mutex
@@ -48,7 +64,7 @@ func NewTurnDispatcher(
 	db *database.DB,
 	pending *repositories.PendingInputRepo,
 	trace *repositories.TraceRepo,
-	text *TextService,
+	text turnRunner,
 ) *TurnDispatcher {
 	return &TurnDispatcher{
 		db:         db,

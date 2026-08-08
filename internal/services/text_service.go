@@ -11,31 +11,37 @@ import (
 	"vadimgribanov.com/tg-gpt/internal/telegram_utils"
 )
 
-func NewTextService(
-	client LLMClient,
-	usersRepo UsersRepo,
-	memoryService *MemoryService,
-	trace *TraceStore,
-	episodes *EpisodeStore,
-	memoryPlugin *MemoryPlugin,
-	reminderService *ReminderService,
-	webSearchService *WebSearchService,
-	dialogTimeout int64,
-	defaultModel string,
-) *TextService {
+// TextServiceDeps collects NewTextService's dependencies into one struct so a new field
+// is a named addition instead of another position to get right at every call site —
+// matching the RetrievalConfig/ConsolidationConfig/EpisodeConfig pattern already used for
+// the memory constructors it's built alongside.
+type TextServiceDeps struct {
+	Client           LLMClient
+	UsersRepo        UsersRepo
+	MemoryService    *MemoryService
+	Trace            *TraceStore
+	Episodes         *EpisodeStore
+	MemoryPlugin     *MemoryPlugin
+	ReminderTools    *ReminderTools
+	WebSearchService *WebSearchService
+	DialogTimeout    int64
+	DefaultModel     string
+}
+
+func NewTextService(deps TextServiceDeps) *TextService {
 	h := &TextService{
-		client:           client,
-		usersRepo:        usersRepo,
-		memoryService:    memoryService,
-		trace:            trace,
-		episodes:         episodes,
-		reminderService:  reminderService,
-		webSearchService: webSearchService,
-		dialogTimeout:    dialogTimeout,
-		defaultModel:     defaultModel,
+		client:           deps.Client,
+		usersRepo:        deps.UsersRepo,
+		memoryService:    deps.MemoryService,
+		trace:            deps.Trace,
+		episodes:         deps.Episodes,
+		reminderTools:    deps.ReminderTools,
+		webSearchService: deps.WebSearchService,
+		dialogTimeout:    deps.DialogTimeout,
+		defaultModel:     deps.DefaultModel,
 	}
 
-	h.runner = NewRunner(client, memoryPlugin, NewUsagePlugin(usersRepo))
+	h.runner = NewRunner(deps.Client, deps.MemoryPlugin, NewUsagePlugin(deps.UsersRepo))
 	h.defaultAgent = Definition{
 		Name:              "assistant",
 		BuildSystemPrompt: defaultSystemPrompt,
@@ -55,7 +61,7 @@ type TextService struct {
 	memoryService        *MemoryService
 	trace                *TraceStore
 	episodes             *EpisodeStore
-	reminderService      *ReminderService
+	reminderTools        *ReminderTools
 	webSearchService     *WebSearchService
 	dialogTimeout        int64
 	defaultModel         string
@@ -187,8 +193,8 @@ func (h *TextService) buildDefaultToolSet() *ToolSet {
 	ts.RegisterAll(h.memoryService.GetMemoryTools(), func(ctx context.Context, mctx TurnContext, _ models.User, call llm.ToolCall) (string, error) {
 		return h.memoryService.HandleToolCall(ctx, mctx, call)
 	})
-	ts.RegisterAll(h.reminderService.GetReminderTools(), func(_ context.Context, _ TurnContext, user models.User, call llm.ToolCall) (string, error) {
-		return h.reminderService.HandleToolCall(user.Id, call)
+	ts.RegisterAll(h.reminderTools.GetReminderTools(), func(_ context.Context, _ TurnContext, user models.User, call llm.ToolCall) (string, error) {
+		return h.reminderTools.HandleToolCall(user.Id, call)
 	})
 	h.registerWebSearchTools(ts)
 	return ts

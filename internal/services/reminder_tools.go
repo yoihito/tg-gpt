@@ -1,70 +1,43 @@
 package services
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
-	tele "gopkg.in/telebot.v3"
 	"vadimgribanov.com/tg-gpt/internal/llm"
 	"vadimgribanov.com/tg-gpt/internal/models"
 	"vadimgribanov.com/tg-gpt/internal/repositories"
-	"vadimgribanov.com/tg-gpt/internal/telegram_utils"
 	"vadimgribanov.com/tg-gpt/internal/utils"
 )
-
-type ScheduledActionRunner interface {
-	RunScheduledAction(ctx context.Context, user models.User, reminder models.Reminder) (string, error)
-}
-
-type ReminderService struct {
-	reminderRepo *repositories.ReminderRepo
-	userRepo     *repositories.UserRepo
-	prefRepo     *repositories.PreferenceRepo
-	trace        *TraceStore
-	timeParser   *utils.TimeParser
-	bot          *tele.Bot
-	actionRunner ScheduledActionRunner
-
-	ticker    *time.Ticker
-	stopChan  chan struct{}
-	wg        sync.WaitGroup
-	mu        sync.Mutex
-	isRunning bool
-}
-
-func NewReminderService(
-	reminderRepo *repositories.ReminderRepo,
-	userRepo *repositories.UserRepo,
-	prefRepo *repositories.PreferenceRepo,
-	trace *TraceStore,
-	bot *tele.Bot,
-) *ReminderService {
-	return &ReminderService{
-		reminderRepo: reminderRepo,
-		userRepo:     userRepo,
-		prefRepo:     prefRepo,
-		trace:        trace,
-		timeParser:   utils.NewTimeParser(),
-		bot:          bot,
-		stopChan:     make(chan struct{}),
-	}
-}
-
-func (s *ReminderService) SetScheduledActionRunner(actionRunner ScheduledActionRunner) {
-	s.actionRunner = actionRunner
-}
 
 // isoLocalLayout: ISO 8601 without timezone offset; interpreted in the supplied
 // *time.Location at parse time.
 const isoLocalLayout = "2006-01-02T15:04:05"
 
-func (s *ReminderService) GetReminderTools() []llm.Tool {
+// ReminderTools exposes reminder management (create/list/cancel) as LLM tool calls. It
+// owns no scheduling or delivery — see ReminderScheduler for firing reminders once due.
+type ReminderTools struct {
+	reminderRepo *repositories.ReminderRepo
+	prefRepo     *repositories.PreferenceRepo
+	timeParser   *utils.TimeParser
+}
+
+func NewReminderTools(
+	reminderRepo *repositories.ReminderRepo,
+	prefRepo *repositories.PreferenceRepo,
+) *ReminderTools {
+	return &ReminderTools{
+		reminderRepo: reminderRepo,
+		prefRepo:     prefRepo,
+		timeParser:   utils.NewTimeParser(),
+	}
+}
+
+func (s *ReminderTools) GetReminderTools() []llm.Tool {
 	return []llm.Tool{
 		{
 			Name:        "create_one_shot_reminder",
@@ -166,7 +139,7 @@ func (s *ReminderService) GetReminderTools() []llm.Tool {
 	}
 }
 
-func (s *ReminderService) HandleToolCall(userID int64, toolCall llm.ToolCall) (string, error) {
+func (s *ReminderTools) HandleToolCall(userID int64, toolCall llm.ToolCall) (string, error) {
 	if toolCall.Name == "list_reminders" {
 		return s.handleListReminders(userID)
 	}
@@ -187,7 +160,7 @@ func (s *ReminderService) HandleToolCall(userID int64, toolCall llm.ToolCall) (s
 	}
 }
 
-func (s *ReminderService) handleCreateOneShotReminder(userID int64, arguments string) (string, error) {
+func (s *ReminderTools) handleCreateOneShotReminder(userID int64, arguments string) (string, error) {
 	var args struct {
 		TimeExpression string `json:"time_expression"`
 		Message        string `json:"message"`
@@ -234,7 +207,7 @@ func (s *ReminderService) handleCreateOneShotReminder(userID int64, arguments st
 	return fmt.Sprintf("Reminder set for %s: %s", timeStr, args.Message), nil
 }
 
-func (s *ReminderService) handleCreateRecurringReminder(userID int64, arguments string) (string, error) {
+func (s *ReminderTools) handleCreateRecurringReminder(userID int64, arguments string) (string, error) {
 	var args struct {
 		Message      string `json:"message"`
 		Timezone     string `json:"timezone"`
@@ -344,7 +317,7 @@ func normalizeReminderAction(actionTypeRaw, actionPromptRaw string) (models.Remi
 	}
 }
 
-func (s *ReminderService) handleListReminders(userID int64) (string, error) {
+func (s *ReminderTools) handleListReminders(userID int64) (string, error) {
 	reminders, err := s.reminderRepo.GetActiveRemindersForUser(userID)
 	if err != nil {
 		return "", err
@@ -353,7 +326,7 @@ func (s *ReminderService) handleListReminders(userID int64) (string, error) {
 		return "No active reminders found", nil
 	}
 
-	loc, _ := s.getUserTimezone(userID)
+	loc, _ := lookupUserTimezone(s.prefRepo, userID)
 	if loc == nil {
 		loc = time.UTC
 	}
@@ -374,7 +347,7 @@ func (s *ReminderService) handleListReminders(userID int64) (string, error) {
 	return b.String(), nil
 }
 
-func (s *ReminderService) handleCancelReminder(userID int64, arguments string) (string, error) {
+func (s *ReminderTools) handleCancelReminder(userID int64, arguments string) (string, error) {
 	var args struct {
 		ReminderID string `json:"reminder_id"`
 	}
@@ -395,8 +368,12 @@ func (s *ReminderService) handleCancelReminder(userID int64, arguments string) (
 	return fmt.Sprintf("Reminder #%d cancelled", reminderID), nil
 }
 
-func (s *ReminderService) getUserTimezone(userID int64) (*time.Location, error) {
-	pref, err := s.prefRepo.Get(userID, "timezone")
+// lookupUserTimezone resolves a user's stored 'timezone' preference. Both ReminderTools
+// (listing reminders in the user's local time) and ReminderScheduler (calculating a
+// recurring reminder's next occurrence) need this same lookup at different points in
+// the reminder lifecycle.
+func lookupUserTimezone(prefRepo *repositories.PreferenceRepo, userID int64) (*time.Location, error) {
+	pref, err := prefRepo.Get(userID, "timezone")
 	if err != nil {
 		return nil, fmt.Errorf("read timezone preference: %w", err)
 	}
@@ -408,209 +385,4 @@ func (s *ReminderService) getUserTimezone(userID int64) (*time.Location, error) 
 		return nil, fmt.Errorf("invalid stored timezone %q: %w", pref.PrefValue, err)
 	}
 	return loc, nil
-}
-
-func (s *ReminderService) StartScheduler(ctx context.Context) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.isRunning {
-		return fmt.Errorf("scheduler already running")
-	}
-	s.ticker = time.NewTicker(30 * time.Second)
-	s.isRunning = true
-	s.wg.Add(1)
-	go s.schedulerLoop(ctx)
-	slog.InfoContext(ctx, "Reminder scheduler started")
-	return nil
-}
-
-func (s *ReminderService) StopScheduler(ctx context.Context) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if !s.isRunning {
-		return nil
-	}
-	slog.InfoContext(ctx, "Stopping reminder scheduler")
-	close(s.stopChan)
-	s.ticker.Stop()
-	s.wg.Wait()
-	s.isRunning = false
-	slog.InfoContext(ctx, "Reminder scheduler stopped")
-	return nil
-}
-
-func (s *ReminderService) schedulerLoop(ctx context.Context) {
-	defer s.wg.Done()
-	slog.InfoContext(ctx, "Scheduler loop started")
-	for {
-		select {
-		case <-s.stopChan:
-			slog.InfoContext(ctx, "Scheduler loop stopping")
-			return
-		case <-s.ticker.C:
-			s.checkAndFireReminders(ctx)
-		}
-	}
-}
-
-func (s *ReminderService) checkAndFireReminders(ctx context.Context) {
-	dueReminders, err := s.reminderRepo.GetDueReminders(time.Now())
-	if err != nil {
-		slog.ErrorContext(ctx, "Failed to fetch due reminders", "error", err)
-		return
-	}
-	if len(dueReminders) == 0 {
-		return
-	}
-	slog.InfoContext(ctx, "Found due reminders", "count", len(dueReminders))
-	for _, reminder := range dueReminders {
-		s.fireReminder(ctx, reminder)
-	}
-}
-
-func (s *ReminderService) fireReminder(ctx context.Context, reminder models.Reminder) {
-	slog.InfoContext(ctx, "Firing reminder", "reminder_id", reminder.ID, "user_id", reminder.UserID)
-
-	claimed, err := s.reminderRepo.ClaimReminder(reminder.ID, time.Now())
-	if err != nil {
-		slog.ErrorContext(ctx, "Failed to claim reminder", "error", err, "reminder_id", reminder.ID)
-		return
-	}
-	if !claimed {
-		slog.InfoContext(ctx, "Reminder already claimed or closed", "reminder_id", reminder.ID)
-		return
-	}
-
-	user, err := s.userRepo.GetUser(reminder.UserID)
-	if err != nil {
-		slog.ErrorContext(ctx, "Failed to get user for reminder", "error", err, "user_id", reminder.UserID)
-		s.releaseReminderClaim(ctx, reminder.ID)
-		return
-	}
-
-	if reminder.ActionType == models.ReminderActionPrompt {
-		s.fireScheduledAction(ctx, user, reminder)
-		return
-	}
-
-	naturalMessages := []string{
-		"Hey! Just wanted to remind you: %s",
-		"Hi there! You asked me to remind you: %s",
-		"Reminder! Don't forget: %s",
-		"Hey, it's time! Remember: %s",
-		"Quick reminder: %s",
-		"Just a heads up: %s",
-	}
-	messageFormat := naturalMessages[time.Now().UnixNano()%int64(len(naturalMessages))]
-	naturalMessage := fmt.Sprintf(messageFormat, reminder.Message)
-
-	sentMsg, err := s.bot.Send(&tele.User{ID: user.ChatId}, naturalMessage)
-	if err != nil {
-		slog.ErrorContext(ctx, "Failed to send reminder", "error", err, "reminder_id", reminder.ID)
-		s.releaseReminderClaim(ctx, reminder.ID)
-		return
-	}
-
-	if err := s.userRepo.Touch(user.Id, time.Now().Unix()); err != nil {
-		slog.ErrorContext(ctx, "Failed to update user last interaction", "error", err, "user_id", reminder.UserID)
-	}
-
-	syntheticUserText := fmt.Sprintf("[Reminder triggered for: %s]", reminder.Message)
-	if err := s.trace.RecordReminderFire(user.Id, user.CurrentDialogId, syntheticUserText, naturalMessage, int64(sentMsg.ID)); err != nil {
-		slog.ErrorContext(ctx, "Failed to save reminder to trace", "error", err, "reminder_id", reminder.ID)
-	}
-
-	if reminder.IsRecurring && !reminder.HasExpiredRecurrence() {
-		s.rescheduleRecurring(ctx, reminder)
-		return
-	}
-
-	if err := s.reminderRepo.MarkReminderFired(reminder.ID, time.Now()); err != nil {
-		slog.ErrorContext(ctx, "Failed to mark reminder as fired", "error", err, "reminder_id", reminder.ID)
-	}
-	slog.InfoContext(ctx, "Reminder fired", "reminder_id", reminder.ID)
-}
-
-func (s *ReminderService) fireScheduledAction(ctx context.Context, user models.User, reminder models.Reminder) {
-	if s.actionRunner == nil {
-		slog.ErrorContext(ctx, "No scheduled action runner configured", "reminder_id", reminder.ID)
-		s.releaseReminderClaim(ctx, reminder.ID)
-		return
-	}
-
-	response, err := s.actionRunner.RunScheduledAction(ctx, user, reminder)
-	if err != nil {
-		slog.ErrorContext(ctx, "Failed to run scheduled action", "error", err, "reminder_id", reminder.ID)
-		s.releaseReminderClaim(ctx, reminder.ID)
-		return
-	}
-
-	if err := s.sendBotMessage(ctx, user.ChatId, response); err != nil {
-		slog.ErrorContext(ctx, "Failed to send scheduled action result", "error", err, "reminder_id", reminder.ID)
-		s.releaseReminderClaim(ctx, reminder.ID)
-		return
-	}
-
-	if reminder.IsRecurring && !reminder.HasExpiredRecurrence() {
-		s.rescheduleRecurring(ctx, reminder)
-		return
-	}
-
-	if err := s.reminderRepo.MarkReminderFired(reminder.ID, time.Now()); err != nil {
-		slog.ErrorContext(ctx, "Failed to mark scheduled action as fired", "error", err, "reminder_id", reminder.ID)
-	}
-	slog.InfoContext(ctx, "Scheduled action fired", "reminder_id", reminder.ID)
-}
-
-func (s *ReminderService) sendBotMessage(ctx context.Context, chatID int64, text string) error {
-	if strings.TrimSpace(text) == "" {
-		text = "Scheduled action completed, but returned no text."
-	}
-	for len(text) > 0 {
-		chunk := text
-		if len(chunk) > telegram_utils.MaxTelegramMessageLength {
-			chunk = text[:telegram_utils.MaxTelegramMessageLength]
-		}
-		if _, err := s.bot.Send(&tele.User{ID: chatID}, telegram_utils.FixMarkdown(chunk), &tele.SendOptions{ParseMode: tele.ModeMarkdown}); err != nil {
-			slog.WarnContext(ctx, "Failed to send markdown message; retrying as plain text", "error", err)
-			if _, fallbackErr := s.bot.Send(&tele.User{ID: chatID}, chunk, &tele.SendOptions{ParseMode: tele.ModeDefault}); fallbackErr != nil {
-				return fallbackErr
-			}
-		}
-		text = text[len(chunk):]
-	}
-	return nil
-}
-
-func (s *ReminderService) releaseReminderClaim(ctx context.Context, reminderID int64) {
-	if err := s.reminderRepo.ReleaseReminderClaim(reminderID); err != nil {
-		slog.ErrorContext(ctx, "Failed to release reminder claim", "error", err, "reminder_id", reminderID)
-	}
-}
-
-func (s *ReminderService) rescheduleRecurring(ctx context.Context, reminder models.Reminder) {
-	loc, err := s.getUserTimezone(reminder.UserID)
-	if err != nil {
-		slog.WarnContext(ctx, "No timezone preference for recurring reminder; falling back to UTC", "error", err, "reminder_id", reminder.ID)
-		loc = time.UTC
-	}
-
-	nextTime := reminder.CalculateNextOccurrence(loc)
-	if nextTime == nil {
-		// Recurrence ended (past until-date or unsupported type) — close it out.
-		if err := s.reminderRepo.MarkReminderFired(reminder.ID, time.Now()); err != nil {
-			slog.ErrorContext(ctx, "Failed to mark expired recurring reminder", "error", err, "reminder_id", reminder.ID)
-		}
-		slog.InfoContext(ctx, "Recurring reminder closed (no more occurrences)", "reminder_id", reminder.ID)
-		return
-	}
-
-	if err := s.reminderRepo.UpdateNextOccurrence(reminder.ID, *nextTime, time.Now()); err != nil {
-		slog.ErrorContext(ctx, "Failed to update next occurrence", "error", err, "reminder_id", reminder.ID)
-		return
-	}
-	slog.InfoContext(ctx, "Recurring reminder rescheduled",
-		"reminder_id", reminder.ID,
-		"next_time", nextTime,
-	)
 }

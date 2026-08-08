@@ -21,23 +21,27 @@ func NewDB(dbPath string) (*DB, error) {
 		return nil, fmt.Errorf("failed to create database directory: %w", err)
 	}
 
-	db, err := sql.Open("sqlite", dbPath)
+	// Pragmas are passed via the DSN (rather than a one-off db.Exec after opening) so
+	// the driver applies them to every pooled connection it opens, not just whichever
+	// connection happens to run the first Exec. Without this, concurrent writers from
+	// different dialogs could hit SQLITE_BUSY on a fresh connection that never got
+	// busy_timeout set, instead of waiting on it as intended.
+	//
+	// _txlock=immediate makes every transaction take the write lock at BEGIN instead
+	// of on its first write statement. With the default "deferred" locking, two
+	// concurrent transactions that each start with a read (as WithTx callers commonly
+	// do) can each establish a read snapshot and then have one of them rejected with
+	// SQLITE_BUSY_SNAPSHOT on its first write — a WAL-mode "upgrade" conflict that
+	// busy_timeout's retry-on-lock-wait does not cover, since the connection isn't
+	// waiting on a lock, its snapshot is simply stale.
+	dsn := dbPath + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)&_txlock=immediate"
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
 
 	if err = db.Ping(); err != nil {
 		return nil, fmt.Errorf("failed to ping database: %w", err)
-	}
-
-	for _, pragma := range []string{
-		"PRAGMA journal_mode=WAL",
-		"PRAGMA foreign_keys=ON",
-		"PRAGMA busy_timeout=5000",
-	} {
-		if _, err := db.Exec(pragma); err != nil {
-			return nil, fmt.Errorf("failed to set %s: %w", pragma, err)
-		}
 	}
 
 	return &DB{db}, nil

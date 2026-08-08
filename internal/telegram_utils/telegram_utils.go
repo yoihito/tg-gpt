@@ -113,6 +113,28 @@ func (t *TelegramStreamer) Flush() error {
 	return nil
 }
 
+// SendChunked sends text to recipient as one or more Telegram messages, splitting at
+// MaxTelegramMessageLength and falling back to plain text if a chunk's Markdown fails to
+// parse. This is the one-shot sibling of TelegramStreamer.Flush — both implement the same
+// "try Markdown, fall back to plain, respect the length limit" contract for the same API,
+// so every caller that needs to push text to a chat outside a live stream shares this
+// instead of writing its own copy.
+func SendChunked(bot *tele.Bot, recipient tele.Recipient, text string) error {
+	for len(text) > 0 {
+		chunk := text
+		if len(chunk) > MaxTelegramMessageLength {
+			chunk = text[:MaxTelegramMessageLength]
+		}
+		if _, err := bot.Send(recipient, FixMarkdown(chunk), &tele.SendOptions{ParseMode: tele.ModeMarkdown}); err != nil {
+			if _, fallbackErr := bot.Send(recipient, chunk, &tele.SendOptions{ParseMode: tele.ModeDefault}); fallbackErr != nil {
+				return fallbackErr
+			}
+		}
+		text = text[len(chunk):]
+	}
+	return nil
+}
+
 func FixMarkdown(markdown string) string {
 	tag := GetUnclosedTag(markdown)
 	if tag == "" {

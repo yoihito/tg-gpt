@@ -329,23 +329,23 @@ func newTextServiceIntegrationHarness(t *testing.T, streams [][]llm.StreamEvent)
 	memoryPlugin := NewMemoryPlugin(traceStore, retriever, consolidator)
 
 	memoryService := NewMemoryService(prefRepo, consolidator, episodeStore)
-	reminderService := NewReminderService(reminderRepo, userRepo, prefRepo, traceStore, nil)
+	reminderTools := NewReminderTools(reminderRepo, prefRepo)
 	llmClient := &fakeLLMClient{
 		models:  map[string]struct{}{"test-model": {}},
 		streams: streams,
 	}
-	textService := NewTextService(
-		llmClient,
-		userRepo,
-		memoryService,
-		traceStore,
-		episodeStore,
-		memoryPlugin,
-		reminderService,
-		nil,
-		int64(time.Hour.Seconds()),
-		"test-model",
-	)
+	textService := NewTextService(TextServiceDeps{
+		Client:           llmClient,
+		UsersRepo:        userRepo,
+		MemoryService:    memoryService,
+		Trace:            traceStore,
+		Episodes:         episodeStore,
+		MemoryPlugin:     memoryPlugin,
+		ReminderTools:    reminderTools,
+		WebSearchService: nil,
+		DialogTimeout:    int64(time.Hour.Seconds()),
+		DefaultModel:     "test-model",
+	})
 
 	user, err := userRepo.Register(12345, "Vadim", "", "vadim", 54321, true, "test-model")
 	if err != nil {

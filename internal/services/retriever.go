@@ -114,69 +114,44 @@ func (r *Retriever) embedQuery(ctx context.Context, query string) (emb []float32
 }
 
 func (r *Retriever) retrieveEpisodes(ctx context.Context, userID int64, query string, queryEmb []float32, hasQueryEmb bool) ([]models.Episode, error) {
-	q := strings.TrimSpace(query)
-	if len(q) < 3 || r.cfg.EpisodesTopK == 0 {
+	if r.cfg.EpisodesTopK == 0 {
 		return nil, nil
 	}
-
-	const candidateLimit = 20
-
-	lexicalIDs, err := r.episodes.SearchLexical(userID, q, candidateLimit)
-	if err != nil {
-		return nil, fmt.Errorf("lexical episode search: %w", err)
-	}
-
-	all, err := r.episodes.ListAll(userID)
-	if err != nil {
-		return nil, fmt.Errorf("list episodes: %w", err)
-	}
-
-	var vectorIDs []int64
-	if len(all) > 0 && hasQueryEmb {
-		type scored struct {
-			id    int64
-			score float32
-		}
-		scoredAll := make([]scored, 0, len(all))
-		for _, e := range all {
-			if e.EmbeddingModel != r.embedder.Model() {
-				continue
-			}
-			scoredAll = append(scoredAll, scored{id: e.ID, score: vec.Cosine(queryEmb, e.Embedding)})
-		}
-		sort.Slice(scoredAll, func(i, j int) bool { return scoredAll[i].score > scoredAll[j].score })
-		limit := candidateLimit
-		if limit > len(scoredAll) {
-			limit = len(scoredAll)
-		}
-		vectorIDs = make([]int64, 0, limit)
-		for i := 0; i < limit; i++ {
-			vectorIDs = append(vectorIDs, scoredAll[i].id)
-		}
-	}
-
-	fusedIDs := rrfFuse(lexicalIDs, vectorIDs, r.cfg.EpisodesTopK)
-	if len(fusedIDs) == 0 {
-		return nil, nil
-	}
-	eps, err := r.episodes.GetByIDs(fusedIDs)
-	if err != nil {
-		return nil, fmt.Errorf("load fused episodes: %w", err)
-	}
-	idx := make(map[int64]models.Episode, len(eps))
-	for _, e := range eps {
-		idx[e.ID] = e
-	}
-	ordered := make([]models.Episode, 0, len(fusedIDs))
-	for _, id := range fusedIDs {
-		if e, ok := idx[id]; ok {
-			ordered = append(ordered, e)
-		}
-	}
-	return ordered, nil
+	return hybridSearch(
+		userID, query, queryEmb, hasQueryEmb, r.embedder.Model(), r.cfg.EpisodesTopK,
+		r.episodes.SearchLexical,
+		r.episodes.ListAll,
+		func(e models.Episode) (int64, string, []float32) { return e.ID, e.EmbeddingModel, e.Embedding },
+		r.episodes.GetByIDs,
+	)
 }
 
 func (r *Retriever) retrieveFacts(ctx context.Context, userID int64, query string, queryEmb []float32, hasQueryEmb bool) ([]models.Fact, error) {
+	return hybridSearch(
+		userID, query, queryEmb, hasQueryEmb, r.embedder.Model(), r.cfg.FactsTopK,
+		r.facts.SearchLexical,
+		r.facts.ListActive,
+		func(f models.Fact) (int64, string, []float32) { return f.ID, f.EmbeddingModel, f.Embedding },
+		r.facts.GetByIDs,
+	)
+}
+
+// hybridSearch is the retrieval algorithm shared by every memory kind: rank candidates
+// lexically (FTS5) and by cosine similarity against the query embedding, fuse the two
+// rankings (RRF), then load and order the fused items. Each kind supplies only how to
+// fetch its own candidates and how to read an id/embedding off one.
+func hybridSearch[T any](
+	userID int64,
+	query string,
+	queryEmb []float32,
+	hasQueryEmb bool,
+	embedderModel string,
+	topN int,
+	searchLexical func(userID int64, query string, limit int) ([]int64, error),
+	listCandidates func(userID int64) ([]T, error),
+	embeddingOf func(T) (id int64, embeddingModel string, embedding []float32),
+	getByIDs func(ids []int64) ([]T, error),
+) ([]T, error) {
 	q := strings.TrimSpace(query)
 	if len(q) < 3 {
 		return nil, nil
@@ -184,28 +159,28 @@ func (r *Retriever) retrieveFacts(ctx context.Context, userID int64, query strin
 
 	const candidateLimit = 20
 
-	lexicalIDs, err := r.facts.SearchLexical(userID, q, candidateLimit)
+	lexicalIDs, err := searchLexical(userID, q, candidateLimit)
 	if err != nil {
 		return nil, fmt.Errorf("lexical search: %w", err)
 	}
 
-	active, err := r.facts.ListActive(userID)
-	if err != nil {
-		return nil, fmt.Errorf("list active facts: %w", err)
-	}
-
 	var vectorIDs []int64
-	if len(active) > 0 && hasQueryEmb {
+	if hasQueryEmb {
+		candidates, err := listCandidates(userID)
+		if err != nil {
+			return nil, fmt.Errorf("list candidates: %w", err)
+		}
 		type scored struct {
 			id    int64
 			score float32
 		}
-		scoredAll := make([]scored, 0, len(active))
-		for _, f := range active {
-			if f.EmbeddingModel != r.embedder.Model() {
+		scoredAll := make([]scored, 0, len(candidates))
+		for _, c := range candidates {
+			id, model, embedding := embeddingOf(c)
+			if model != embedderModel {
 				continue
 			}
-			scoredAll = append(scoredAll, scored{id: f.ID, score: vec.Cosine(queryEmb, f.Embedding)})
+			scoredAll = append(scoredAll, scored{id: id, score: vec.Cosine(queryEmb, embedding)})
 		}
 		sort.Slice(scoredAll, func(i, j int) bool { return scoredAll[i].score > scoredAll[j].score })
 		limit := candidateLimit
@@ -218,22 +193,23 @@ func (r *Retriever) retrieveFacts(ctx context.Context, userID int64, query strin
 		}
 	}
 
-	fusedIDs := rrfFuse(lexicalIDs, vectorIDs, r.cfg.FactsTopK)
+	fusedIDs := rrfFuse(lexicalIDs, vectorIDs, topN)
 	if len(fusedIDs) == 0 {
 		return nil, nil
 	}
-	facts, err := r.facts.GetByIDs(fusedIDs)
+	items, err := getByIDs(fusedIDs)
 	if err != nil {
-		return nil, fmt.Errorf("load fused facts: %w", err)
+		return nil, fmt.Errorf("load fused items: %w", err)
 	}
-	idx := make(map[int64]models.Fact, len(facts))
-	for _, f := range facts {
-		idx[f.ID] = f
+	idx := make(map[int64]T, len(items))
+	for _, item := range items {
+		id, _, _ := embeddingOf(item)
+		idx[id] = item
 	}
-	ordered := make([]models.Fact, 0, len(fusedIDs))
+	ordered := make([]T, 0, len(fusedIDs))
 	for _, id := range fusedIDs {
-		if f, ok := idx[id]; ok {
-			ordered = append(ordered, f)
+		if item, ok := idx[id]; ok {
+			ordered = append(ordered, item)
 		}
 	}
 	return ordered, nil
