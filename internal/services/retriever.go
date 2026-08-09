@@ -17,9 +17,9 @@ import (
 
 // RetrievalConfig bounds how much of each memory kind Retrieve pulls in for a query.
 type RetrievalConfig struct {
-	FactsTopK         int
-	EpisodesTopK      int
-	RecentTraceEvents int
+	FactsTopK    int
+	EpisodesTopK int
+	RecentTurns  int
 }
 
 // Retriever assembles the memory context for a turn: all preferences, top-K facts and
@@ -72,7 +72,7 @@ func (r *Retriever) Retrieve(ctx context.Context, mctx TurnContext, query string
 	}
 	out.Preferences = prefs
 
-	recent, err := r.trace.GetRecent(mctx.UserID, mctx.DialogID, r.cfg.RecentTraceEvents)
+	recent, err := r.trace.GetRecentTurns(mctx.UserID, mctx.DialogID, r.cfg.RecentTurns)
 	if err != nil {
 		return out, fmt.Errorf("get recent trace: %w", err)
 	}
@@ -266,15 +266,9 @@ func (r *Retriever) AssemblePrompt(systemHeader string, retrieved RetrievedMemor
 	messages := []llm.Message{
 		{Role: llm.RoleSystem, Content: sys.String()},
 	}
-	// Trim leading trace events until we hit a user_msg so we never start the replay
-	// mid-tool-call-group (which would leave an orphan `role: tool` message that OpenAI rejects).
-	start := 0
-	for ; start < len(retrieved.RecentTrace); start++ {
-		if retrieved.RecentTrace[start].EventType == models.EventTypeUserMsg {
-			break
-		}
-	}
-	messages = appendTraceMessages(messages, retrieved.RecentTrace[start:])
+	// RecentTrace always starts at a user_msg (GetRecentTurns bounds the window by whole
+	// turns), so there's no partial leading tool-call group to trim here.
+	messages = appendTraceMessages(messages, retrieved.RecentTrace)
 	return messages
 }
 

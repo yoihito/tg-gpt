@@ -41,7 +41,7 @@ type turnRunner interface {
 type TurnDispatcher struct {
 	db         *database.DB
 	pending    *repositories.PendingInputRepo
-	trace      *repositories.TraceRepo
+	trace      *TraceStore
 	text       turnRunner
 	maxPending int
 
@@ -63,7 +63,7 @@ type activeConversation struct {
 func NewTurnDispatcher(
 	db *database.DB,
 	pending *repositories.PendingInputRepo,
-	trace *repositories.TraceRepo,
+	trace *TraceStore,
 	text turnRunner,
 ) *TurnDispatcher {
 	return &TurnDispatcher{
@@ -227,16 +227,11 @@ func (r *TurnDispatcher) attachPendingInputs(ctx context.Context, userID, dialog
 			return nil
 		}
 
-		events := make([]repositories.AppendEventInput, 0, len(pending))
+		msgs := make([]UserMsgBatchInput, 0, len(pending))
 		for _, input := range pending {
-			tgMsgID := input.TgMessageID
-			events = append(events, repositories.AppendEventInput{
-				EventType:   models.EventTypeUserMsg,
-				Payload:     models.UserMsgPayload{Content: input.Message.Content, MultiContent: input.Message.Parts},
-				TgMessageID: &tgMsgID,
-			})
+			msgs = append(msgs, UserMsgBatchInput{Message: input.Message, TgMessageID: input.TgMessageID})
 		}
-		traceIDs, err := r.trace.AppendBatchTx(tx, userID, dialogID, events)
+		traceIDs, err := r.trace.AppendUserMsgBatchTx(tx, userID, dialogID, msgs)
 		if err != nil {
 			return err
 		}

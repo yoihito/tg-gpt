@@ -124,10 +124,10 @@ func newTurnDispatcherHarness(t *testing.T) *turnDispatcherHarness {
 	}
 
 	pendingRepo := repositories.NewPendingInputRepo(db)
-	traceRepo := repositories.NewTraceRepo(db)
+	traceStore := NewTraceStore(repositories.NewTraceRepo(db))
 	userRepo := repositories.NewUserRepo(db)
 	fake := &fakeTurnRunner{}
-	dispatcher := NewTurnDispatcher(db, pendingRepo, traceRepo, fake)
+	dispatcher := NewTurnDispatcher(db, pendingRepo, traceStore, fake)
 
 	user, err := userRepo.Register(1001, "Test", "", "test", 5001, true, "test-model")
 	if err != nil {

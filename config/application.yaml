@@ -19,6 +19,6 @@ memory:
   retrieval:
     facts_top_k: 5
     episodes_top_k: 2
-    recent_trace_events: 8
+    recent_turns: 6
   episode:
     min_turns: 3

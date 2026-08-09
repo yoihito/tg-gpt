@@ -21,9 +21,9 @@ type MemoryThresholds struct {
 }
 
 type MemoryRetrieval struct {
-	FactsTopK         int `yaml:"facts_top_k"`
-	EpisodesTopK      int `yaml:"episodes_top_k"`
-	RecentTraceEvents int `yaml:"recent_trace_events"`
+	FactsTopK    int `yaml:"facts_top_k"`
+	EpisodesTopK int `yaml:"episodes_top_k"`
+	RecentTurns  int `yaml:"recent_turns"`
 }
 
 type MemoryEpisode struct {
@@ -96,8 +96,8 @@ func applyMemoryDefaults(m *MemoryConfig) {
 	if m.Retrieval.EpisodesTopK == 0 {
 		m.Retrieval.EpisodesTopK = 2
 	}
-	if m.Retrieval.RecentTraceEvents == 0 {
-		m.Retrieval.RecentTraceEvents = 8
+	if m.Retrieval.RecentTurns == 0 {
+		m.Retrieval.RecentTurns = 6
 	}
 	if m.Episode.MinTurns == 0 {
 		m.Episode.MinTurns = 3

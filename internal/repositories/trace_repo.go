@@ -153,22 +153,44 @@ func (r *TraceRepo) GetAllForDialog(userID, dialogID int64) ([]models.TraceEvent
 	return scanTraceEvents(rows)
 }
 
-// GetRecent returns the last `limit` events for (user_id, dialog_id), oldest first.
-func (r *TraceRepo) GetRecent(userID, dialogID int64, limit int) ([]models.TraceEvent, error) {
-	rows, err := r.db.Query(
-		`SELECT id, user_id, dialog_id, turn_index, event_type, payload, tg_message_id, model, created_at
-		 FROM (
-			 SELECT id, user_id, dialog_id, turn_index, event_type, payload, tg_message_id, model, created_at
-			 FROM trace_events
-			 WHERE user_id = ? AND dialog_id = ?
-			 ORDER BY turn_index DESC
-			 LIMIT ?
-		 )
-		 ORDER BY turn_index ASC`,
-		userID, dialogID, limit,
-	)
+// GetRecentTurns returns every event from the start of the `numTurns`-most-recent turn
+// onward (oldest first), where a turn is delimited by a user_msg event — the only event
+// type a turn ever starts with. This bounds the window by whole turns rather than raw
+// event count, so a turn with several tool calls (which appends a model_msg per round
+// plus a tool_result per call) still comes back complete instead of straddling the
+// window boundary. Returns the entire dialog if it has fewer than numTurns turns.
+func (r *TraceRepo) GetRecentTurns(userID, dialogID int64, numTurns int) ([]models.TraceEvent, error) {
+	if numTurns <= 0 {
+		return nil, nil
+	}
+
+	var minTurnIndex int64
+	hasBoundary := true
+	err := r.db.QueryRow(
+		`SELECT turn_index FROM trace_events
+		 WHERE user_id = ? AND dialog_id = ? AND event_type = ?
+		 ORDER BY turn_index DESC
+		 LIMIT 1 OFFSET ?`,
+		userID, dialogID, models.EventTypeUserMsg, numTurns-1,
+	).Scan(&minTurnIndex)
+	if err == sql.ErrNoRows {
+		hasBoundary = false
+	} else if err != nil {
+		return nil, fmt.Errorf("find turn boundary: %w", err)
+	}
+
+	query := `SELECT id, user_id, dialog_id, turn_index, event_type, payload, tg_message_id, model, created_at
+	          FROM trace_events WHERE user_id = ? AND dialog_id = ?`
+	args := []any{userID, dialogID}
+	if hasBoundary {
+		query += ` AND turn_index >= ?`
+		args = append(args, minTurnIndex)
+	}
+	query += ` ORDER BY turn_index ASC`
+
+	rows, err := r.db.Query(query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("query recent trace: %w", err)
+		return nil, fmt.Errorf("query recent turns: %w", err)
 	}
 	defer rows.Close()
 

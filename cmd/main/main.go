@@ -88,9 +88,9 @@ func main() {
 	retriever := services.NewRetriever(
 		traceRepo, prefRepo, factRepo, episodeRepo, embedder,
 		services.RetrievalConfig{
-			FactsTopK:         appConfig.Memory.Retrieval.FactsTopK,
-			EpisodesTopK:      appConfig.Memory.Retrieval.EpisodesTopK,
-			RecentTraceEvents: appConfig.Memory.Retrieval.RecentTraceEvents,
+			FactsTopK:    appConfig.Memory.Retrieval.FactsTopK,
+			EpisodesTopK: appConfig.Memory.Retrieval.EpisodesTopK,
+			RecentTurns:  appConfig.Memory.Retrieval.RecentTurns,
 		},
 	)
 	consolidator := services.NewMemoryConsolidator(
@@ -139,7 +139,7 @@ func main() {
 	voiceService := &services.VoiceService{
 		Client: llmClientProxy.OpenaiClient,
 	}
-	turnDispatcher := services.NewTurnDispatcher(db, pendingInputRepo, traceRepo, textService)
+	turnDispatcher := services.NewTurnDispatcher(db, pendingInputRepo, traceStore, textService)
 
 	b.Use(func(next tele.HandlerFunc) tele.HandlerFunc {
 		return func(c tele.Context) error {

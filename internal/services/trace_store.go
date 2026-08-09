@@ -1,6 +1,7 @@
 package services
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 
@@ -53,6 +54,38 @@ func (t *TraceStore) BeginTurn(
 		return TurnContext{}, fmt.Errorf("append user_msg: %w", err)
 	}
 	return TurnContext{UserID: userID, DialogID: dialogID, UserTraceID: id}, nil
+}
+
+// UserMsgBatchInput is one message to attach as a user_msg trace event via
+// AppendUserMsgBatchTx.
+type UserMsgBatchInput struct {
+	Message     llm.Message
+	TgMessageID int64
+}
+
+// AppendUserMsgBatchTx appends a batch of user_msg trace events within tx, using the same
+// event shape BeginTurn uses for a single message. TurnDispatcher uses this to attach a
+// burst of coalesced messages atomically alongside PendingInputRepo's own tx-scoped writes,
+// so there's one place that knows how a user_msg trace event is shaped, not two.
+func (t *TraceStore) AppendUserMsgBatchTx(
+	tx *sql.Tx,
+	userID, dialogID int64,
+	msgs []UserMsgBatchInput,
+) ([]int64, error) {
+	events := make([]repositories.AppendEventInput, 0, len(msgs))
+	for _, m := range msgs {
+		var tgPtr *int64
+		if m.TgMessageID != 0 {
+			id := m.TgMessageID
+			tgPtr = &id
+		}
+		events = append(events, repositories.AppendEventInput{
+			EventType:   models.EventTypeUserMsg,
+			Payload:     models.UserMsgPayload{Content: m.Message.Content, MultiContent: m.Message.Parts},
+			TgMessageID: tgPtr,
+		})
+	}
+	return t.trace.AppendBatchTx(tx, userID, dialogID, events)
 }
 
 // PopForRetry deletes the most recent user_msg event and everything after it in the

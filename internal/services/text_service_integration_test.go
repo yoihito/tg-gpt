@@ -316,9 +316,9 @@ func newTextServiceIntegrationHarness(t *testing.T, streams [][]llm.StreamEvent)
 
 	traceStore := NewTraceStore(traceRepo)
 	retriever := NewRetriever(traceRepo, prefRepo, factRepo, episodeRepo, embedder, RetrievalConfig{
-		FactsTopK:         3,
-		EpisodesTopK:      3,
-		RecentTraceEvents: 20,
+		FactsTopK:    3,
+		EpisodesTopK: 3,
+		RecentTurns:  10,
 	})
 	consolidator := NewMemoryConsolidator(prefRepo, factRepo, embedder, extractor, ConsolidationConfig{
 		FactConfidenceMin:   0.8,
