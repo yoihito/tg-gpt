@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
+	"time"
 
 	"vadimgribanov.com/tg-gpt/internal/llm"
 	"vadimgribanov.com/tg-gpt/internal/models"
@@ -70,9 +72,18 @@ func (s *ToolSet) Lookup(name string) (llm.Tool, bool) {
 func (s *ToolSet) Execute(ctx context.Context, mctx TurnContext, user models.User, call llm.ToolCall) (string, error) {
 	handler, ok := s.handlers[call.Name]
 	if !ok {
+		slog.WarnContext(ctx, "Tool call: unavailable in this mode", "tool", call.Name)
 		return "Tool is not available in this mode.", fmt.Errorf("tool is not available in this mode: %s", call.Name)
 	}
+	slog.InfoContext(ctx, "Tool call: starting", "tool", call.Name, "arguments", call.Arguments)
+	start := time.Now()
 	result, err := handler(ctx, mctx, user, call)
+	duration := time.Since(start)
+	if err != nil {
+		slog.WarnContext(ctx, "Tool call: failed", "tool", call.Name, "duration", duration.String(), "error", err)
+	} else {
+		slog.InfoContext(ctx, "Tool call: completed", "tool", call.Name, "duration", duration.String())
+	}
 	// Some handlers return an empty result alongside an error for failures
 	// that were historically fatal to the turn (bad JSON, unknown tool). The
 	// caller now feeds `result` back to the model instead of aborting, so it
