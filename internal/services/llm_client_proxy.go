@@ -32,8 +32,13 @@ func NewClientProxyFromConfig(config *config.Config) *LLMClientProxy {
 	client := openai.NewClient(option.WithAPIKey(os.Getenv("OPENAI_API_KEY")))
 	proxy.OpenaiClient = &client
 	anthropicClient := anthropic.NewClient(os.Getenv("ANTHROPIC_API_KEY"))
+	deepInfraClient := openai.NewClient(
+		option.WithAPIKey(os.Getenv("DEEPINFRA_API_KEY")),
+		option.WithBaseURL("https://api.deepinfra.com/v1/openai/"),
+	)
 	proxy.registerProvider(adapters.NewOpenaiAdapter(&client))
 	proxy.registerProvider(adapters.NewAnthropicAdapter(anthropicClient))
+	proxy.registerProvider(adapters.NewDeepInfraAdapter(&deepInfraClient))
 	for _, model := range config.Models {
 		proxy.registerAvailableModel(model)
 	}

@@ -11,6 +11,7 @@ const (
 	ProviderOpenAI    Provider = "openai"
 	ProviderAnthropic Provider = "anthropic"
 	ProviderGemini    Provider = "gemini"
+	ProviderDeepInfra Provider = "deepinfra"
 )
 
 type Role string
