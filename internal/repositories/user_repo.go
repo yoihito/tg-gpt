@@ -53,8 +53,8 @@ func (repo *UserRepo) CheckIfUserExists(userId int64) bool {
 
 func (repo *UserRepo) GetUser(userId int64) (models.User, error) {
 	query := `
-		SELECT id, first_name, last_name, username, chat_id, transcribed_seconds, 
-			   number_of_input_tokens, number_of_output_tokens, current_dialog_id, 
+		SELECT id, first_name, last_name, username, chat_id, transcribed_seconds,
+			   number_of_input_tokens, number_of_output_tokens,
 			   last_interaction, active, current_model
 		FROM users WHERE id = ?
 	`
@@ -65,7 +65,7 @@ func (repo *UserRepo) GetUser(userId int64) (models.User, error) {
 	err := repo.db.QueryRow(query, userId).Scan(
 		&user.Id, &user.FirstName, &lastName, &username, &user.ChatId,
 		&user.TranscribedSeconds, &user.NumberOfInputTokens, &user.NumberOfOutputTokens,
-		&user.CurrentDialogId, &user.LastInteraction, &user.Active, &user.CurrentModel,
+		&user.LastInteraction, &user.Active, &user.CurrentModel,
 	)
 
 	if err != nil {
@@ -124,26 +124,4 @@ func (repo *UserRepo) SetCurrentModel(userID int64, model string) error {
 		return fmt.Errorf("failed to set current model: %w", err)
 	}
 	return nil
-}
-
-func (repo *UserRepo) StartNewDialogCAS(userID, expectedDialogID, ts int64) (int64, bool, error) {
-	res, err := repo.db.Exec(
-		`UPDATE users
-		 SET current_dialog_id = current_dialog_id + 1,
-		     last_interaction = ?,
-		     updated_at = strftime('%s', 'now')
-		 WHERE id = ? AND current_dialog_id = ?`,
-		ts, userID, expectedDialogID,
-	)
-	if err != nil {
-		return 0, false, fmt.Errorf("failed to start new dialog: %w", err)
-	}
-	affected, err := res.RowsAffected()
-	if err != nil {
-		return 0, false, err
-	}
-	if affected == 0 {
-		return 0, false, nil
-	}
-	return expectedDialogID + 1, true, nil
 }

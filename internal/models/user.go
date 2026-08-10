@@ -9,7 +9,6 @@ type User struct {
 	TranscribedSeconds   int64
 	NumberOfInputTokens  int64
 	NumberOfOutputTokens int64
-	CurrentDialogId      int64
 	LastInteraction      int64
 	Active               bool
 	CurrentModel         string

@@ -162,8 +162,11 @@ func (s *ReminderScheduler) fireReminder(ctx context.Context, reminder models.Re
 		slog.ErrorContext(ctx, "Failed to update user last interaction", "error", err, "user_id", reminder.UserID)
 	}
 
+	// Reminders always fire into the General topic (dialogID 0) per design decision:
+	// there's no single "current" dialog once dialog identity is per-thread, and General
+	// is Telegram's own always-present default target (message_thread_id omitted).
 	syntheticUserText := fmt.Sprintf("[Reminder triggered for: %s]", reminder.Message)
-	if err := s.trace.RecordReminderFire(user.Id, user.CurrentDialogId, syntheticUserText, naturalMessage, int64(sentMsg.ID)); err != nil {
+	if err := s.trace.RecordReminderFire(user.Id, 0, syntheticUserText, naturalMessage, int64(sentMsg.ID)); err != nil {
 		slog.ErrorContext(ctx, "Failed to save reminder to trace", "error", err, "reminder_id", reminder.ID)
 	}
 

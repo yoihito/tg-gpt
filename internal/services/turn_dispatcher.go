@@ -79,6 +79,7 @@ func NewTurnDispatcher(
 func (r *TurnDispatcher) Submit(
 	ctx context.Context,
 	user models.User,
+	dialogID int64,
 	tgMessageID int64,
 	msg llm.Message,
 	streamer *telegram_utils.TelegramStreamer,
@@ -88,10 +89,10 @@ func (r *TurnDispatcher) Submit(
 		return err
 	}
 	user = preparedUser
-	key := conversationKey{userID: user.Id, dialogID: user.CurrentDialogId}
+	key := conversationKey{userID: user.Id, dialogID: dialogID}
 	if _, err := r.pending.Insert(ctx, repositories.InsertPendingInput{
 		UserID:      user.Id,
-		DialogID:    user.CurrentDialogId,
+		DialogID:    dialogID,
 		TgMessageID: tgMessageID,
 		Message:     msg,
 	}); err != nil {
@@ -121,10 +122,6 @@ func (r *TurnDispatcher) Submit(
 
 	go r.run(runCtx, key, user, active)
 	return nil
-}
-
-func (r *TurnDispatcher) CancelCurrentDialog(ctx context.Context, user models.User) error {
-	return r.CancelDialog(ctx, user.Id, user.CurrentDialogId)
 }
 
 func (r *TurnDispatcher) CancelDialog(ctx context.Context, userID, dialogID int64) error {

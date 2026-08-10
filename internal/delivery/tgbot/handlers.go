@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"time"
 
 	tele "gopkg.in/telebot.v3"
 	"vadimgribanov.com/tg-gpt/internal/llm"
@@ -42,20 +41,21 @@ func RegisterHandlers(
 	bot.Handle("/cancel", func(c tele.Context) error {
 		user := c.Get("user").(models.User)
 		rateLimiter.CancelRequest(user)
-		return turnDispatcher.CancelCurrentDialog(c.Get("requestContext").(context.Context), user)
+		dialogID := int64(c.Message().ThreadID)
+		return turnDispatcher.CancelDialog(c.Get("requestContext").(context.Context), user.Id, dialogID)
 	})
 
 	protected := bot.Group()
 	protected.Handle("/start", func(c tele.Context) error {
 		return c.Send("Hello! I'm a bot that can talk to you. Just send me a voice message or text and I will respond to you.")
 	})
-	protected.Handle("/new_chat", handler.NewDialog)
 	protected.Handle("/retry", handler.RetryLastMessage)
 	protected.Handle("/change_model", handler.ListModels)
 	protected.Handle("/current_model", handler.GetCurrentModel)
 	protected.Handle(tele.OnVoice, handler.HandleVoice)
 	protected.Handle(tele.OnText, handler.HandleText)
 	protected.Handle(tele.OnPhoto, handler.HandlePhoto)
+	protected.Handle(tele.OnTopicClosed, handler.OnTopicClosed)
 	protected.Handle(&tele.Btn{Unique: "model"}, handler.ChangeModel)
 }
 
@@ -107,6 +107,7 @@ func (h *BotHandler) HandleText(c tele.Context) error {
 	err = h.dispatcher.Submit(
 		ctx,
 		user,
+		int64(c.Message().ThreadID),
 		int64(c.Message().ID),
 		llmUserMessage(userInput),
 		streamer,
@@ -149,6 +150,7 @@ func (h *BotHandler) HandleVoice(c tele.Context) error {
 	return h.dispatcher.Submit(
 		ctx,
 		user,
+		int64(c.Message().ThreadID),
 		int64(c.Message().ID),
 		llmUserMessage(transcriptionText),
 		streamer,
@@ -187,6 +189,7 @@ func (h *BotHandler) HandlePhoto(c tele.Context) error {
 	return h.dispatcher.Submit(
 		ctx,
 		user,
+		int64(c.Message().ThreadID),
 		int64(c.Message().ID),
 		llmVisionMessage(userInput, fmt.Sprintf("data:image/jpeg;base64,%s", encodedStr)),
 		streamer,
@@ -201,10 +204,11 @@ func (h *BotHandler) RetryLastMessage(c tele.Context) error {
 	}
 
 	user := c.Get("user").(models.User)
-	if h.dispatcher.IsActive(user.Id, user.CurrentDialogId) {
+	dialogID := int64(c.Message().ThreadID)
+	if h.dispatcher.IsActive(user.Id, dialogID) {
 		return c.Send("Cannot retry while a response is being generated. Use /cancel first.")
 	}
-	userMsg, tgMsgID, err := h.traceStore.PopForRetry(user.Id, user.CurrentDialogId)
+	userMsg, tgMsgID, err := h.traceStore.PopForRetry(user.Id, dialogID)
 	if err != nil {
 		return c.Send("No messages found")
 	}
@@ -214,10 +218,11 @@ func (h *BotHandler) RetryLastMessage(c tele.Context) error {
 	}
 
 	streamer := telegram_utils.NewTelegramStreamer(c, &tele.Message{
-		ID:   int(tgMsgID),
-		Chat: c.Chat(),
+		ID:       int(tgMsgID),
+		Chat:     c.Chat(),
+		ThreadID: c.Message().ThreadID,
 	})
-	return h.textService.RetryWithMessage(ctx, user, tgMsgID, userMsg, streamer)
+	return h.textService.RetryWithMessage(ctx, user, dialogID, tgMsgID, userMsg, streamer)
 }
 
 func (h *BotHandler) ListModels(c tele.Context) error {
@@ -261,26 +266,18 @@ func (h *BotHandler) GetCurrentModel(c tele.Context) error {
 	return c.Send(fmt.Sprintf("Current model is %s", user.CurrentModel))
 }
 
-func (h *BotHandler) NewDialog(c tele.Context) error {
+// OnTopicClosed fires when the user closes a forum topic in their private chat with the
+// bot. A closed topic is the Telegram-native signal that a dialog is "done", so this is
+// what now triggers episodic summarization (previously done by /new_chat and the dialog
+// timeout, both removed now that dialog identity is the topic's thread ID rather than an
+// app-level counter).
+func (h *BotHandler) OnTopicClosed(c tele.Context) error {
 	ctx := c.Get("requestContext").(context.Context)
-	slog.DebugContext(ctx, "Starting new dialog")
-
 	user := c.Get("user").(models.User)
-	oldDialogID := user.CurrentDialogId
-	if err := h.dispatcher.CancelDialog(ctx, user.Id, oldDialogID); err != nil {
-		return err
-	}
-	go h.episodeStore.CloseDialog(context.WithoutCancel(ctx), user.Id, oldDialogID)
-
-	_, ok, err := h.userRepo.StartNewDialogCAS(user.Id, oldDialogID, time.Now().Unix())
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return c.Send("Dialog already changed")
-	}
-	return c.Send("New dialog started")
-
+	dialogID := int64(c.Message().ThreadID)
+	slog.DebugContext(ctx, "Topic closed, summarizing dialog", "user_id", user.Id, "dialog_id", dialogID)
+	go h.episodeStore.CloseDialog(context.WithoutCancel(ctx), user.Id, dialogID)
+	return nil
 }
 
 func llmUserMessage(text string) llm.Message {

@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
@@ -29,7 +28,7 @@ func TestTextServiceIntegrationSimpleTextTurnPersistsTraceAndUsage(t *testing.T)
 		},
 	})
 
-	_, err := h.textService.handleLLMRequest(context.Background(), h.user, 101, llm.Message{
+	_, err := h.textService.handleLLMRequest(context.Background(), h.user, testDialogID, 101, llm.Message{
 		Role:    llm.RoleUser,
 		Content: "hello",
 	}, nil)
@@ -37,7 +36,7 @@ func TestTextServiceIntegrationSimpleTextTurnPersistsTraceAndUsage(t *testing.T)
 		t.Fatal(err)
 	}
 
-	events := h.traceEvents(t, h.user.CurrentDialogId)
+	events := h.traceEvents(t, testDialogID)
 	if len(events) != 2 {
 		t.Fatalf("trace events len: got %d want 2: %#v", len(events), events)
 	}
@@ -84,7 +83,7 @@ func TestTextServiceIntegrationToolLoopPersistsProtocolOrderedTrace(t *testing.T
 		},
 	})
 
-	_, err := h.textService.handleLLMRequest(context.Background(), h.user, 201, llm.Message{
+	_, err := h.textService.handleLLMRequest(context.Background(), h.user, testDialogID, 201, llm.Message{
 		Role:    llm.RoleUser,
 		Content: "what do you remember?",
 	}, nil)
@@ -92,7 +91,7 @@ func TestTextServiceIntegrationToolLoopPersistsProtocolOrderedTrace(t *testing.T
 		t.Fatal(err)
 	}
 
-	events := h.traceEvents(t, h.user.CurrentDialogId)
+	events := h.traceEvents(t, testDialogID)
 	if len(events) != 4 {
 		t.Fatalf("trace events len: got %d want 4: %#v", len(events), events)
 	}
@@ -156,7 +155,7 @@ func TestTextServiceIntegrationToolErrorContinuesTurn(t *testing.T) {
 		},
 	})
 
-	resp, err := h.textService.handleLLMRequest(context.Background(), h.user, 401, llm.Message{
+	resp, err := h.textService.handleLLMRequest(context.Background(), h.user, testDialogID, 401, llm.Message{
 		Role:    llm.RoleUser,
 		Content: "remember something",
 	}, nil)
@@ -167,7 +166,7 @@ func TestTextServiceIntegrationToolErrorContinuesTurn(t *testing.T) {
 		t.Fatalf("final response: got %q", resp)
 	}
 
-	events := h.traceEvents(t, h.user.CurrentDialogId)
+	events := h.traceEvents(t, testDialogID)
 	wantTypes := []string{
 		models.EventTypeUserMsg,
 		models.EventTypeModelMsg,
@@ -207,7 +206,7 @@ func TestTextServiceIntegrationMaxToolIterationsStopsTurnGracefully(t *testing.T
 	}
 	h := newTextServiceIntegrationHarness(t, streams)
 
-	resp, err := h.textService.handleLLMRequest(context.Background(), h.user, 501, llm.Message{
+	resp, err := h.textService.handleLLMRequest(context.Background(), h.user, testDialogID, 501, llm.Message{
 		Role:    llm.RoleUser,
 		Content: "keep looping forever",
 	}, nil)
@@ -230,7 +229,7 @@ func TestTextServiceIntegrationRetryReplacesLastExchange(t *testing.T) {
 		{{TextDelta: "retry answer"}},
 	})
 
-	_, err := h.textService.handleLLMRequest(context.Background(), h.user, 301, llm.Message{
+	_, err := h.textService.handleLLMRequest(context.Background(), h.user, testDialogID, 301, llm.Message{
 		Role:    llm.RoleUser,
 		Content: "try this",
 	}, nil)
@@ -238,7 +237,7 @@ func TestTextServiceIntegrationRetryReplacesLastExchange(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	userMsg, tgMsgID, err := h.traceStore.PopForRetry(h.user.Id, h.user.CurrentDialogId)
+	userMsg, tgMsgID, err := h.traceStore.PopForRetry(h.user.Id, testDialogID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -246,11 +245,11 @@ func TestTextServiceIntegrationRetryReplacesLastExchange(t *testing.T) {
 		t.Fatalf("popped message: tg=%d msg=%#v", tgMsgID, userMsg)
 	}
 
-	if err := h.textService.RetryWithMessage(context.Background(), h.user, tgMsgID, userMsg, nil); err != nil {
+	if err := h.textService.RetryWithMessage(context.Background(), h.user, testDialogID, tgMsgID, userMsg, nil); err != nil {
 		t.Fatal(err)
 	}
 
-	events := h.traceEvents(t, h.user.CurrentDialogId)
+	events := h.traceEvents(t, testDialogID)
 	if len(events) != 2 {
 		t.Fatalf("trace events len after retry: got %d want 2: %#v", len(events), events)
 	}
@@ -343,7 +342,6 @@ func newTextServiceIntegrationHarness(t *testing.T, streams [][]llm.StreamEvent)
 		MemoryPlugin:     memoryPlugin,
 		ReminderTools:    reminderTools,
 		WebSearchService: nil,
-		DialogTimeout:    int64(time.Hour.Seconds()),
 		DefaultModel:     "test-model",
 	})
 

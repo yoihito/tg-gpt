@@ -39,7 +39,7 @@ func (t *TelegramStreamer) SendStatus(text string) error {
 	if t.HasOutput() || strings.TrimSpace(text) == "" {
 		return nil
 	}
-	msg, err := t.c.Bot().Reply(t.replyTo, text, &tele.SendOptions{ParseMode: tele.ModeDefault})
+	msg, err := t.c.Bot().Reply(t.replyTo, text, &tele.SendOptions{ParseMode: tele.ModeDefault, ThreadID: t.replyTo.ThreadID})
 	if err != nil {
 		slog.ErrorContext(ctx, "Error sending status message", "error", err, "message", text)
 		return err
@@ -87,9 +87,9 @@ func (t *TelegramStreamer) Flush() error {
 	var err error
 	if t.currentMessage == nil {
 		slog.DebugContext(ctx, "Telegram streamer: sending message", "message_len", len(t.accumulatedMessage))
-		t.currentMessage, err = t.c.Bot().Reply(t.replyTo, FixMarkdown(t.accumulatedMessage), &tele.SendOptions{ParseMode: tele.ModeMarkdown})
+		t.currentMessage, err = t.c.Bot().Reply(t.replyTo, FixMarkdown(t.accumulatedMessage), &tele.SendOptions{ParseMode: tele.ModeMarkdown, ThreadID: t.replyTo.ThreadID})
 		if err != nil {
-			t.currentMessage, err = t.c.Bot().Reply(t.replyTo, t.accumulatedMessage, &tele.SendOptions{ParseMode: tele.ModeDefault})
+			t.currentMessage, err = t.c.Bot().Reply(t.replyTo, t.accumulatedMessage, &tele.SendOptions{ParseMode: tele.ModeDefault, ThreadID: t.replyTo.ThreadID})
 			slog.ErrorContext(ctx, "Error sending message", "error", err, "message", t.accumulatedMessage)
 		}
 	} else {
@@ -103,7 +103,7 @@ func (t *TelegramStreamer) Flush() error {
 
 	if err != nil {
 		slog.ErrorContext(ctx, "Error streaming", "error", err)
-		noticeErr := t.c.Send("Failed to answer the message")
+		_, noticeErr := t.c.Bot().Reply(t.replyTo, "Failed to answer the message", &tele.SendOptions{ThreadID: t.replyTo.ThreadID})
 		if noticeErr != nil {
 			slog.ErrorContext(ctx, "Error sending notice", "error", noticeErr)
 		}

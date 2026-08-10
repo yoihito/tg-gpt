@@ -143,8 +143,13 @@ func newTurnDispatcherHarness(t *testing.T) *turnDispatcherHarness {
 	}
 }
 
-func dialogKey(user models.User) string {
-	return fmt.Sprintf("%d:%d", user.Id, user.CurrentDialogId)
+// testDialogID stands in for a Telegram message thread ID in tests that don't care which
+// specific thread is used, only that dialog identity is now caller-supplied rather than
+// read off the user.
+const testDialogID int64 = 777
+
+func dialogKey(user models.User, dialogID int64) string {
+	return fmt.Sprintf("%d:%d", user.Id, dialogID)
 }
 
 // waitUntil polls cond until it's true or the timeout elapses, failing the test on
@@ -166,7 +171,7 @@ func waitUntil(t *testing.T, timeout time.Duration, cond func() bool) {
 
 func TestTurnDispatcherCoalescesSubmitWhileATurnIsRunning(t *testing.T) {
 	h := newTurnDispatcherHarness(t)
-	key := dialogKey(h.user)
+	key := dialogKey(h.user, testDialogID)
 
 	started := make(chan struct{}, 1)
 	proceed := make(chan struct{})
@@ -179,7 +184,7 @@ func TestTurnDispatcherCoalescesSubmitWhileATurnIsRunning(t *testing.T) {
 		return "", nil
 	}
 
-	if err := h.dispatcher.Submit(context.Background(), h.user, 1, llm.Message{Role: llm.RoleUser, Content: "first"}, nil); err != nil {
+	if err := h.dispatcher.Submit(context.Background(), h.user, testDialogID, 1, llm.Message{Role: llm.RoleUser, Content: "first"}, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -189,19 +194,19 @@ func TestTurnDispatcherCoalescesSubmitWhileATurnIsRunning(t *testing.T) {
 		t.Fatal("first turn never started")
 	}
 
-	if !h.dispatcher.IsActive(h.user.Id, h.user.CurrentDialogId) {
+	if !h.dispatcher.IsActive(h.user.Id, testDialogID) {
 		t.Fatal("expected dialog to be active while its turn is running")
 	}
 
 	// Submitted while the first turn is still in flight — must be coalesced into the
 	// same dialog's run rather than starting a second, overlapping goroutine.
-	if err := h.dispatcher.Submit(context.Background(), h.user, 2, llm.Message{Role: llm.RoleUser, Content: "second"}, nil); err != nil {
+	if err := h.dispatcher.Submit(context.Background(), h.user, testDialogID, 2, llm.Message{Role: llm.RoleUser, Content: "second"}, nil); err != nil {
 		t.Fatal(err)
 	}
 
 	close(proceed)
 
-	waitUntil(t, 2*time.Second, func() bool { return !h.dispatcher.IsActive(h.user.Id, h.user.CurrentDialogId) })
+	waitUntil(t, 2*time.Second, func() bool { return !h.dispatcher.IsActive(h.user.Id, testDialogID) })
 
 	got := h.fake.allMessagesForDialog(key)
 	want := []string{"first", "second"}
@@ -212,7 +217,7 @@ func TestTurnDispatcherCoalescesSubmitWhileATurnIsRunning(t *testing.T) {
 
 func TestTurnDispatcherAssignsEachCallTheStreamerOfItsOwnInputs(t *testing.T) {
 	h := newTurnDispatcherHarness(t)
-	key := dialogKey(h.user)
+	key := dialogKey(h.user, testDialogID)
 
 	started := make(chan struct{}, 1)
 	proceed := make(chan struct{})
@@ -228,17 +233,17 @@ func TestTurnDispatcherAssignsEachCallTheStreamerOfItsOwnInputs(t *testing.T) {
 	streamerA := &telegram_utils.TelegramStreamer{}
 	streamerB := &telegram_utils.TelegramStreamer{}
 
-	if err := h.dispatcher.Submit(context.Background(), h.user, 1, llm.Message{Role: llm.RoleUser, Content: "first"}, streamerA); err != nil {
+	if err := h.dispatcher.Submit(context.Background(), h.user, testDialogID, 1, llm.Message{Role: llm.RoleUser, Content: "first"}, streamerA); err != nil {
 		t.Fatal(err)
 	}
 	<-started
 
-	if err := h.dispatcher.Submit(context.Background(), h.user, 2, llm.Message{Role: llm.RoleUser, Content: "second"}, streamerB); err != nil {
+	if err := h.dispatcher.Submit(context.Background(), h.user, testDialogID, 2, llm.Message{Role: llm.RoleUser, Content: "second"}, streamerB); err != nil {
 		t.Fatal(err)
 	}
 	close(proceed)
 
-	waitUntil(t, 2*time.Second, func() bool { return !h.dispatcher.IsActive(h.user.Id, h.user.CurrentDialogId) })
+	waitUntil(t, 2*time.Second, func() bool { return !h.dispatcher.IsActive(h.user.Id, testDialogID) })
 
 	streamers := h.fake.streamersForDialog(key)
 	if len(streamers) != 2 || streamers[0] != streamerA || streamers[1] != streamerB {
@@ -261,10 +266,10 @@ func TestTurnDispatcherRunsDifferentDialogsConcurrently(t *testing.T) {
 		return "", nil
 	}
 
-	if err := h.dispatcher.Submit(context.Background(), h.user, 1, llm.Message{Role: llm.RoleUser, Content: "a"}, nil); err != nil {
+	if err := h.dispatcher.Submit(context.Background(), h.user, testDialogID, 1, llm.Message{Role: llm.RoleUser, Content: "a"}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.dispatcher.Submit(context.Background(), user2, 1, llm.Message{Role: llm.RoleUser, Content: "b"}, nil); err != nil {
+	if err := h.dispatcher.Submit(context.Background(), user2, testDialogID, 1, llm.Message{Role: llm.RoleUser, Content: "b"}, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -282,7 +287,7 @@ func TestTurnDispatcherRunsDifferentDialogsConcurrently(t *testing.T) {
 	close(release)
 
 	waitUntil(t, 2*time.Second, func() bool {
-		return !h.dispatcher.IsActive(h.user.Id, h.user.CurrentDialogId) && !h.dispatcher.IsActive(user2.Id, user2.CurrentDialogId)
+		return !h.dispatcher.IsActive(h.user.Id, testDialogID) && !h.dispatcher.IsActive(user2.Id, testDialogID)
 	})
 }
 
@@ -297,24 +302,24 @@ func TestTurnDispatcherCancelDialogStopsRunningTurnAndDiscardsPending(t *testing
 		return "", ctx.Err()
 	}
 
-	if err := h.dispatcher.Submit(context.Background(), h.user, 1, llm.Message{Role: llm.RoleUser, Content: "first"}, nil); err != nil {
+	if err := h.dispatcher.Submit(context.Background(), h.user, testDialogID, 1, llm.Message{Role: llm.RoleUser, Content: "first"}, nil); err != nil {
 		t.Fatal(err)
 	}
 	<-started
 
 	// Coalesced in while the turn above is still blocked — cancellation must discard
 	// this too, not just stop the in-flight turn.
-	if err := h.dispatcher.Submit(context.Background(), h.user, 2, llm.Message{Role: llm.RoleUser, Content: "second"}, nil); err != nil {
+	if err := h.dispatcher.Submit(context.Background(), h.user, testDialogID, 2, llm.Message{Role: llm.RoleUser, Content: "second"}, nil); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := h.dispatcher.CancelDialog(context.Background(), h.user.Id, h.user.CurrentDialogId); err != nil {
+	if err := h.dispatcher.CancelDialog(context.Background(), h.user.Id, testDialogID); err != nil {
 		t.Fatal(err)
 	}
 
-	waitUntil(t, 2*time.Second, func() bool { return !h.dispatcher.IsActive(h.user.Id, h.user.CurrentDialogId) })
+	waitUntil(t, 2*time.Second, func() bool { return !h.dispatcher.IsActive(h.user.Id, testDialogID) })
 
-	pending, err := h.pendingRepo.ListPendingForDialog(context.Background(), h.user.Id, h.user.CurrentDialogId, 100)
+	pending, err := h.pendingRepo.ListPendingForDialog(context.Background(), h.user.Id, testDialogID, 100)
 	if err != nil {
 		t.Fatal(err)
 	}

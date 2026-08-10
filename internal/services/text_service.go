@@ -24,7 +24,6 @@ type TextServiceDeps struct {
 	MemoryPlugin     *MemoryPlugin
 	ReminderTools    *ReminderTools
 	WebSearchService *WebSearchService
-	DialogTimeout    int64
 	DefaultModel     string
 }
 
@@ -37,7 +36,6 @@ func NewTextService(deps TextServiceDeps) *TextService {
 		episodes:         deps.Episodes,
 		reminderTools:    deps.ReminderTools,
 		webSearchService: deps.WebSearchService,
-		dialogTimeout:    deps.DialogTimeout,
 		defaultModel:     deps.DefaultModel,
 	}
 
@@ -63,7 +61,6 @@ type TextService struct {
 	episodes             *EpisodeStore
 	reminderTools        *ReminderTools
 	webSearchService     *WebSearchService
-	dialogTimeout        int64
 	defaultModel         string
 	runner               *Runner
 	defaultAgent         Definition
@@ -80,7 +77,6 @@ type UsersRepo interface {
 	Touch(userID int64, ts int64) error
 	AddTokenUsage(userID int64, inputTokens, outputTokens int64) error
 	SetCurrentModel(userID int64, model string) error
-	StartNewDialogCAS(userID, expectedDialogID, ts int64) (int64, bool, error)
 }
 
 const AssistantPrompt = `You are a helpful assistant. Your name is Johnny. You can save things you learn about the user (preferences and facts) and create, list, or cancel reminders.
@@ -117,39 +113,19 @@ func scheduledActionSystemPrompt(ctx context.Context) (string, error) {
 func (h *TextService) RetryWithMessage(
 	ctx context.Context,
 	user models.User,
+	dialogID int64,
 	tgUserMessageId int64,
 	userMsg llm.Message,
 	streamer *telegram_utils.TelegramStreamer,
 ) error {
-	_, err := h.handleLLMRequest(ctx, user, tgUserMessageId, userMsg, streamer)
+	_, err := h.handleLLMRequest(ctx, user, dialogID, tgUserMessageId, userMsg, streamer)
 	return err
 }
 
-func (h *TextService) OnStreamableTextHandler(ctx context.Context, user models.User, tgUserMessageId int64, userText string, streamer *telegram_utils.TelegramStreamer) error {
-	_, err := h.handleLLMRequest(ctx, user, tgUserMessageId, llm.Message{
-		Role:    llm.RoleUser,
-		Content: userText,
-	}, streamer)
-	return err
-}
-
-func (h *TextService) OnStreamableVisionHandler(ctx context.Context, user models.User, tgUserMessageId int64, userText string, imageUrl string, streamer *telegram_utils.TelegramStreamer) error {
-	_, err := h.handleLLMRequest(ctx, user, tgUserMessageId, llm.Message{
-		Role: llm.RoleUser,
-		Parts: []llm.ContentPart{
-			{
-				Type: llm.ContentPartText,
-				Text: userText,
-			},
-			{
-				Type:     llm.ContentPartImageURL,
-				ImageURL: imageUrl,
-			},
-		},
-	}, streamer)
-	return err
-}
-
+// RunScheduledAction always targets dialogID 0 (the General topic): scheduled/reminder
+// fires aren't triggered from any specific incoming message/thread, and the user has
+// chosen to keep all proactive sends in one predictable place rather than resurrecting
+// per-reminder topic tracking.
 func (h *TextService) RunScheduledAction(ctx context.Context, user models.User, reminder models.Reminder) (string, error) {
 	prompt := reminder.ActionPrompt
 	if prompt == "" {
@@ -163,7 +139,7 @@ func (h *TextService) RunScheduledAction(ctx context.Context, user models.User, 
 			prompt,
 		),
 	}
-	return h.runSingleInputTurn(ctx, user, 0, msg, nil, h.scheduledActionAgent)
+	return h.runSingleInputTurn(ctx, user, 0, 0, msg, nil, h.scheduledActionAgent)
 }
 
 func extractQueryText(msg llm.Message) string {
@@ -184,8 +160,8 @@ type UserInput struct {
 	Message     llm.Message
 }
 
-func (h *TextService) handleLLMRequest(ctx context.Context, user models.User, tgUserMessageId int64, newMessage llm.Message, streamer *telegram_utils.TelegramStreamer) (string, error) {
-	return h.runSingleInputTurn(ctx, user, tgUserMessageId, newMessage, streamer, h.defaultAgent)
+func (h *TextService) handleLLMRequest(ctx context.Context, user models.User, dialogID int64, tgUserMessageId int64, newMessage llm.Message, streamer *telegram_utils.TelegramStreamer) (string, error) {
+	return h.runSingleInputTurn(ctx, user, dialogID, tgUserMessageId, newMessage, streamer, h.defaultAgent)
 }
 
 func (h *TextService) buildDefaultToolSet() *ToolSet {
@@ -234,23 +210,6 @@ func (h *TextService) RunAttachedTurn(
 
 func (h *TextService) PrepareUserForInput(ctx context.Context, user models.User) (models.User, error) {
 	now := time.Now().Unix()
-	if now-user.LastInteraction > h.dialogTimeout {
-		oldDialogID := user.CurrentDialogId
-		go h.episodes.CloseDialog(context.WithoutCancel(ctx), user.Id, oldDialogID)
-		newDialogID, ok, err := h.usersRepo.StartNewDialogCAS(user.Id, oldDialogID, now)
-		if err != nil {
-			return models.User{}, err
-		}
-		if ok {
-			user.CurrentDialogId = newDialogID
-		} else {
-			reloaded, err := h.reloadUser(user.Id)
-			if err != nil {
-				return models.User{}, err
-			}
-			user = reloaded
-		}
-	}
 	user.LastInteraction = now
 	if err := h.usersRepo.Touch(user.Id, now); err != nil {
 		return models.User{}, err
@@ -280,6 +239,7 @@ func (h *TextService) resolveModel(ctx context.Context, user models.User) (strin
 func (h *TextService) runSingleInputTurn(
 	ctx context.Context,
 	user models.User,
+	dialogID int64,
 	tgUserMessageId int64,
 	newMessage llm.Message,
 	streamer *telegram_utils.TelegramStreamer,
@@ -287,7 +247,7 @@ func (h *TextService) runSingleInputTurn(
 ) (string, error) {
 	slog.InfoContext(ctx, "LLM request: preparing user",
 		"user_id", user.Id,
-		"dialog_id", user.CurrentDialogId,
+		"dialog_id", dialogID,
 		"current_model", user.CurrentModel,
 	)
 	user, err := h.PrepareUserForInput(ctx, user)
@@ -303,10 +263,10 @@ func (h *TextService) runSingleInputTurn(
 
 	slog.InfoContext(ctx, "LLM request: beginning turn",
 		"user_id", user.Id,
-		"dialog_id", user.CurrentDialogId,
+		"dialog_id", dialogID,
 		"model", modelToUse,
 	)
-	mctx, err := h.trace.BeginTurn(user.Id, user.CurrentDialogId, newMessage, tgUserMessageId)
+	mctx, err := h.trace.BeginTurn(user.Id, dialogID, newMessage, tgUserMessageId)
 	if err != nil {
 		slog.ErrorContext(ctx, "Error beginning turn", "error", err)
 		return "", err
@@ -427,15 +387,4 @@ func joinUserInputText(inputs []UserInput) string {
 		out += text
 	}
 	return out
-}
-
-func (h *TextService) reloadUser(userID int64) (models.User, error) {
-	type userGetter interface {
-		GetUser(userID int64) (models.User, error)
-	}
-	repo, ok := h.usersRepo.(userGetter)
-	if !ok {
-		return models.User{}, fmt.Errorf("users repo cannot reload user after dialog race")
-	}
-	return repo.GetUser(userID)
 }

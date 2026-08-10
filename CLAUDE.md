@@ -56,7 +56,7 @@ This is a Go-based Telegram bot that provides an interface to multiple LLM provi
 **Authentication & Rate Limiting:**
 - User authentication via `ALLOWED_USER_ID` environment variable
 - Concurrent request limiting via `middleware/rate_limiter.go`
-- Per-user dialog timeout management
+- Dialog identity is the Telegram message thread (forum topic); each topic in the user's DM is an independent conversation, no app-level timeout or counter
 
 **Message Types:**
 - Text messages with streaming responses
@@ -75,12 +75,10 @@ This is a Go-based Telegram bot that provides an interface to multiple LLM provi
 ### Application Config
 Edit `config/application.yaml` to:
 - Add/remove supported models
-- Configure dialog timeout
 - Set max concurrent requests per user
 
 ### Bot Commands
 - `/start` - Welcome message
-- `/new_chat` - Start new conversation context
 - `/retry` - Retry last message
 - `/current_model` - Show current model
 - `/change_model` - Switch between available models

@@ -95,6 +95,10 @@ func (db *DB) Migrate() error {
 		return fmt.Errorf("failed to add reminder action columns: %w", err)
 	}
 
+	if err := db.dropUsersCurrentDialogIdIfExists(); err != nil {
+		return fmt.Errorf("failed to drop users.current_dialog_id column: %w", err)
+	}
+
 	slog.Info("Database migrations completed successfully")
 	return nil
 }
@@ -135,6 +139,19 @@ func (db *DB) dropRemindersTimezoneIfExists() error {
 	}
 	slog.Info("Dropping reminders.timezone column (moved to preferences)")
 	_, err = db.Exec(`ALTER TABLE reminders DROP COLUMN timezone`)
+	return err
+}
+
+func (db *DB) dropUsersCurrentDialogIdIfExists() error {
+	has, err := columnExists(db.DB, "users", "current_dialog_id")
+	if err != nil {
+		return err
+	}
+	if !has {
+		return nil
+	}
+	slog.Info("Dropping users.current_dialog_id column (dialog identity now comes from Telegram message threads)")
+	_, err = db.Exec(`ALTER TABLE users DROP COLUMN current_dialog_id`)
 	return err
 }
 
@@ -273,7 +290,6 @@ CREATE TABLE IF NOT EXISTS users (
 	transcribed_seconds INTEGER DEFAULT 0,
 	number_of_input_tokens INTEGER DEFAULT 0,
 	number_of_output_tokens INTEGER DEFAULT 0,
-	current_dialog_id INTEGER DEFAULT 0,
 	last_interaction INTEGER NOT NULL,
 	active BOOLEAN DEFAULT true,
 	current_model TEXT NOT NULL,

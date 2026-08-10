@@ -43,7 +43,6 @@ type MemoryConfig struct {
 }
 
 type Config struct {
-	DialogTimeout         int          `yaml:"dialog_timeout"`
 	MaxConcurrentRequests int          `yaml:"max_concurrent_requests"`
 	DefaultModel          LLMModel     `yaml:"default_model"`
 	Models                []LLMModel   `yaml:"models"`

@@ -73,7 +73,6 @@ func main() {
 		}
 		allowedUserIDs = append(allowedUserIDs, id)
 	}
-	dialogTimeout := int64(appConfig.DialogTimeout)
 	maxConcurrentRequests := appConfig.MaxConcurrentRequests
 	rateLimiter := middleware.RateLimiter{MaxConcurrentRequests: maxConcurrentRequests}
 	authenticator := middleware.UserAuthenticator{UserRepo: userRepo, AllowedUserIds: allowedUserIDs, AppConfig: *appConfig}
@@ -132,7 +131,6 @@ func main() {
 		MemoryPlugin:     memoryPlugin,
 		ReminderTools:    reminderTools,
 		WebSearchService: webSearchService,
-		DialogTimeout:    dialogTimeout,
 		DefaultModel:     appConfig.DefaultModel.ModelId,
 	})
 	reminderScheduler.SetScheduledActionRunner(textService)
@@ -155,7 +153,6 @@ func main() {
 
 	err = b.SetCommands([]tele.Command{
 		{Text: "/retry", Description: "Retry the last message"},
-		{Text: "/new_chat", Description: "Start a new dialog"},
 		{Text: "/current_model", Description: "Currently selected model"},
 		{Text: "/change_model", Description: "Change the model"},
 		{Text: "/cancel", Description: "Cancel the current request"},
