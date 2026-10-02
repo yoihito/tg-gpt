@@ -29,13 +29,14 @@ func (u *UserAuthenticator) Middleware() tele.MiddlewareFunc {
 			ctx := c.Get("requestContext").(context.Context)
 
 			var user models.User
+			var err error
 			if !u.UserRepo.CheckIfUserExists(c.Sender().ID) {
 				userId := c.Sender().ID
 				firstName := c.Sender().FirstName
 				lastName := c.Sender().LastName
 				username := c.Sender().Username
-				chatId := c.Update().Message.Chat.ID
-				user, _ = u.UserRepo.Register(
+				chatId := c.Chat().ID
+				user, err = u.UserRepo.Register(
 					userId,
 					firstName,
 					lastName,
@@ -45,7 +46,10 @@ func (u *UserAuthenticator) Middleware() tele.MiddlewareFunc {
 					u.AppConfig.DefaultModel.ModelId,
 				)
 			} else {
-				user, _ = u.UserRepo.GetUser(c.Sender().ID)
+				user, err = u.UserRepo.GetUser(c.Sender().ID)
+			}
+			if err != nil {
+				return err
 			}
 			slog.DebugContext(ctx, "User authenticated", "user", user)
 			if user.Active {

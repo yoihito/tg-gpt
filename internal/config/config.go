@@ -78,7 +78,7 @@ func applyMemoryDefaults(m *MemoryConfig) {
 		m.Embedding.Model = "text-embedding-3-small"
 	}
 	if m.Extractor.Model == "" {
-		m.Extractor.Model = "gpt-5.4-nano"
+		m.Extractor.Model = "gpt-6-luna"
 	}
 	if m.Thresholds.FactConfidenceMin == 0 {
 		m.Thresholds.FactConfidenceMin = 0.7

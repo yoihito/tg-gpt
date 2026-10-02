@@ -61,7 +61,7 @@ This is a Go-based Telegram bot that provides an interface to multiple LLM provi
 **Message Types:**
 - Text messages with streaming responses
 - Voice messages with transcription + LLM response
-- Image messages with vision model support (requires caption)
+- Single photos and photo albums with vision model support (captions optional)
 
 ## Configuration
 

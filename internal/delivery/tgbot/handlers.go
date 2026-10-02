@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
+	"time"
 
 	tele "gopkg.in/telebot.v3"
 	"vadimgribanov.com/tg-gpt/internal/llm"
@@ -41,13 +43,14 @@ func RegisterHandlers(
 	bot.Handle("/cancel", func(c tele.Context) error {
 		user := c.Get("user").(models.User)
 		rateLimiter.CancelRequest(user)
+		handler.photoAlbums.cancel(user.Id, c.Chat().ID, c.Message().ThreadID)
 		dialogID := int64(c.Message().ThreadID)
 		return turnDispatcher.CancelDialog(c.Get("requestContext").(context.Context), user.Id, dialogID)
 	})
 
 	protected := bot.Group()
 	protected.Handle("/start", func(c tele.Context) error {
-		return c.Send("Hello! I'm a bot that can talk to you. Just send me a voice message or text and I will respond to you.")
+		return c.Send("Hello! I'm a bot that can talk to you. Just send me a text, a voice message, or photos (with or without a caption) and I will respond to you.")
 	})
 	protected.Handle("/retry", handler.RetryLastMessage)
 	protected.Handle("/change_model", handler.ListModels)
@@ -60,6 +63,7 @@ func RegisterHandlers(
 }
 
 type BotHandler struct {
+	photoAlbums    *photoAlbumCollector
 	rateLimiter    *middleware.RateLimiter
 	textService    *services.TextService
 	voiceService   *services.VoiceService
@@ -81,6 +85,7 @@ func NewBotHandler(
 	llmClientProxy *services.LLMClientProxy,
 ) *BotHandler {
 	return &BotHandler{
+		photoAlbums:    newPhotoAlbumCollector(time.Second),
 		rateLimiter:    rateLimiter,
 		textService:    textService,
 		voiceService:   voiceService,
@@ -162,38 +167,48 @@ func (h *BotHandler) HandlePhoto(c tele.Context) error {
 	slog.DebugContext(ctx, "Got photo message")
 	user := c.Get("user").(models.User)
 
-	photoFile := c.Message().Photo
-	reader, err := c.Bot().File(&photoFile.File)
-	if err != nil {
+	if c.Message().AlbumID != "" {
+		h.photoAlbums.add(user.Id, c, func(photos []tele.Context) {
+			if err := h.submitPhotos(context.WithoutCancel(ctx), user, photos); err != nil {
+				slog.ErrorContext(ctx, "Error submitting photo album", "error", err)
+				if sendErr := c.Send("Failed to analyze the images"); sendErr != nil {
+					slog.ErrorContext(ctx, "Error sending photo album failure", "error", sendErr)
+				}
+			}
+		})
+		return nil
+	}
+	return h.submitPhotos(ctx, user, []tele.Context{c})
+}
+
+func (h *BotHandler) submitPhotos(ctx context.Context, user models.User, photos []tele.Context) error {
+	imageURLs := make([]string, 0, len(photos))
+	captions := make([]string, 0, len(photos))
+	for _, photo := range photos {
+		reader, err := photo.Bot().File(&photo.Message().Photo.File)
+		if err != nil {
+			return err
+		}
+		fileContent, readErr := io.ReadAll(reader)
+		closeErr := reader.Close()
+		if readErr != nil {
+			return readErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		imageURLs = append(imageURLs, "data:image/jpeg;base64,"+base64.StdEncoding.EncodeToString(fileContent))
+		if caption := strings.TrimSpace(photo.Message().Caption); caption != "" {
+			captions = append(captions, caption)
+		}
+	}
+	c := photos[0]
+	if err := c.Notify(tele.Typing); err != nil {
 		return err
 	}
-	defer reader.Close()
-
-	fileContent, err := io.ReadAll(reader)
-	if err != nil {
-		return err
-	}
-	encodedStr := base64.StdEncoding.EncodeToString(fileContent)
-
-	err = c.Notify(tele.Typing)
-	if err != nil {
-		return err
-	}
-	userInput := c.Message().Caption
-
-	if len(userInput) == 0 {
-		return c.Send("Provide image caption")
-	}
-
 	streamer := telegram_utils.NewTelegramStreamer(c, c.Message())
-	return h.dispatcher.Submit(
-		ctx,
-		user,
-		int64(c.Message().ThreadID),
-		int64(c.Message().ID),
-		llmVisionMessage(userInput, fmt.Sprintf("data:image/jpeg;base64,%s", encodedStr)),
-		streamer,
-	)
+	return h.dispatcher.Submit(ctx, user, int64(c.Message().ThreadID), int64(c.Message().ID),
+		llmVisionMessage(strings.Join(captions, "\n\n"), imageURLs...), streamer)
 }
 
 func (h *BotHandler) RetryLastMessage(c tele.Context) error {
@@ -239,7 +254,7 @@ func (h *BotHandler) ListModels(c tele.Context) error {
 	}
 	selector.Inline(rows...)
 
-	return c.Send("Choose model", selector)
+	return c.Send("Choose model", &tele.SendOptions{ReplyMarkup: selector, ThreadID: c.Message().ThreadID})
 }
 
 func (h *BotHandler) ChangeModel(c tele.Context) error {
@@ -248,22 +263,27 @@ func (h *BotHandler) ChangeModel(c tele.Context) error {
 
 	user := c.Get("user").(models.User)
 
-	modelName := c.Args()[0]
-	if !h.llmClientProxy.IsClientRegistered(modelName) {
-		return c.Send("Model not found")
+	args := c.Args()
+	if len(args) != 1 || !h.llmClientProxy.IsClientRegistered(args[0]) {
+		return c.Respond(&tele.CallbackResponse{Text: "Model not found. Run /change_model again.", ShowAlert: true})
 	}
+	modelName := args[0]
 	user.CurrentModel = modelName
 	if err := h.userRepo.SetCurrentModel(user.Id, modelName); err != nil {
 		return err
 	}
-	return c.Send(fmt.Sprintf("Model changed to %s", modelName))
+	c.Set("user", user)
+	if err := c.Respond(); err != nil {
+		return err
+	}
+	return c.Send(fmt.Sprintf("Model changed to %s", modelName), &tele.SendOptions{ThreadID: c.Message().ThreadID})
 }
 
 func (h *BotHandler) GetCurrentModel(c tele.Context) error {
 	ctx := c.Get("requestContext").(context.Context)
 	slog.DebugContext(ctx, "Getting current model")
 	user := c.Get("user").(models.User)
-	return c.Send(fmt.Sprintf("Current model is %s", user.CurrentModel))
+	return c.Send(fmt.Sprintf("Current model is %s", user.CurrentModel), &tele.SendOptions{ThreadID: c.Message().ThreadID})
 }
 
 // OnTopicClosed fires when the user closes a forum topic in their private chat with the
@@ -284,12 +304,14 @@ func llmUserMessage(text string) llm.Message {
 	return llm.Message{Role: llm.RoleUser, Content: text}
 }
 
-func llmVisionMessage(text string, imageURL string) llm.Message {
-	return llm.Message{
-		Role: llm.RoleUser,
-		Parts: []llm.ContentPart{
-			{Type: llm.ContentPartText, Text: text},
-			{Type: llm.ContentPartImageURL, ImageURL: imageURL},
-		},
+func llmVisionMessage(text string, imageURLs ...string) llm.Message {
+	if strings.TrimSpace(text) == "" {
+		text = "Please analyze the provided images."
 	}
+	parts := make([]llm.ContentPart, 0, len(imageURLs)+1)
+	parts = append(parts, llm.ContentPart{Type: llm.ContentPartText, Text: text})
+	for _, imageURL := range imageURLs {
+		parts = append(parts, llm.ContentPart{Type: llm.ContentPartImageURL, ImageURL: imageURL})
+	}
+	return llm.Message{Role: llm.RoleUser, Parts: parts}
 }
