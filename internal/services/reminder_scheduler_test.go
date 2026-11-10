@@ -201,6 +201,83 @@ func TestReminderSchedulerReschedulesRecurringReminderAfterFiring(t *testing.T) 
 	}
 }
 
+// TestNextFutureOccurrenceFastForwardsThroughDrift is the regression test for a
+// recurring reminder that fell far behind (e.g. an hourly check whose base RemindAt was
+// hours in the past): CalculateNextOccurrence only ever advances one interval, so
+// without fast-forwarding, rescheduleRecurring would persist a next_time that's still
+// due immediately, and the scheduler's 30s poll would re-fire it over and over (running
+// the full scheduled action, LLM calls included) until enough ticks had passed to catch
+// up one hour at a time — "every hour" effectively becoming "every 30 seconds" for
+// however long the drift was.
+func TestNextFutureOccurrenceFastForwardsThroughDrift(t *testing.T) {
+	hourly := models.RecurrenceTypeHourly
+	now := time.Now()
+	reminder := models.Reminder{
+		RemindAt:           now.Add(-5*time.Hour - 10*time.Minute), // drifted ~5h behind
+		IsRecurring:        true,
+		RecurrenceType:     &hourly,
+		RecurrenceInterval: 1,
+	}
+
+	next := nextFutureOccurrence(reminder, time.UTC, now)
+	if next == nil {
+		t.Fatal("expected a next occurrence")
+	}
+	if !next.After(now) {
+		t.Fatalf("expected the fast-forwarded occurrence to be in the future, got %v (now=%v)", next, now)
+	}
+	// It should land on the *next* hourly slot after now, not jump arbitrarily far
+	// ahead: at most one interval beyond now.
+	if next.Sub(now) > time.Hour {
+		t.Fatalf("expected the next occurrence within one hour of now, got %v ahead", next.Sub(now))
+	}
+}
+
+func TestReminderSchedulerFiresOnceForHourlyReminderThatDriftedFarBehind(t *testing.T) {
+	repos := newReminderTestRepos(t)
+	fakeTg := newFakeTelegramServer(t)
+	traceStore := NewTraceStore(repos.traceRepo)
+	scheduler := NewReminderScheduler(repos.reminderRepo, repos.userRepo, repos.prefRepo, traceStore, newTestBot(t, fakeTg.server.URL))
+
+	if err := repos.prefRepo.Upsert(repositories.UpsertPreferenceInput{
+		UserID: reminderTestUserID, Key: "timezone", Value: "UTC", Source: "explicit",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	hourly := models.RecurrenceTypeHourly
+	id, err := repos.reminderRepo.CreateReminder(models.Reminder{
+		UserID: reminderTestUserID, Message: "hourly check",
+		RemindAt: time.Now().Add(-5 * time.Hour), IsRecurring: true,
+		RecurrenceType: &hourly, RecurrenceInterval: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	scheduler.checkAndFireReminders(context.Background())
+	scheduler.wg.Wait()
+
+	if sent := fakeTg.sentMessages(); len(sent) != 1 {
+		t.Fatalf("expected exactly one fire despite 5h of drift, got %d: %#v", len(sent), sent)
+	}
+
+	rescheduled, err := repos.reminderRepo.GetReminderByID(id, reminderTestUserID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rescheduled.RemindAt.After(time.Now()) {
+		t.Fatalf("expected the rescheduled time to be in the future, got %v", rescheduled.RemindAt)
+	}
+
+	// Firing again immediately must be a no-op: the schedule has already caught up.
+	scheduler.checkAndFireReminders(context.Background())
+	scheduler.wg.Wait()
+	if sent := fakeTg.sentMessages(); len(sent) != 1 {
+		t.Fatalf("expected no additional fire right after catching up, got %d: %#v", len(sent), sent)
+	}
+}
+
 func TestReminderSchedulerDoesNotDoubleFireAConcurrentlyClaimedReminder(t *testing.T) {
 	repos := newReminderTestRepos(t)
 	fakeTg := newFakeTelegramServer(t)

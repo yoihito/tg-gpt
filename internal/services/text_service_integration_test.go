@@ -317,6 +317,31 @@ func TestTextServiceIntegrationRunScheduledActionSkipsWhenNoToolCall(t *testing.
 	}
 }
 
+// TestScheduledActionRunnerExcludesConsolidation locks in the fix for a scheduled
+// check's synthetic "[Scheduled reminder action triggered]" input triggering fact/
+// preference extraction as if the user had said it: the chat and scheduled-action
+// Definitions must run on separate Runners, and only the chat one may carry
+// ConsolidationPlugin.
+func TestScheduledActionRunnerExcludesConsolidation(t *testing.T) {
+	h := newTextServiceIntegrationHarness(t, nil)
+
+	for _, p := range h.textService.scheduledActionRunner.plugins {
+		if _, ok := p.(*ConsolidationPlugin); ok {
+			t.Fatal("scheduled-action runner must not run consolidation")
+		}
+	}
+
+	foundOnChatRunner := false
+	for _, p := range h.textService.runner.plugins {
+		if _, ok := p.(*ConsolidationPlugin); ok {
+			foundOnChatRunner = true
+		}
+	}
+	if !foundOnChatRunner {
+		t.Fatal("expected the chat runner to still run consolidation")
+	}
+}
+
 type textServiceIntegrationHarness struct {
 	db          *database.DB
 	user        models.User
@@ -382,7 +407,8 @@ func newTextServiceIntegrationHarness(t *testing.T, streams [][]llm.StreamEvent)
 		SemanticDedupCosine: 0.95,
 	})
 	episodeStore := NewEpisodeStore(traceRepo, episodeRepo, summarizer, embedder, EpisodeConfig{MinTurns: 2})
-	memoryPlugin := NewMemoryPlugin(traceStore, retriever, consolidator)
+	memoryPlugin := NewMemoryPlugin(traceStore, retriever)
+	consolidationPlugin := NewConsolidationPlugin(consolidator)
 
 	memoryService := NewMemoryService(prefRepo, consolidator, episodeStore)
 	reminderTools := NewReminderTools(reminderRepo, prefRepo)
@@ -391,15 +417,16 @@ func newTextServiceIntegrationHarness(t *testing.T, streams [][]llm.StreamEvent)
 		streams: streams,
 	}
 	textService := NewTextService(TextServiceDeps{
-		Client:           llmClient,
-		UsersRepo:        userRepo,
-		MemoryService:    memoryService,
-		Trace:            traceStore,
-		Episodes:         episodeStore,
-		MemoryPlugin:     memoryPlugin,
-		ReminderTools:    reminderTools,
-		WebSearchService: nil,
-		DefaultModel:     "test-model",
+		Client:              llmClient,
+		UsersRepo:           userRepo,
+		MemoryService:       memoryService,
+		Trace:               traceStore,
+		Episodes:            episodeStore,
+		MemoryPlugin:        memoryPlugin,
+		ConsolidationPlugin: consolidationPlugin,
+		ReminderTools:       reminderTools,
+		WebSearchService:    nil,
+		DefaultModel:        "test-model",
 	})
 
 	user, err := userRepo.Register(12345, "Vadim", "", "vadim", 54321, true, "test-model")

@@ -108,7 +108,8 @@ func main() {
 		traceRepo, episodeRepo, summarizer, embedder,
 		services.EpisodeConfig{MinTurns: appConfig.Memory.Episode.MinTurns},
 	)
-	memoryPlugin := services.NewMemoryPlugin(traceStore, retriever, consolidator)
+	memoryPlugin := services.NewMemoryPlugin(traceStore, retriever)
+	consolidationPlugin := services.NewConsolidationPlugin(consolidator)
 
 	memoryService := services.NewMemoryService(prefRepo, consolidator, episodeStore)
 
@@ -127,16 +128,17 @@ func main() {
 	reminderScheduler := services.NewReminderScheduler(reminderRepo, userRepo, prefRepo, traceStore, b)
 	webSearchService := services.NewWebSearchService(os.Getenv("TAVILY_API_KEY"))
 	textService := services.NewTextService(services.TextServiceDeps{
-		Client:           llmClientProxy,
-		UsersRepo:        userRepo,
-		MemoryService:    memoryService,
-		Trace:            traceStore,
-		Episodes:         episodeStore,
-		MemoryPlugin:     memoryPlugin,
-		Compactor:        windowCompactor,
-		ReminderTools:    reminderTools,
-		WebSearchService: webSearchService,
-		DefaultModel:     appConfig.DefaultModel.ModelId,
+		Client:              llmClientProxy,
+		UsersRepo:           userRepo,
+		MemoryService:       memoryService,
+		Trace:               traceStore,
+		Episodes:            episodeStore,
+		MemoryPlugin:        memoryPlugin,
+		ConsolidationPlugin: consolidationPlugin,
+		Compactor:           windowCompactor,
+		ReminderTools:       reminderTools,
+		WebSearchService:    webSearchService,
+		DefaultModel:        appConfig.DefaultModel.ModelId,
 	})
 	reminderScheduler.SetScheduledActionRunner(textService)
 	voiceService := &services.VoiceService{

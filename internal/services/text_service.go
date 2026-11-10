@@ -18,16 +18,17 @@ import (
 // matching the RetrievalConfig/ConsolidationConfig/EpisodeConfig pattern already used for
 // the memory constructors it's built alongside.
 type TextServiceDeps struct {
-	Client           LLMClient
-	UsersRepo        UsersRepo
-	MemoryService    *MemoryService
-	Trace            *TraceStore
-	Episodes         *EpisodeStore
-	MemoryPlugin     *MemoryPlugin
-	Compactor        *WindowCompactor
-	ReminderTools    *ReminderTools
-	WebSearchService *WebSearchService
-	DefaultModel     string
+	Client              LLMClient
+	UsersRepo           UsersRepo
+	MemoryService       *MemoryService
+	Trace               *TraceStore
+	Episodes            *EpisodeStore
+	MemoryPlugin        *MemoryPlugin
+	ConsolidationPlugin *ConsolidationPlugin
+	Compactor           *WindowCompactor
+	ReminderTools       *ReminderTools
+	WebSearchService    *WebSearchService
+	DefaultModel        string
 }
 
 func NewTextService(deps TextServiceDeps) *TextService {
@@ -42,11 +43,23 @@ func NewTextService(deps TextServiceDeps) *TextService {
 		defaultModel:     deps.DefaultModel,
 	}
 
-	plugins := []Plugin{deps.MemoryPlugin, NewUsagePlugin(deps.UsersRepo)}
+	// Two Runners sharing the same client, differing only in which plugins are
+	// attached (plugins are a Runner-construction-time decision — see AsTool's doc
+	// comment for the same pattern used for sub-agents): the chat Runner also
+	// consolidates facts/preferences from what the user said, which a scheduled
+	// action's synthetic input has none of.
+	basePlugins := []Plugin{deps.MemoryPlugin, NewUsagePlugin(deps.UsersRepo)}
 	if deps.Compactor != nil {
-		plugins = append(plugins, deps.Compactor)
+		basePlugins = append(basePlugins, deps.Compactor)
 	}
-	h.runner = NewRunner(deps.Client, plugins...)
+	chatPlugins := basePlugins
+	if deps.ConsolidationPlugin != nil {
+		chatPlugins = append([]Plugin{}, basePlugins...)
+		chatPlugins = append(chatPlugins, deps.ConsolidationPlugin)
+	}
+	h.runner = NewRunner(deps.Client, chatPlugins...)
+	h.scheduledActionRunner = NewRunner(deps.Client, basePlugins...)
+
 	h.defaultAgent = Definition{
 		Name:              "assistant",
 		BuildSystemPrompt: defaultSystemPrompt,
@@ -61,17 +74,18 @@ func NewTextService(deps TextServiceDeps) *TextService {
 }
 
 type TextService struct {
-	client               LLMClient
-	usersRepo            UsersRepo
-	memoryService        *MemoryService
-	trace                *TraceStore
-	episodes             *EpisodeStore
-	reminderTools        *ReminderTools
-	webSearchService     *WebSearchService
-	defaultModel         string
-	runner               *Runner
-	defaultAgent         Definition
-	scheduledActionAgent Definition
+	client                LLMClient
+	usersRepo             UsersRepo
+	memoryService         *MemoryService
+	trace                 *TraceStore
+	episodes              *EpisodeStore
+	reminderTools         *ReminderTools
+	webSearchService      *WebSearchService
+	defaultModel          string
+	runner                *Runner
+	scheduledActionRunner *Runner
+	defaultAgent          Definition
+	scheduledActionAgent  Definition
 }
 
 type LLMClient interface {
@@ -167,7 +181,7 @@ func (h *TextService) RunScheduledAction(ctx context.Context, user models.User, 
 	}
 	sink := &notifyResult{}
 	ctx = context.WithValue(ctx, notifyResultKey{}, sink)
-	_, err := h.runSingleInputTurn(ctx, user, reminder.DialogID, 0, msg, nil, h.scheduledActionAgent)
+	_, err := h.runSingleInputTurn(ctx, user, reminder.DialogID, 0, msg, nil, h.scheduledActionAgent, h.scheduledActionRunner)
 	if err != nil {
 		return false, "", err
 	}
@@ -193,7 +207,7 @@ type UserInput struct {
 }
 
 func (h *TextService) handleLLMRequest(ctx context.Context, user models.User, dialogID int64, tgUserMessageId int64, newMessage llm.Message, streamer *telegram_utils.TelegramStreamer) (string, error) {
-	return h.runSingleInputTurn(ctx, user, dialogID, tgUserMessageId, newMessage, streamer, h.defaultAgent)
+	return h.runSingleInputTurn(ctx, user, dialogID, tgUserMessageId, newMessage, streamer, h.defaultAgent, h.runner)
 }
 
 func (h *TextService) buildDefaultToolSet() *ToolSet {
@@ -279,7 +293,7 @@ func (h *TextService) RunAttachedTurn(
 	}
 	def := h.defaultAgent
 	def.Model = modelToUse
-	return h.runTurn(ctx, def, user, mctx, inputs, streamer, drainNewInputs)
+	return h.runTurn(ctx, h.runner, def, user, mctx, inputs, streamer, drainNewInputs)
 }
 
 func (h *TextService) PrepareUserForInput(ctx context.Context, user models.User) (models.User, error) {
@@ -318,6 +332,7 @@ func (h *TextService) runSingleInputTurn(
 	newMessage llm.Message,
 	streamer *telegram_utils.TelegramStreamer,
 	def Definition,
+	runner *Runner,
 ) (string, error) {
 	slog.InfoContext(ctx, "LLM request: preparing user",
 		"user_id", user.Id,
@@ -353,14 +368,16 @@ func (h *TextService) runSingleInputTurn(
 			Message:     newMessage,
 		},
 	}
-	return h.runTurn(ctx, def, user, mctx, inputs, streamer, nil)
+	return h.runTurn(ctx, runner, def, user, mctx, inputs, streamer, nil)
 }
 
-// runTurn runs def through the Runner and forwards its RunStream to streamer. This is
-// the only place TextService touches telegram_utils — Runner itself never does, so
-// nothing Telegram-specific needs to exist as a plugin.
+// runTurn runs def through runner and forwards its RunStream to streamer. This is the
+// only place TextService touches telegram_utils — Runner itself never does, so nothing
+// Telegram-specific needs to exist as a plugin. Which runner is passed in is what
+// decides side effects like consolidation (see NewTextService) — def alone never does.
 func (h *TextService) runTurn(
 	ctx context.Context,
+	runner *Runner,
 	def Definition,
 	user models.User,
 	mctx TurnContext,
@@ -371,7 +388,7 @@ func (h *TextService) runTurn(
 	if streamer != nil {
 		streamer.SetContext(ctx)
 	}
-	stream, err := h.runner.Run(ctx, def, user, mctx, inputs, RunOptions{DrainInputs: drainNewInputs})
+	stream, err := runner.Run(ctx, def, user, mctx, inputs, RunOptions{DrainInputs: drainNewInputs})
 	if err != nil {
 		slog.ErrorContext(ctx, "Got an error while starting the agent run", "error", err)
 		return "", err

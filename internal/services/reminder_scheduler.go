@@ -255,6 +255,12 @@ func (s *ReminderScheduler) releaseReminderClaim(ctx context.Context, reminderID
 	}
 }
 
+// maxCatchUpSteps caps nextFutureOccurrence's fast-forward loop — purely a safety
+// valve against an unforeseen infinite loop, never expected to actually bind (even an
+// hourly reminder left untouched for a couple of years is a few tens of thousands of
+// steps).
+const maxCatchUpSteps = 100000
+
 func (s *ReminderScheduler) rescheduleRecurring(ctx context.Context, reminder models.Reminder) {
 	loc, err := lookupUserTimezone(s.prefRepo, reminder.UserID)
 	if err != nil {
@@ -262,7 +268,7 @@ func (s *ReminderScheduler) rescheduleRecurring(ctx context.Context, reminder mo
 		loc = time.UTC
 	}
 
-	nextTime := reminder.CalculateNextOccurrence(loc)
+	nextTime := nextFutureOccurrence(reminder, loc, time.Now())
 	if nextTime == nil {
 		// Recurrence ended (past until-date or unsupported type) — close it out.
 		if err := s.reminderRepo.MarkReminderFired(reminder.ID, time.Now()); err != nil {
@@ -280,4 +286,23 @@ func (s *ReminderScheduler) rescheduleRecurring(ctx context.Context, reminder mo
 		"reminder_id", reminder.ID,
 		"next_time", nextTime,
 	)
+}
+
+// nextFutureOccurrence fast-forwards through any occurrences that have already
+// elapsed — e.g. the reminder's base RemindAt drifted behind now because the scheduler
+// was down, or because interval*unit is small (hourly) relative to how far behind it
+// fell — without firing the reminder for each skipped slot. CalculateNextOccurrence by
+// itself only ever advances one interval from RemindAt (by design, to avoid drift from
+// polling lag); chaining it here just finds the first result that's actually still in
+// the future before persisting, the same way a cron implementation skips missed runs
+// instead of bursting through all of them.
+func nextFutureOccurrence(reminder models.Reminder, loc *time.Location, now time.Time) *time.Time {
+	for i := 0; i < maxCatchUpSteps; i++ {
+		next := reminder.CalculateNextOccurrence(loc)
+		if next == nil || next.After(now) {
+			return next
+		}
+		reminder.RemindAt = *next
+	}
+	return &reminder.RemindAt
 }
