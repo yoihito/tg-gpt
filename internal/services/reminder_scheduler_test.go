@@ -75,6 +75,7 @@ func TestReminderSchedulerFiresDueOneShotReminder(t *testing.T) {
 	}
 
 	scheduler.checkAndFireReminders(context.Background())
+	scheduler.wg.Wait()
 
 	sent := fakeTg.sentMessages()
 	if len(sent) != 1 || !strings.Contains(sent[0], "buy milk") {
@@ -107,6 +108,7 @@ func TestReminderSchedulerSkipsReminderNotYetDue(t *testing.T) {
 	}
 
 	scheduler.checkAndFireReminders(context.Background())
+	scheduler.wg.Wait()
 
 	if sent := fakeTg.sentMessages(); len(sent) != 0 {
 		t.Fatalf("expected no messages sent for a not-yet-due reminder, got %#v", sent)
@@ -137,6 +139,7 @@ func TestReminderSchedulerReschedulesRecurringReminderAfterFiring(t *testing.T) 
 	}
 
 	scheduler.checkAndFireReminders(context.Background())
+	scheduler.wg.Wait()
 
 	rescheduled, err := repos.reminderRepo.GetReminderByID(id, reminderTestUserID)
 	if err != nil {
@@ -182,8 +185,199 @@ func TestReminderSchedulerDoesNotDoubleFireAConcurrentlyClaimedReminder(t *testi
 	}
 
 	scheduler.checkAndFireReminders(context.Background())
+	scheduler.wg.Wait()
 
 	if sent := fakeTg.sentMessages(); len(sent) != 0 {
 		t.Fatalf("expected no message sent for an already-claimed reminder, got %#v", sent)
+	}
+}
+
+type scheduledRunnerFunc func(context.Context, models.User, models.Reminder) (string, error)
+
+func (f scheduledRunnerFunc) RunScheduledAction(ctx context.Context, user models.User, reminder models.Reminder) (string, error) {
+	return f(ctx, user, reminder)
+}
+
+func TestSchedulerStopCancelsFloodWaitAndAllowsRestart(t *testing.T) {
+	repos := newReminderTestRepos(t)
+	flooded := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		select {
+		case flooded <- struct{}{}:
+		default:
+		}
+		_, _ = w.Write([]byte(`{"ok":false,"error_code":429,"description":"Too Many Requests: retry after 230","parameters":{"retry_after":230}}`))
+	}))
+	defer server.Close()
+	scheduler := NewReminderScheduler(repos.reminderRepo, repos.userRepo, repos.prefRepo, NewTraceStore(repos.traceRepo), newTestBot(t, server.URL))
+	scheduler.SetScheduledActionRunner(scheduledRunnerFunc(func(context.Context, models.User, models.Reminder) (string, error) { return "scheduled answer", nil }))
+	id, err := repos.reminderRepo.CreateReminder(models.Reminder{
+		UserID: reminderTestUserID, Message: "scheduled action", RemindAt: time.Now().Add(-time.Minute),
+		ActionType: models.ReminderActionPrompt, ActionPrompt: "answer", RecurrenceInterval: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := scheduler.StartScheduler(parent); err != nil {
+		t.Fatal(err)
+	}
+	scheduler.ticker.Reset(time.Millisecond)
+	select {
+	case <-flooded:
+	case <-time.After(time.Second):
+		cancel()
+		_ = scheduler.StopScheduler(parent)
+		t.Fatal("scheduled delivery never attempted")
+	}
+	stopped := make(chan error, 1)
+	go func() { stopped <- scheduler.StopScheduler(context.Background()) }()
+	select {
+	case err := <-stopped:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatal("StopScheduler did not cancel flood wait")
+	}
+	if parent.Err() != nil {
+		t.Fatal("shutdown required parent context cancellation")
+	}
+	reminder, err := repos.reminderRepo.GetReminderByID(id, reminderTestUserID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reminder.IsProcessing || reminder.IsFired {
+		t.Fatal("failed delivery should release its claim without marking fired")
+	}
+	if err := scheduler.StartScheduler(parent); err != nil {
+		t.Fatal(err)
+	}
+	if err := scheduler.StopScheduler(parent); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestScheduledDeliveryTimeoutReleasesClaim(t *testing.T) {
+	repos := newReminderTestRepos(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":false,"error_code":429,"description":"Too Many Requests: retry after 230","parameters":{"retry_after":230}}`))
+	}))
+	defer server.Close()
+	scheduler := NewReminderScheduler(repos.reminderRepo, repos.userRepo, repos.prefRepo, NewTraceStore(repos.traceRepo), newTestBot(t, server.URL))
+	scheduler.deliveryTimeout = 20 * time.Millisecond
+	scheduler.SetScheduledActionRunner(scheduledRunnerFunc(func(context.Context, models.User, models.Reminder) (string, error) { return "scheduled answer", nil }))
+	id, err := repos.reminderRepo.CreateReminder(models.Reminder{
+		UserID: reminderTestUserID, Message: "action", ActionType: models.ReminderActionPrompt,
+		RemindAt: time.Now().Add(-time.Minute), RecurrenceInterval: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheduler.checkAndFireReminders(context.Background())
+	done := make(chan struct{})
+	go func() { scheduler.wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("delivery timeout did not bound retries")
+	}
+	reminder, err := repos.reminderRepo.GetReminderByID(id, reminderTestUserID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reminder.IsProcessing || reminder.IsFired {
+		t.Fatal("timed-out delivery should remain eligible for retry")
+	}
+}
+
+func TestFloodedScheduledActionDoesNotBlockOtherUsers(t *testing.T) {
+	repos := newReminderTestRepos(t)
+	otherUserID := reminderTestUserID + 1
+	if _, err := repos.userRepo.Register(otherUserID, "Other", "", "", reminderTestChatID+1, true, "test-model"); err != nil {
+		t.Fatal(err)
+	}
+	flooded := make(chan struct{}, 1)
+	notified := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Text string `json:"text"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if body.Text == "scheduled answer" {
+			select {
+			case flooded <- struct{}{}:
+			default:
+			}
+			_, _ = w.Write([]byte(`{"ok":false,"error_code":429,"description":"Too Many Requests: retry after 230","parameters":{"retry_after":230}}`))
+		} else {
+			select {
+			case notified <- struct{}{}:
+			default:
+			}
+			_, _ = w.Write([]byte(`{"ok":true,"result":{"message_id":1,"chat":{"id":1}}}`))
+		}
+	}))
+	defer server.Close()
+	scheduler := NewReminderScheduler(repos.reminderRepo, repos.userRepo, repos.prefRepo, NewTraceStore(repos.traceRepo), newTestBot(t, server.URL))
+	scheduler.SetScheduledActionRunner(scheduledRunnerFunc(func(context.Context, models.User, models.Reminder) (string, error) { return "scheduled answer", nil }))
+	for _, reminder := range []models.Reminder{
+		{UserID: reminderTestUserID, Message: "action", ActionType: models.ReminderActionPrompt, RemindAt: time.Now().Add(-time.Minute), RecurrenceInterval: 1},
+		{UserID: otherUserID, Message: "buy milk", RemindAt: time.Now().Add(-time.Minute), RecurrenceInterval: 1},
+	} {
+		if _, err := repos.reminderRepo.CreateReminder(reminder); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() { cancel(); scheduler.wg.Wait() }()
+	scheduler.checkAndFireReminders(ctx)
+	select {
+	case <-flooded:
+	case <-time.After(time.Second):
+		t.Fatal("expected flood response")
+	}
+	select {
+	case <-notified:
+	case <-time.After(time.Second):
+		t.Fatal("flood wait blocked other user")
+	}
+}
+
+func TestSchedulerKeepsActionsSequentialPerUser(t *testing.T) {
+	repos := newReminderTestRepos(t)
+	fakeTg := newFakeTelegramServer(t)
+	scheduler := NewReminderScheduler(repos.reminderRepo, repos.userRepo, repos.prefRepo, NewTraceStore(repos.traceRepo), newTestBot(t, fakeTg.server.URL))
+	started := make(chan struct{}, 2)
+	scheduler.SetScheduledActionRunner(scheduledRunnerFunc(func(ctx context.Context, _ models.User, _ models.Reminder) (string, error) {
+		started <- struct{}{}
+		<-ctx.Done()
+		return "", ctx.Err()
+	}))
+	for i := 0; i < 2; i++ {
+		if _, err := repos.reminderRepo.CreateReminder(models.Reminder{UserID: reminderTestUserID, Message: "action", ActionType: models.ReminderActionPrompt, RemindAt: time.Now().Add(-time.Minute), RecurrenceInterval: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() { cancel(); scheduler.wg.Wait() }()
+	scheduler.checkAndFireReminders(ctx)
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("action never started")
+	}
+	scheduler.checkAndFireReminders(ctx)
+	select {
+	case <-started:
+		t.Fatal("two actions ran concurrently for the same user")
+	case <-time.After(20 * time.Millisecond):
 	}
 }

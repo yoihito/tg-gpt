@@ -14,6 +14,9 @@ import (
 	"vadimgribanov.com/tg-gpt/internal/telegram_utils"
 )
 
+const scheduledDeliveryTimeout = 30 * time.Second
+const reminderWorkers = 4
+
 type ScheduledActionRunner interface {
 	RunScheduledAction(ctx context.Context, user models.User, reminder models.Reminder) (string, error)
 }
@@ -29,11 +32,14 @@ type ReminderScheduler struct {
 	bot          *tele.Bot
 	actionRunner ScheduledActionRunner
 
-	ticker    *time.Ticker
-	stopChan  chan struct{}
-	wg        sync.WaitGroup
-	mu        sync.Mutex
-	isRunning bool
+	ticker          *time.Ticker
+	cancel          context.CancelFunc
+	workers         chan struct{}
+	activeUsers     sync.Map
+	deliveryTimeout time.Duration
+	wg              sync.WaitGroup
+	mu              sync.Mutex
+	isRunning       bool
 }
 
 func NewReminderScheduler(
@@ -44,12 +50,13 @@ func NewReminderScheduler(
 	bot *tele.Bot,
 ) *ReminderScheduler {
 	return &ReminderScheduler{
-		reminderRepo: reminderRepo,
-		userRepo:     userRepo,
-		prefRepo:     prefRepo,
-		trace:        trace,
-		bot:          bot,
-		stopChan:     make(chan struct{}),
+		reminderRepo:    reminderRepo,
+		userRepo:        userRepo,
+		prefRepo:        prefRepo,
+		trace:           trace,
+		bot:             bot,
+		workers:         make(chan struct{}, reminderWorkers),
+		deliveryTimeout: scheduledDeliveryTimeout,
 	}
 }
 
@@ -63,6 +70,7 @@ func (s *ReminderScheduler) StartScheduler(ctx context.Context) error {
 	if s.isRunning {
 		return fmt.Errorf("scheduler already running")
 	}
+	ctx, s.cancel = context.WithCancel(ctx)
 	s.ticker = time.NewTicker(30 * time.Second)
 	s.isRunning = true
 	s.wg.Add(1)
@@ -78,7 +86,7 @@ func (s *ReminderScheduler) StopScheduler(ctx context.Context) error {
 		return nil
 	}
 	slog.InfoContext(ctx, "Stopping reminder scheduler")
-	close(s.stopChan)
+	s.cancel()
 	s.ticker.Stop()
 	s.wg.Wait()
 	s.isRunning = false
@@ -91,7 +99,7 @@ func (s *ReminderScheduler) schedulerLoop(ctx context.Context) {
 	slog.InfoContext(ctx, "Scheduler loop started")
 	for {
 		select {
-		case <-s.stopChan:
+		case <-ctx.Done():
 			slog.InfoContext(ctx, "Scheduler loop stopping")
 			return
 		case <-s.ticker.C:
@@ -111,7 +119,28 @@ func (s *ReminderScheduler) checkAndFireReminders(ctx context.Context) {
 	}
 	slog.InfoContext(ctx, "Found due reminders", "count", len(dueReminders))
 	for _, reminder := range dueReminders {
-		s.fireReminder(ctx, reminder)
+		if ctx.Err() != nil {
+			return
+		}
+		select {
+		case s.workers <- struct{}{}:
+			if _, busy := s.activeUsers.LoadOrStore(reminder.UserID, struct{}{}); busy {
+				<-s.workers
+				continue
+			}
+			s.wg.Add(1)
+			go func() {
+				defer s.wg.Done()
+				defer s.activeUsers.Delete(reminder.UserID)
+				defer func() { <-s.workers }()
+				if ctx.Err() == nil {
+					s.fireReminder(ctx, reminder)
+				}
+			}()
+		default:
+			// Unclaimed reminders remain due and will be picked up on the next tick.
+			return
+		}
 	}
 }
 
@@ -198,7 +227,9 @@ func (s *ReminderScheduler) fireScheduledAction(ctx context.Context, user models
 	if strings.TrimSpace(response) == "" {
 		response = "Scheduled action completed, but returned no text."
 	}
-	if err := telegram_utils.SendChunked(s.bot, &tele.User{ID: user.ChatId}, response); err != nil {
+	deliveryCtx, cancel := context.WithTimeout(ctx, s.deliveryTimeout)
+	defer cancel()
+	if err := telegram_utils.SendChunked(deliveryCtx, s.bot, &tele.User{ID: user.ChatId}, response); err != nil {
 		slog.ErrorContext(ctx, "Failed to send scheduled action result", "error", err, "reminder_id", reminder.ID)
 		s.releaseReminderClaim(ctx, reminder.ID)
 		return

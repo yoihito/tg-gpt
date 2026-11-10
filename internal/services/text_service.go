@@ -294,6 +294,9 @@ func (h *TextService) runTurn(
 	streamer *telegram_utils.TelegramStreamer,
 	drainNewInputs func(context.Context) ([]UserInput, error),
 ) (string, error) {
+	if streamer != nil {
+		streamer.SetContext(ctx)
+	}
 	stream, err := h.runner.Run(ctx, def, user, mctx, inputs, RunOptions{DrainInputs: drainNewInputs})
 	if err != nil {
 		slog.ErrorContext(ctx, "Got an error while starting the agent run", "error", err)

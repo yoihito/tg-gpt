@@ -2,7 +2,6 @@ package telegram_utils
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"strings"
 
@@ -14,34 +13,40 @@ const MaxTelegramMessageLength = 4096
 const StreamingInterval = 200
 
 type TelegramStreamer struct {
-	messages           []*tele.Message
 	currentMessage     *tele.Message
 	replyTo            *tele.Message
 	accumulatedMessage string
 	prevLength         int
-	c                  tele.Context
+	bot                *tele.Bot
+	ctx                context.Context
+	delivery           *chatDelivery
 }
 
 func NewTelegramStreamer(c tele.Context, replyTo *tele.Message) *TelegramStreamer {
 	return &TelegramStreamer{
-		c:        c,
+		bot:      c.Bot(),
+		ctx:      c.Get("requestContext").(context.Context),
+		delivery: deliveryFor(c.Bot(), replyTo.Chat.Recipient()),
 		replyTo:  replyTo,
-		messages: []*tele.Message{},
 	}
 }
+
+// SetContext binds delivery waits to the dispatched turn so /cancel interrupts them.
+func (t *TelegramStreamer) SetContext(ctx context.Context) { t.ctx = ctx }
 
 func (t *TelegramStreamer) HasOutput() bool {
 	return t.currentMessage != nil || strings.TrimSpace(t.accumulatedMessage) != ""
 }
 
 func (t *TelegramStreamer) SendStatus(text string) error {
-	ctx := t.c.Get("requestContext").(context.Context)
 	if t.HasOutput() || strings.TrimSpace(text) == "" {
 		return nil
 	}
-	msg, err := t.c.Bot().Reply(t.replyTo, text, &tele.SendOptions{ParseMode: tele.ModeDefault, ThreadID: t.replyTo.ThreadID})
+	msg, _, err := t.delivery.deliver(t.ctx, true, func() (*tele.Message, error) {
+		return t.bot.Reply(t.replyTo, text, &tele.SendOptions{ParseMode: tele.ModeDefault, ThreadID: t.replyTo.ThreadID})
+	})
 	if err != nil {
-		slog.ErrorContext(ctx, "Error sending status message", "error", err, "message", text)
+		slog.ErrorContext(t.ctx, "Error sending status message", "error", err, "message", text)
 		return err
 	}
 	t.currentMessage = msg
@@ -49,67 +54,69 @@ func (t *TelegramStreamer) SendStatus(text string) error {
 }
 
 func (t *TelegramStreamer) SendEvent(event llm.StreamEvent) error {
-	ctx := t.c.Get("requestContext").(context.Context)
-	slog.DebugContext(ctx, "Streaming event", "event", event)
-	textChunk := event.TextDelta
-	if textChunk == "" {
+	slog.DebugContext(t.ctx, "Streaming event", "event", event)
+	if event.TextDelta == "" {
 		return nil
 	}
-
-	if len(t.accumulatedMessage)+len(textChunk) >= MaxTelegramMessageLength {
-		if t.prevLength != len(t.accumulatedMessage) {
-			err := t.Flush()
-			if err != nil {
-				return err
-			}
+	t.accumulatedMessage += event.TextDelta
+	for {
+		chunk, rest := splitMessage(t.accumulatedMessage)
+		t.accumulatedMessage = chunk
+		if rest == "" {
+			break
 		}
-		t.messages = append(t.messages, t.currentMessage)
+		if err := t.Flush(); err != nil {
+			return err
+		}
 		t.currentMessage = nil
-		t.accumulatedMessage = ""
+		t.accumulatedMessage = rest
 		t.prevLength = 0
 	}
-	t.accumulatedMessage += textChunk
+
 	if len(t.accumulatedMessage)-t.prevLength < StreamingInterval {
 		return nil
 	}
-	t.prevLength = len(t.accumulatedMessage)
-	return t.Flush()
+	return t.flush(false)
 }
 
-func (t *TelegramStreamer) Flush() error {
-	ctx := t.c.Get("requestContext").(context.Context)
+func (t *TelegramStreamer) Flush() error { return t.flush(true) }
 
-	// Don't send empty messages
-	if strings.TrimSpace(t.accumulatedMessage) == "" {
+func (t *TelegramStreamer) flush(wait bool) error {
+	if strings.TrimSpace(t.accumulatedMessage) == "" || t.prevLength == len(t.accumulatedMessage) {
 		return nil
 	}
-
-	var err error
-	if t.currentMessage == nil {
-		slog.DebugContext(ctx, "Telegram streamer: sending message", "message_len", len(t.accumulatedMessage))
-		t.currentMessage, err = t.c.Bot().Reply(t.replyTo, FixMarkdown(t.accumulatedMessage), &tele.SendOptions{ParseMode: tele.ModeMarkdown, ThreadID: t.replyTo.ThreadID})
-		if err != nil {
-			t.currentMessage, err = t.c.Bot().Reply(t.replyTo, t.accumulatedMessage, &tele.SendOptions{ParseMode: tele.ModeDefault, ThreadID: t.replyTo.ThreadID})
-			slog.ErrorContext(ctx, "Error sending message", "error", err, "message", t.accumulatedMessage)
-		}
-	} else {
-		slog.DebugContext(ctx, "Telegram streamer: editing message", "message_len", len(t.accumulatedMessage))
-		_, err = t.c.Bot().Edit(t.currentMessage, FixMarkdown(t.accumulatedMessage), &tele.SendOptions{ParseMode: tele.ModeMarkdown})
-		if err != nil {
-			_, err = t.c.Bot().Edit(t.currentMessage, t.accumulatedMessage, &tele.SendOptions{ParseMode: tele.ModeDefault})
-			slog.ErrorContext(ctx, "Error editing message", "error", err, "message", t.accumulatedMessage)
+	// Intermediate updates hold back a Markdown link that's still being streamed
+	// in: unlike bold/italic/code, an in-progress "[text](url" can't be closed
+	// without the rest of the URL, so sending it as-is would trip Telegram's
+	// entity parser. The final flush (wait==true) always sends everything,
+	// relying on withMarkdownFallback's plain-text fallback for anything that's
+	// genuinely malformed rather than just unfinished.
+	textToSend := t.accumulatedMessage
+	if !wait {
+		textToSend = trimIncompleteLink(textToSend)
+		if strings.TrimSpace(textToSend) == "" {
+			return nil
 		}
 	}
-
+	msg, delivered, err := t.delivery.deliver(t.ctx, wait, func() (*tele.Message, error) {
+		return withMarkdownFallback(textToSend, func(text string, mode tele.ParseMode) (*tele.Message, error) {
+			options := &tele.SendOptions{ParseMode: mode, ThreadID: t.replyTo.ThreadID}
+			if t.currentMessage == nil {
+				return t.bot.Reply(t.replyTo, text, options)
+			}
+			return t.bot.Edit(t.currentMessage, text, options)
+		})
+	})
 	if err != nil {
-		slog.ErrorContext(ctx, "Error streaming", "error", err)
-		_, noticeErr := t.c.Bot().Reply(t.replyTo, "Failed to answer the message", &tele.SendOptions{ThreadID: t.replyTo.ThreadID})
-		if noticeErr != nil {
-			slog.ErrorContext(ctx, "Error sending notice", "error", noticeErr)
-		}
-		return errors.Join(err, noticeErr)
+		slog.ErrorContext(t.ctx, "Error streaming", "error", err)
+		return err
 	}
-	slog.DebugContext(ctx, "Telegram streamer: flushed", "message_len", len(t.accumulatedMessage))
+	if delivered {
+		if t.currentMessage == nil {
+			t.currentMessage = msg
+		}
+		t.prevLength = len(textToSend)
+	}
 	return nil
 }
 
@@ -119,20 +126,64 @@ func (t *TelegramStreamer) Flush() error {
 // "try Markdown, fall back to plain, respect the length limit" contract for the same API,
 // so every caller that needs to push text to a chat outside a live stream shares this
 // instead of writing its own copy.
-func SendChunked(bot *tele.Bot, recipient tele.Recipient, text string) error {
-	for len(text) > 0 {
-		chunk := text
-		if len(chunk) > MaxTelegramMessageLength {
-			chunk = text[:MaxTelegramMessageLength]
+func SendChunked(ctx context.Context, bot *tele.Bot, recipient tele.Recipient, text string) error {
+	delivery := deliveryFor(bot, recipient.Recipient())
+	for text != "" {
+		chunk, rest := splitMessage(text)
+		_, _, err := delivery.deliver(ctx, true, func() (*tele.Message, error) {
+			return withMarkdownFallback(chunk, func(text string, mode tele.ParseMode) (*tele.Message, error) {
+				return bot.Send(recipient, text, &tele.SendOptions{ParseMode: mode})
+			})
+		})
+		if err != nil {
+			return err
 		}
-		if _, err := bot.Send(recipient, FixMarkdown(chunk), &tele.SendOptions{ParseMode: tele.ModeMarkdown}); err != nil {
-			if _, fallbackErr := bot.Send(recipient, chunk, &tele.SendOptions{ParseMode: tele.ModeDefault}); fallbackErr != nil {
-				return fallbackErr
-			}
-		}
-		text = text[len(chunk):]
+		text = rest
 	}
 	return nil
+}
+
+// trimIncompleteLink returns the longest prefix of text that doesn't end in the
+// middle of a Markdown link ([text](url)). A link still being streamed in can't
+// be closed the way an unclosed bold/italic/code span can, since the rest of the
+// URL isn't known yet.
+func trimIncompleteLink(text string) string {
+	const (
+		normal = iota
+		afterOpenBracket
+		afterCloseBracket
+		afterOpenParen
+	)
+	runes := []rune(text)
+	state := normal
+	linkStart := -1
+	for i := 0; i < len(runes); i++ {
+		if runes[i] == '\\' {
+			i++ // skip escaped character without affecting link state
+			continue
+		}
+		r := runes[i]
+		if state == afterCloseBracket && r != '(' {
+			state = normal
+			linkStart = -1
+		}
+		switch {
+		case r == '[' && state == normal:
+			state = afterOpenBracket
+			linkStart = i
+		case r == ']' && state == afterOpenBracket:
+			state = afterCloseBracket
+		case r == '(' && state == afterCloseBracket:
+			state = afterOpenParen
+		case r == ')' && state == afterOpenParen:
+			state = normal
+			linkStart = -1
+		}
+	}
+	if state != normal && linkStart >= 0 {
+		return string(runes[:linkStart])
+	}
+	return text
 }
 
 func FixMarkdown(markdown string) string {
