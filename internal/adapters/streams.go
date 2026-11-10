@@ -2,12 +2,13 @@ package adapters
 
 import (
 	"sort"
+	"strings"
 
 	"vadimgribanov.com/tg-gpt/internal/llm"
 )
 
 type StreamAccumulator struct {
-	accumulatedResponse string
+	accumulatedResponse strings.Builder
 	promptTokens        int64
 	cachedPromptTokens  int64
 	completionTokens    int64
@@ -22,7 +23,7 @@ func NewStreamAccumulator() *StreamAccumulator {
 
 func (s *StreamAccumulator) AddEvent(event llm.StreamEvent) {
 	if event.TextDelta != "" {
-		s.accumulatedResponse += event.TextDelta
+		s.accumulatedResponse.WriteString(event.TextDelta)
 	}
 	if event.ToolCall != nil {
 		s.addToolCallDelta(*event.ToolCall)
@@ -55,7 +56,7 @@ func (s *StreamAccumulator) addToolCallDelta(call llm.ToolCall) {
 }
 
 func (s *StreamAccumulator) AccumulatedResponse() string {
-	return s.accumulatedResponse
+	return s.accumulatedResponse.String()
 }
 
 func (s *StreamAccumulator) OutputTokens() int64 {
