@@ -18,9 +18,10 @@ import (
 // fakeTelegramServer records every sendMessage call a *tele.Bot makes against it and
 // answers with the minimum valid Telegram API response the client library needs.
 type fakeTelegramServer struct {
-	mu       sync.Mutex
-	messages []string
-	server   *httptest.Server
+	mu        sync.Mutex
+	messages  []string
+	threadIDs []string
+	server    *httptest.Server
 }
 
 func newFakeTelegramServer(t *testing.T) *fakeTelegramServer {
@@ -29,11 +30,13 @@ func newFakeTelegramServer(t *testing.T) *fakeTelegramServer {
 	f.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/sendMessage") {
 			var body struct {
-				Text string `json:"text"`
+				Text     string `json:"text"`
+				ThreadID string `json:"message_thread_id"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			f.mu.Lock()
 			f.messages = append(f.messages, body.Text)
+			f.threadIDs = append(f.threadIDs, body.ThreadID)
 			f.mu.Unlock()
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -48,6 +51,14 @@ func (f *fakeTelegramServer) sentMessages() []string {
 	defer f.mu.Unlock()
 	out := make([]string, len(f.messages))
 	copy(out, f.messages)
+	return out
+}
+
+func (f *fakeTelegramServer) sentThreadIDs() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, len(f.threadIDs))
+	copy(out, f.threadIDs)
 	return out
 }
 
@@ -91,6 +102,37 @@ func TestReminderSchedulerFiresDueOneShotReminder(t *testing.T) {
 	}
 	if fired.IsProcessing {
 		t.Fatal("expected claim to be released once fired")
+	}
+}
+
+func TestReminderSchedulerRoutesNotifyReminderToOriginThread(t *testing.T) {
+	repos := newReminderTestRepos(t)
+	fakeTg := newFakeTelegramServer(t)
+	traceStore := NewTraceStore(repos.traceRepo)
+	scheduler := NewReminderScheduler(repos.reminderRepo, repos.userRepo, repos.prefRepo, traceStore, newTestBot(t, fakeTg.server.URL))
+
+	const originDialogID = int64(555)
+	if _, err := repos.reminderRepo.CreateReminder(models.Reminder{
+		UserID: reminderTestUserID, DialogID: originDialogID, Message: "water the plants",
+		RemindAt: time.Now().Add(-time.Minute), RecurrenceInterval: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	scheduler.checkAndFireReminders(context.Background())
+	scheduler.wg.Wait()
+
+	threads := fakeTg.sentThreadIDs()
+	if len(threads) != 1 || threads[0] != "555" {
+		t.Fatalf("expected the reminder routed to its origin thread (555), got %v", threads)
+	}
+
+	events, err := repos.traceRepo.GetAllForDialog(reminderTestUserID, originDialogID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) == 0 {
+		t.Fatal("expected the reminder fire to be recorded in the origin thread's trace")
 	}
 }
 
@@ -192,10 +234,68 @@ func TestReminderSchedulerDoesNotDoubleFireAConcurrentlyClaimedReminder(t *testi
 	}
 }
 
-type scheduledRunnerFunc func(context.Context, models.User, models.Reminder) (string, error)
+type scheduledRunnerFunc func(context.Context, models.User, models.Reminder) (bool, string, error)
 
-func (f scheduledRunnerFunc) RunScheduledAction(ctx context.Context, user models.User, reminder models.Reminder) (string, error) {
+func (f scheduledRunnerFunc) RunScheduledAction(ctx context.Context, user models.User, reminder models.Reminder) (bool, string, error) {
 	return f(ctx, user, reminder)
+}
+
+func TestFireScheduledActionSkipsSendWhenAgentHasNothingToReport(t *testing.T) {
+	repos := newReminderTestRepos(t)
+	fakeTg := newFakeTelegramServer(t)
+	scheduler := NewReminderScheduler(repos.reminderRepo, repos.userRepo, repos.prefRepo, NewTraceStore(repos.traceRepo), newTestBot(t, fakeTg.server.URL))
+	scheduler.SetScheduledActionRunner(scheduledRunnerFunc(func(context.Context, models.User, models.Reminder) (bool, string, error) {
+		return false, "", nil
+	}))
+	id, err := repos.reminderRepo.CreateReminder(models.Reminder{
+		UserID: reminderTestUserID, Message: "check news", ActionType: models.ReminderActionPrompt, ActionPrompt: "check",
+		RemindAt: time.Now().Add(-time.Minute), RecurrenceInterval: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	scheduler.checkAndFireReminders(context.Background())
+	scheduler.wg.Wait()
+
+	if sent := fakeTg.sentMessages(); len(sent) != 0 {
+		t.Fatalf("expected no message when the agent found nothing to report, got %#v", sent)
+	}
+	fired, err := repos.reminderRepo.GetReminderByID(id, reminderTestUserID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fired.IsFired || fired.IsProcessing {
+		t.Fatal("a silent check should still be marked fired, same as a notified one")
+	}
+}
+
+func TestFireScheduledActionSendsToOriginThreadWhenNotified(t *testing.T) {
+	repos := newReminderTestRepos(t)
+	fakeTg := newFakeTelegramServer(t)
+	scheduler := NewReminderScheduler(repos.reminderRepo, repos.userRepo, repos.prefRepo, NewTraceStore(repos.traceRepo), newTestBot(t, fakeTg.server.URL))
+	scheduler.SetScheduledActionRunner(scheduledRunnerFunc(func(context.Context, models.User, models.Reminder) (bool, string, error) {
+		return true, "breaking news!", nil
+	}))
+	if _, err := repos.reminderRepo.CreateReminder(models.Reminder{
+		UserID: reminderTestUserID, DialogID: 42, Message: "check news",
+		ActionType: models.ReminderActionPrompt, ActionPrompt: "check",
+		RemindAt: time.Now().Add(-time.Minute), RecurrenceInterval: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	scheduler.checkAndFireReminders(context.Background())
+	scheduler.wg.Wait()
+
+	sent := fakeTg.sentMessages()
+	if len(sent) != 1 || sent[0] != "breaking news!" {
+		t.Fatalf("expected the notify_user message to be sent, got %#v", sent)
+	}
+	threads := fakeTg.sentThreadIDs()
+	if len(threads) != 1 || threads[0] != "42" {
+		t.Fatalf("expected the message routed to its origin thread (42), got %v", threads)
+	}
 }
 
 func TestSchedulerStopCancelsFloodWaitAndAllowsRestart(t *testing.T) {
@@ -211,7 +311,9 @@ func TestSchedulerStopCancelsFloodWaitAndAllowsRestart(t *testing.T) {
 	}))
 	defer server.Close()
 	scheduler := NewReminderScheduler(repos.reminderRepo, repos.userRepo, repos.prefRepo, NewTraceStore(repos.traceRepo), newTestBot(t, server.URL))
-	scheduler.SetScheduledActionRunner(scheduledRunnerFunc(func(context.Context, models.User, models.Reminder) (string, error) { return "scheduled answer", nil }))
+	scheduler.SetScheduledActionRunner(scheduledRunnerFunc(func(context.Context, models.User, models.Reminder) (bool, string, error) {
+		return true, "scheduled answer", nil
+	}))
 	id, err := repos.reminderRepo.CreateReminder(models.Reminder{
 		UserID: reminderTestUserID, Message: "scheduled action", RemindAt: time.Now().Add(-time.Minute),
 		ActionType: models.ReminderActionPrompt, ActionPrompt: "answer", RecurrenceInterval: 1,
@@ -270,7 +372,9 @@ func TestScheduledDeliveryTimeoutReleasesClaim(t *testing.T) {
 	defer server.Close()
 	scheduler := NewReminderScheduler(repos.reminderRepo, repos.userRepo, repos.prefRepo, NewTraceStore(repos.traceRepo), newTestBot(t, server.URL))
 	scheduler.deliveryTimeout = 20 * time.Millisecond
-	scheduler.SetScheduledActionRunner(scheduledRunnerFunc(func(context.Context, models.User, models.Reminder) (string, error) { return "scheduled answer", nil }))
+	scheduler.SetScheduledActionRunner(scheduledRunnerFunc(func(context.Context, models.User, models.Reminder) (bool, string, error) {
+		return true, "scheduled answer", nil
+	}))
 	id, err := repos.reminderRepo.CreateReminder(models.Reminder{
 		UserID: reminderTestUserID, Message: "action", ActionType: models.ReminderActionPrompt,
 		RemindAt: time.Now().Add(-time.Minute), RecurrenceInterval: 1,
@@ -327,7 +431,9 @@ func TestFloodedScheduledActionDoesNotBlockOtherUsers(t *testing.T) {
 	}))
 	defer server.Close()
 	scheduler := NewReminderScheduler(repos.reminderRepo, repos.userRepo, repos.prefRepo, NewTraceStore(repos.traceRepo), newTestBot(t, server.URL))
-	scheduler.SetScheduledActionRunner(scheduledRunnerFunc(func(context.Context, models.User, models.Reminder) (string, error) { return "scheduled answer", nil }))
+	scheduler.SetScheduledActionRunner(scheduledRunnerFunc(func(context.Context, models.User, models.Reminder) (bool, string, error) {
+		return true, "scheduled answer", nil
+	}))
 	for _, reminder := range []models.Reminder{
 		{UserID: reminderTestUserID, Message: "action", ActionType: models.ReminderActionPrompt, RemindAt: time.Now().Add(-time.Minute), RecurrenceInterval: 1},
 		{UserID: otherUserID, Message: "buy milk", RemindAt: time.Now().Add(-time.Minute), RecurrenceInterval: 1},
@@ -356,10 +462,10 @@ func TestSchedulerKeepsActionsSequentialPerUser(t *testing.T) {
 	fakeTg := newFakeTelegramServer(t)
 	scheduler := NewReminderScheduler(repos.reminderRepo, repos.userRepo, repos.prefRepo, NewTraceStore(repos.traceRepo), newTestBot(t, fakeTg.server.URL))
 	started := make(chan struct{}, 2)
-	scheduler.SetScheduledActionRunner(scheduledRunnerFunc(func(ctx context.Context, _ models.User, _ models.Reminder) (string, error) {
+	scheduler.SetScheduledActionRunner(scheduledRunnerFunc(func(ctx context.Context, _ models.User, _ models.Reminder) (bool, string, error) {
 		started <- struct{}{}
 		<-ctx.Done()
-		return "", ctx.Err()
+		return false, "", ctx.Err()
 	}))
 	for i := 0; i < 2; i++ {
 		if _, err := repos.reminderRepo.CreateReminder(models.Reminder{UserID: reminderTestUserID, Message: "action", ActionType: models.ReminderActionPrompt, RemindAt: time.Now().Add(-time.Minute), RecurrenceInterval: 1}); err != nil {

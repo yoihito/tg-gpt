@@ -75,6 +75,7 @@ func (db *DB) Migrate() error {
 		createEpisodicMemoryFTS,
 		createEpisodicMemoryFTSTriggers,
 		createRemindersTable,
+		createDialogCompactionTable,
 	}
 
 	for i, migration := range schemaMigrations {
@@ -99,8 +100,82 @@ func (db *DB) Migrate() error {
 		return fmt.Errorf("failed to drop users.current_dialog_id column: %w", err)
 	}
 
+	if err := db.addReminderDialogIDAndHourlyRecurrenceIfMissing(); err != nil {
+		return fmt.Errorf("failed to add reminders.dialog_id and hourly recurrence: %w", err)
+	}
+
 	slog.Info("Database migrations completed successfully")
 	return nil
+}
+
+// addReminderDialogIDAndHourlyRecurrenceIfMissing adds reminders.dialog_id (so
+// scheduled sends can target the thread that created them) and widens the
+// recurrence_type CHECK constraint to allow 'hourly'. Both require a table rebuild —
+// dialog_id can't just be ADD COLUMN'd with the rest of its history since it needs a
+// NOT NULL default, and SQLite has no ALTER TABLE for CHECK constraints — so they're
+// bundled into one rebuild, gated on dialog_id's absence like the other additive
+// reminders migrations above.
+func (db *DB) addReminderDialogIDAndHourlyRecurrenceIfMissing() error {
+	has, err := columnExists(db.DB, "reminders", "dialog_id")
+	if err != nil {
+		return err
+	}
+	if has {
+		return nil
+	}
+	slog.Info("Rebuilding reminders table: adding dialog_id, widening recurrence_type to allow 'hourly'")
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	for _, stmt := range []string{
+		`CREATE TABLE reminders_new (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id INTEGER NOT NULL,
+			dialog_id INTEGER NOT NULL DEFAULT 0,
+			message TEXT NOT NULL,
+			remind_at INTEGER NOT NULL,
+			created_at INTEGER DEFAULT (strftime('%s', 'now')),
+			updated_at INTEGER DEFAULT (strftime('%s', 'now')),
+			is_fired BOOLEAN DEFAULT false,
+			is_cancelled BOOLEAN DEFAULT false,
+			is_processing BOOLEAN DEFAULT false,
+			is_recurring BOOLEAN DEFAULT false,
+			recurrence_type TEXT CHECK (recurrence_type IN ('hourly', 'daily', 'weekly', 'monthly', NULL)),
+			recurrence_interval INTEGER DEFAULT 1,
+			recurrence_end_at INTEGER,
+			last_fired_at INTEGER,
+			processing_started_at INTEGER,
+			action_type TEXT NOT NULL DEFAULT 'notify',
+			action_prompt TEXT,
+			FOREIGN KEY (user_id) REFERENCES users(id)
+		)`,
+		`INSERT INTO reminders_new (
+			id, user_id, dialog_id, message, remind_at, created_at, updated_at,
+			is_fired, is_cancelled, is_processing, is_recurring,
+			recurrence_type, recurrence_interval, recurrence_end_at,
+			last_fired_at, processing_started_at, action_type, action_prompt
+		)
+		SELECT
+			id, user_id, 0, message, remind_at, created_at, updated_at,
+			is_fired, is_cancelled, is_processing, is_recurring,
+			recurrence_type, recurrence_interval, recurrence_end_at,
+			last_fired_at, processing_started_at, action_type, action_prompt
+		FROM reminders`,
+		`DROP TABLE reminders`,
+		`ALTER TABLE reminders_new RENAME TO reminders`,
+		`CREATE INDEX IF NOT EXISTS idx_reminders_active ON reminders(remind_at, is_fired, is_cancelled)
+		 WHERE is_fired = false AND is_cancelled = false`,
+		`CREATE INDEX IF NOT EXISTS idx_reminders_user ON reminders(user_id, is_cancelled)`,
+	} {
+		if _, err := tx.Exec(stmt); err != nil {
+			return fmt.Errorf("rebuild reminders table: %w", err)
+		}
+	}
+	return tx.Commit()
 }
 
 func (db *DB) addReminderActionColumnsIfMissing() error {
@@ -435,6 +510,7 @@ const createRemindersTable = `
 CREATE TABLE IF NOT EXISTS reminders (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
 	user_id INTEGER NOT NULL,
+	dialog_id INTEGER NOT NULL DEFAULT 0,
 	message TEXT NOT NULL,
 	remind_at INTEGER NOT NULL,
 	created_at INTEGER DEFAULT (strftime('%s', 'now')),
@@ -443,7 +519,7 @@ CREATE TABLE IF NOT EXISTS reminders (
 	is_cancelled BOOLEAN DEFAULT false,
 	is_processing BOOLEAN DEFAULT false,
 	is_recurring BOOLEAN DEFAULT false,
-	recurrence_type TEXT CHECK (recurrence_type IN ('daily', 'weekly', 'monthly', NULL)),
+	recurrence_type TEXT CHECK (recurrence_type IN ('hourly', 'daily', 'weekly', 'monthly', NULL)),
 	recurrence_interval INTEGER DEFAULT 1,
 	recurrence_end_at INTEGER,
 	last_fired_at INTEGER,
@@ -457,4 +533,15 @@ CREATE INDEX IF NOT EXISTS idx_reminders_active ON reminders(remind_at, is_fired
 WHERE is_fired = false AND is_cancelled = false;
 
 CREATE INDEX IF NOT EXISTS idx_reminders_user ON reminders(user_id, is_cancelled);
+`
+
+const createDialogCompactionTable = `
+CREATE TABLE IF NOT EXISTS dialog_compaction (
+	user_id INTEGER NOT NULL,
+	dialog_id INTEGER NOT NULL,
+	window_start_turn_index INTEGER NOT NULL DEFAULT 0,
+	rolling_summary TEXT NOT NULL DEFAULT '',
+	updated_at INTEGER DEFAULT (strftime('%s', 'now')),
+	PRIMARY KEY (user_id, dialog_id)
+);
 `

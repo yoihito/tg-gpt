@@ -35,12 +35,13 @@ func (r *ReminderRepo) CreateReminder(reminder models.Reminder) (int64, error) {
 
 	result, err := r.db.Exec(`
 		INSERT INTO reminders (
-			user_id, message, remind_at,
+			user_id, dialog_id, message, remind_at,
 			is_recurring, recurrence_type, recurrence_interval, recurrence_end_at,
 			action_type, action_prompt
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		reminder.UserID,
+		reminder.DialogID,
 		reminder.Message,
 		reminder.RemindAt.Unix(),
 		reminder.IsRecurring,
@@ -61,7 +62,7 @@ func (r *ReminderRepo) CreateReminder(reminder models.Reminder) (int64, error) {
 // so this is the user-visible list.
 func (r *ReminderRepo) GetActiveRemindersForUser(userID int64) ([]models.Reminder, error) {
 	rows, err := r.db.Query(`
-		SELECT id, user_id, message, remind_at, created_at, updated_at,
+		SELECT id, user_id, dialog_id, message, remind_at, created_at, updated_at,
 		       is_fired, is_cancelled, is_processing,
 		       is_recurring, recurrence_type, recurrence_interval,
 		       recurrence_end_at, last_fired_at, processing_started_at,
@@ -80,7 +81,7 @@ func (r *ReminderRepo) GetActiveRemindersForUser(userID int64) ([]models.Reminde
 func (r *ReminderRepo) GetDueReminders(before time.Time) ([]models.Reminder, error) {
 	staleProcessingBefore := before.Add(-30 * time.Minute)
 	rows, err := r.db.Query(`
-		SELECT id, user_id, message, remind_at, created_at, updated_at,
+		SELECT id, user_id, dialog_id, message, remind_at, created_at, updated_at,
 		       is_fired, is_cancelled, is_processing,
 		       is_recurring, recurrence_type, recurrence_interval,
 		       recurrence_end_at, last_fired_at, processing_started_at,
@@ -196,7 +197,7 @@ func (r *ReminderRepo) CancelReminder(reminderID int64, userID int64) error {
 
 func (r *ReminderRepo) GetReminderByID(reminderID int64, userID int64) (*models.Reminder, error) {
 	row := r.db.QueryRow(`
-		SELECT id, user_id, message, remind_at, created_at, updated_at,
+		SELECT id, user_id, dialog_id, message, remind_at, created_at, updated_at,
 		       is_fired, is_cancelled, is_processing,
 		       is_recurring, recurrence_type, recurrence_interval,
 		       recurrence_end_at, last_fired_at, processing_started_at,
@@ -226,6 +227,7 @@ func (r *ReminderRepo) scanReminders(rows *sql.Rows) ([]models.Reminder, error) 
 		err := rows.Scan(
 			&reminder.ID,
 			&reminder.UserID,
+			&reminder.DialogID,
 			&reminder.Message,
 			&remindAt,
 			&createdAt,
@@ -289,6 +291,7 @@ func (r *ReminderRepo) scanReminder(row *sql.Row) (models.Reminder, error) {
 	err := row.Scan(
 		&reminder.ID,
 		&reminder.UserID,
+		&reminder.DialogID,
 		&reminder.Message,
 		&remindAt,
 		&createdAt,

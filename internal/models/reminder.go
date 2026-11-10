@@ -6,6 +6,7 @@ type RecurrenceType string
 type ReminderActionType string
 
 const (
+	RecurrenceTypeHourly  RecurrenceType = "hourly"
 	RecurrenceTypeDaily   RecurrenceType = "daily"
 	RecurrenceTypeWeekly  RecurrenceType = "weekly"
 	RecurrenceTypeMonthly RecurrenceType = "monthly"
@@ -17,6 +18,7 @@ const (
 type Reminder struct {
 	ID                  int64
 	UserID              int64
+	DialogID            int64
 	Message             string
 	RemindAt            time.Time
 	CreatedAt           time.Time
@@ -62,6 +64,11 @@ func (r *Reminder) CalculateNextOccurrence(loc *time.Location) *time.Time {
 	base := r.RemindAt.In(loc)
 	var next time.Time
 	switch *r.RecurrenceType {
+	case RecurrenceTypeHourly:
+		// Plain duration arithmetic, not calendar-day arithmetic like the other
+		// recurrence types: a DST transition can shift the local wall-clock hour by
+		// one on the day it happens. Accepted tradeoff for sub-day recurrence.
+		next = base.Add(time.Duration(interval) * time.Hour)
 	case RecurrenceTypeDaily:
 		next = base.AddDate(0, 0, interval)
 	case RecurrenceTypeWeekly:

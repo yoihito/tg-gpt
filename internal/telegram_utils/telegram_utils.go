@@ -126,13 +126,13 @@ func (t *TelegramStreamer) flush(wait bool) error {
 // "try Markdown, fall back to plain, respect the length limit" contract for the same API,
 // so every caller that needs to push text to a chat outside a live stream shares this
 // instead of writing its own copy.
-func SendChunked(ctx context.Context, bot *tele.Bot, recipient tele.Recipient, text string) error {
+func SendChunked(ctx context.Context, bot *tele.Bot, recipient tele.Recipient, threadID int, text string) error {
 	delivery := deliveryFor(bot, recipient.Recipient())
 	for text != "" {
 		chunk, rest := splitMessage(text)
 		_, _, err := delivery.deliver(ctx, true, func() (*tele.Message, error) {
 			return withMarkdownFallback(chunk, func(text string, mode tele.ParseMode) (*tele.Message, error) {
-				return bot.Send(recipient, text, &tele.SendOptions{ParseMode: mode})
+				return bot.Send(recipient, text, &tele.SendOptions{ParseMode: mode, ThreadID: threadID})
 			})
 		})
 		if err != nil {

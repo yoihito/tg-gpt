@@ -347,11 +347,31 @@ func TestFinalFlushSendsStillIncompleteLink(t *testing.T) {
 	}
 }
 
+func TestSendChunkedRoutesToThread(t *testing.T) {
+	var threadIDs []string
+	streamer := testStreamer(t, func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			ThreadID string `json:"message_thread_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+		}
+		threadIDs = append(threadIDs, body.ThreadID)
+		telegramOK(w)
+	})
+	if err := SendChunked(context.Background(), streamer.bot, &tele.Chat{ID: 10}, 42, "scheduled answer"); err != nil {
+		t.Fatal(err)
+	}
+	if len(threadIDs) != 1 || threadIDs[0] != "42" {
+		t.Fatalf("expected thread 42, got %v", threadIDs)
+	}
+}
+
 func TestSendChunkedHonorsCancellation(t *testing.T) {
 	streamer := testStreamer(t, func(w http.ResponseWriter, r *http.Request) { t.Error("sent after cancellation"); telegramOK(w) })
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	err := SendChunked(ctx, streamer.bot, &tele.Chat{ID: 10}, "scheduled answer")
+	err := SendChunked(ctx, streamer.bot, &tele.Chat{ID: 10}, 0, "scheduled answer")
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("got %v", err)
 	}

@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"strings"
 	"sync"
 	"time"
 
@@ -18,7 +17,10 @@ const scheduledDeliveryTimeout = 30 * time.Second
 const reminderWorkers = 4
 
 type ScheduledActionRunner interface {
-	RunScheduledAction(ctx context.Context, user models.User, reminder models.Reminder) (string, error)
+	// RunScheduledAction runs the scheduled prompt and reports whether the agent decided
+	// there was anything worth telling the user (via its notify_user tool) — notified is
+	// false, with an empty message, whenever the agent checked but found nothing new.
+	RunScheduledAction(ctx context.Context, user models.User, reminder models.Reminder) (notified bool, message string, err error)
 }
 
 // ReminderScheduler owns the reminder lifecycle once a reminder exists: polling for due
@@ -180,7 +182,7 @@ func (s *ReminderScheduler) fireReminder(ctx context.Context, reminder models.Re
 	messageFormat := naturalMessages[time.Now().UnixNano()%int64(len(naturalMessages))]
 	naturalMessage := fmt.Sprintf(messageFormat, reminder.Message)
 
-	sentMsg, err := s.bot.Send(&tele.User{ID: user.ChatId}, naturalMessage)
+	sentMsg, err := s.bot.Send(&tele.User{ID: user.ChatId}, naturalMessage, &tele.SendOptions{ThreadID: int(reminder.DialogID)})
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to send reminder", "error", err, "reminder_id", reminder.ID)
 		s.releaseReminderClaim(ctx, reminder.ID)
@@ -191,11 +193,10 @@ func (s *ReminderScheduler) fireReminder(ctx context.Context, reminder models.Re
 		slog.ErrorContext(ctx, "Failed to update user last interaction", "error", err, "user_id", reminder.UserID)
 	}
 
-	// Reminders always fire into the General topic (dialogID 0) per design decision:
-	// there's no single "current" dialog once dialog identity is per-thread, and General
-	// is Telegram's own always-present default target (message_thread_id omitted).
+	// Reminders fire into the thread (dialog) that created them, so a later message in
+	// that same thread can reference what the reminder said.
 	syntheticUserText := fmt.Sprintf("[Reminder triggered for: %s]", reminder.Message)
-	if err := s.trace.RecordReminderFire(user.Id, 0, syntheticUserText, naturalMessage, int64(sentMsg.ID)); err != nil {
+	if err := s.trace.RecordReminderFire(user.Id, reminder.DialogID, syntheticUserText, naturalMessage, int64(sentMsg.ID)); err != nil {
 		slog.ErrorContext(ctx, "Failed to save reminder to trace", "error", err, "reminder_id", reminder.ID)
 	}
 
@@ -217,22 +218,24 @@ func (s *ReminderScheduler) fireScheduledAction(ctx context.Context, user models
 		return
 	}
 
-	response, err := s.actionRunner.RunScheduledAction(ctx, user, reminder)
+	notified, message, err := s.actionRunner.RunScheduledAction(ctx, user, reminder)
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to run scheduled action", "error", err, "reminder_id", reminder.ID)
 		s.releaseReminderClaim(ctx, reminder.ID)
 		return
 	}
 
-	if strings.TrimSpace(response) == "" {
-		response = "Scheduled action completed, but returned no text."
-	}
-	deliveryCtx, cancel := context.WithTimeout(ctx, s.deliveryTimeout)
-	defer cancel()
-	if err := telegram_utils.SendChunked(deliveryCtx, s.bot, &tele.User{ID: user.ChatId}, response); err != nil {
-		slog.ErrorContext(ctx, "Failed to send scheduled action result", "error", err, "reminder_id", reminder.ID)
-		s.releaseReminderClaim(ctx, reminder.ID)
-		return
+	if !notified {
+		slog.InfoContext(ctx, "Scheduled check completed with nothing to report", "reminder_id", reminder.ID)
+	} else {
+		deliveryCtx, cancel := context.WithTimeout(ctx, s.deliveryTimeout)
+		if err := telegram_utils.SendChunked(deliveryCtx, s.bot, &tele.User{ID: user.ChatId}, int(reminder.DialogID), message); err != nil {
+			cancel()
+			slog.ErrorContext(ctx, "Failed to send scheduled action result", "error", err, "reminder_id", reminder.ID)
+			s.releaseReminderClaim(ctx, reminder.ID)
+			return
+		}
+		cancel()
 	}
 
 	if reminder.IsRecurring && !reminder.HasExpiredRecurrence() {

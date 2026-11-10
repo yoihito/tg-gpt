@@ -22,5 +22,6 @@ memory:
     facts_top_k: 5
     episodes_top_k: 2
     recent_turns: 6
+    compaction_batch_size: 6
   episode:
     min_turns: 3

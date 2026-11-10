@@ -2,8 +2,10 @@ package services
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"vadimgribanov.com/tg-gpt/internal/llm"
@@ -22,6 +24,7 @@ type TextServiceDeps struct {
 	Trace            *TraceStore
 	Episodes         *EpisodeStore
 	MemoryPlugin     *MemoryPlugin
+	Compactor        *WindowCompactor
 	ReminderTools    *ReminderTools
 	WebSearchService *WebSearchService
 	DefaultModel     string
@@ -39,7 +42,11 @@ func NewTextService(deps TextServiceDeps) *TextService {
 		defaultModel:     deps.DefaultModel,
 	}
 
-	h.runner = NewRunner(deps.Client, deps.MemoryPlugin, NewUsagePlugin(deps.UsersRepo))
+	plugins := []Plugin{deps.MemoryPlugin, NewUsagePlugin(deps.UsersRepo)}
+	if deps.Compactor != nil {
+		plugins = append(plugins, deps.Compactor)
+	}
+	h.runner = NewRunner(deps.Client, plugins...)
 	h.defaultAgent = Definition{
 		Name:              "assistant",
 		BuildSystemPrompt: defaultSystemPrompt,
@@ -91,7 +98,13 @@ IMPORTANT:
 
 Today is %s. Give short concise answers.`
 
-const scheduledActionPromptSuffix = "\n\nScheduled action mode: execute the scheduled task now and return the result directly. Only the web_search tool is available."
+const scheduledActionPromptSuffix = `
+
+Scheduled action mode: execute the scheduled task now. Only the web_search tool and the
+notify_user tool are available. Call notify_user with a concise, user-facing message
+ONLY when there is something new, changed, or actionable to report compared to your
+earlier checks visible above in this conversation. If nothing has changed, simply finish
+without calling notify_user — do not produce any other user-facing output.`
 
 func defaultSystemPrompt(ctx context.Context) (string, error) {
 	// Day granularity, not a full timestamp: this message is always first in the
@@ -122,11 +135,24 @@ func (h *TextService) RetryWithMessage(
 	return err
 }
 
-// RunScheduledAction always targets dialogID 0 (the General topic): scheduled/reminder
-// fires aren't triggered from any specific incoming message/thread, and the user has
-// chosen to keep all proactive sends in one predictable place rather than resurrecting
-// per-reminder topic tracking.
-func (h *TextService) RunScheduledAction(ctx context.Context, user models.User, reminder models.Reminder) (string, error) {
+// notifyResultKey carries a per-call result sink for the notify_user tool through
+// context. A context value (rather than a field somewhere shared) is needed because
+// h.scheduledActionAgent's ToolSet/handler closures are built once in NewTextService and
+// reused across every concurrent reminder worker (reminderWorkers = 4 in
+// reminder_scheduler.go) — a shared mutable field would race across concurrent
+// RunScheduledAction calls, where a fresh context value per call can't.
+type notifyResultKey struct{}
+
+type notifyResult struct {
+	notified bool
+	message  string
+}
+
+// RunScheduledAction runs the scheduled prompt in the reminder's own origin thread, so
+// a later message in that same thread can reference what it found. It reports whether
+// the agent decided there was anything worth telling the user — see notify_user in
+// buildScheduledActionToolSet.
+func (h *TextService) RunScheduledAction(ctx context.Context, user models.User, reminder models.Reminder) (bool, string, error) {
 	prompt := reminder.ActionPrompt
 	if prompt == "" {
 		prompt = reminder.Message
@@ -139,7 +165,13 @@ func (h *TextService) RunScheduledAction(ctx context.Context, user models.User, 
 			prompt,
 		),
 	}
-	return h.runSingleInputTurn(ctx, user, 0, 0, msg, nil, h.scheduledActionAgent)
+	sink := &notifyResult{}
+	ctx = context.WithValue(ctx, notifyResultKey{}, sink)
+	_, err := h.runSingleInputTurn(ctx, user, reminder.DialogID, 0, msg, nil, h.scheduledActionAgent)
+	if err != nil {
+		return false, "", err
+	}
+	return sink.notified, sink.message, nil
 }
 
 func extractQueryText(msg llm.Message) string {
@@ -169,8 +201,8 @@ func (h *TextService) buildDefaultToolSet() *ToolSet {
 	ts.RegisterAll(h.memoryService.GetMemoryTools(), func(ctx context.Context, mctx TurnContext, _ models.User, call llm.ToolCall) (string, error) {
 		return h.memoryService.HandleToolCall(ctx, mctx, call)
 	})
-	ts.RegisterAll(h.reminderTools.GetReminderTools(), func(_ context.Context, _ TurnContext, user models.User, call llm.ToolCall) (string, error) {
-		return h.reminderTools.HandleToolCall(user.Id, call)
+	ts.RegisterAll(h.reminderTools.GetReminderTools(), func(_ context.Context, mctx TurnContext, user models.User, call llm.ToolCall) (string, error) {
+		return h.reminderTools.HandleToolCall(user.Id, mctx.DialogID, call)
 	})
 	h.registerWebSearchTools(ts)
 	return ts
@@ -179,7 +211,49 @@ func (h *TextService) buildDefaultToolSet() *ToolSet {
 func (h *TextService) buildScheduledActionToolSet() *ToolSet {
 	ts := NewToolSet()
 	h.registerWebSearchTools(ts)
+	ts.Register(notifyUserTool, handleNotifyUser)
 	return ts
+}
+
+var notifyUserTool = llm.Tool{
+	Name: "notify_user",
+	Description: "Send a message to the user about this scheduled check. Call this ONLY " +
+		"when there is something new, changed, or actionable to report compared to your " +
+		"earlier checks visible in this conversation's history. If nothing has changed, " +
+		"do not call this tool — just finish without any other output.",
+	Parameters: map[string]interface{}{
+		"type": "object",
+		"properties": map[string]interface{}{
+			"message": map[string]interface{}{
+				"type":        "string",
+				"description": "The concise, user-facing message to send.",
+			},
+		},
+		"required": []string{"message"},
+	},
+}
+
+// handleNotifyUser never touches Telegram directly — it stashes the message into the
+// per-call sink RunScheduledAction placed on ctx, which is read back once the turn
+// finishes to decide what (if anything) ReminderScheduler actually sends.
+func handleNotifyUser(ctx context.Context, _ TurnContext, _ models.User, call llm.ToolCall) (string, error) {
+	if err := ValidateToolArguments(call.Name, call.Arguments); err != nil {
+		return "", err
+	}
+	var args struct {
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal([]byte(call.Arguments), &args); err != nil {
+		return "", fmt.Errorf("invalid arguments for notify_user: %w", err)
+	}
+	if strings.TrimSpace(args.Message) == "" {
+		return "message must not be empty", fmt.Errorf("empty notify_user message")
+	}
+	if sink, ok := ctx.Value(notifyResultKey{}).(*notifyResult); ok {
+		sink.notified = true
+		sink.message = args.Message
+	}
+	return "Message queued for delivery.", nil
 }
 
 func (h *TextService) registerWebSearchTools(ts *ToolSet) {

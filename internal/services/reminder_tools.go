@@ -72,7 +72,7 @@ func (s *ReminderTools) GetReminderTools() []llm.Tool {
 		},
 		{
 			Name:        "create_recurring_reminder",
-			Description: "Create a reminder that repeats on a schedule. Use whenever the user mentions repetition (daily, weekly, monthly, every N days/weeks/months).",
+			Description: "Create a reminder that repeats on a schedule. Use whenever the user mentions repetition (hourly, daily, weekly, monthly, every N hours/days/weeks/months).",
 			Parameters: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
@@ -86,12 +86,12 @@ func (s *ReminderTools) GetReminderTools() []llm.Tool {
 					},
 					"frequency": map[string]interface{}{
 						"type":        "string",
-						"enum":        []string{"daily", "weekly", "monthly"},
+						"enum":        []string{"hourly", "daily", "weekly", "monthly"},
 						"description": "Base unit of recurrence.",
 					},
 					"interval": map[string]interface{}{
 						"type":        "integer",
-						"description": "Repeat every N units of frequency. interval=2 + frequency=weekly = biweekly. Defaults to 1 if omitted.",
+						"description": "Repeat every N units of frequency. interval=2 + frequency=weekly = biweekly; interval=3 + frequency=hourly = every 3 hours. Defaults to 1 if omitted.",
 					},
 					"start_at": map[string]interface{}{
 						"type":        "string",
@@ -139,7 +139,7 @@ func (s *ReminderTools) GetReminderTools() []llm.Tool {
 	}
 }
 
-func (s *ReminderTools) HandleToolCall(userID int64, toolCall llm.ToolCall) (string, error) {
+func (s *ReminderTools) HandleToolCall(userID, dialogID int64, toolCall llm.ToolCall) (string, error) {
 	if toolCall.Name == "list_reminders" {
 		return s.handleListReminders(userID)
 	}
@@ -150,9 +150,9 @@ func (s *ReminderTools) HandleToolCall(userID int64, toolCall llm.ToolCall) (str
 
 	switch toolCall.Name {
 	case "create_one_shot_reminder":
-		return s.handleCreateOneShotReminder(userID, toolCall.Arguments)
+		return s.handleCreateOneShotReminder(userID, dialogID, toolCall.Arguments)
 	case "create_recurring_reminder":
-		return s.handleCreateRecurringReminder(userID, toolCall.Arguments)
+		return s.handleCreateRecurringReminder(userID, dialogID, toolCall.Arguments)
 	case "cancel_reminder":
 		return s.handleCancelReminder(userID, toolCall.Arguments)
 	default:
@@ -160,7 +160,7 @@ func (s *ReminderTools) HandleToolCall(userID int64, toolCall llm.ToolCall) (str
 	}
 }
 
-func (s *ReminderTools) handleCreateOneShotReminder(userID int64, arguments string) (string, error) {
+func (s *ReminderTools) handleCreateOneShotReminder(userID, dialogID int64, arguments string) (string, error) {
 	var args struct {
 		TimeExpression string `json:"time_expression"`
 		Message        string `json:"message"`
@@ -188,6 +188,7 @@ func (s *ReminderTools) handleCreateOneShotReminder(userID int64, arguments stri
 
 	id, err := s.reminderRepo.CreateReminder(models.Reminder{
 		UserID:             userID,
+		DialogID:           dialogID,
 		Message:            args.Message,
 		RemindAt:           *parsedTime,
 		IsRecurring:        false,
@@ -207,7 +208,7 @@ func (s *ReminderTools) handleCreateOneShotReminder(userID int64, arguments stri
 	return fmt.Sprintf("Reminder set for %s: %s", timeStr, args.Message), nil
 }
 
-func (s *ReminderTools) handleCreateRecurringReminder(userID int64, arguments string) (string, error) {
+func (s *ReminderTools) handleCreateRecurringReminder(userID, dialogID int64, arguments string) (string, error) {
 	var args struct {
 		Message      string `json:"message"`
 		Timezone     string `json:"timezone"`
@@ -233,6 +234,8 @@ func (s *ReminderTools) handleCreateRecurringReminder(userID int64, arguments st
 
 	var rType models.RecurrenceType
 	switch args.Frequency {
+	case "hourly":
+		rType = models.RecurrenceTypeHourly
 	case "daily":
 		rType = models.RecurrenceTypeDaily
 	case "weekly":
@@ -240,7 +243,7 @@ func (s *ReminderTools) handleCreateRecurringReminder(userID int64, arguments st
 	case "monthly":
 		rType = models.RecurrenceTypeMonthly
 	default:
-		return fmt.Sprintf("Invalid frequency %q. Must be 'daily', 'weekly', or 'monthly'.", args.Frequency), nil
+		return fmt.Sprintf("Invalid frequency %q. Must be 'hourly', 'daily', 'weekly', or 'monthly'.", args.Frequency), nil
 	}
 
 	startAt, err := time.ParseInLocation(isoLocalLayout, args.StartAt, loc)
@@ -264,6 +267,7 @@ func (s *ReminderTools) handleCreateRecurringReminder(userID int64, arguments st
 
 	id, err := s.reminderRepo.CreateReminder(models.Reminder{
 		UserID:             userID,
+		DialogID:           dialogID,
 		Message:            args.Message,
 		RemindAt:           startAt,
 		IsRecurring:        true,

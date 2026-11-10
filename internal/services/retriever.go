@@ -16,17 +16,19 @@ import (
 )
 
 // RetrievalConfig bounds how much of each memory kind Retrieve pulls in for a query.
+// The live trace window's size is WindowCompactor's concern, not Retrieve's — it just
+// replays whatever WindowCompactor hasn't folded into a rolling summary yet.
 type RetrievalConfig struct {
 	FactsTopK    int
 	EpisodesTopK int
-	RecentTurns  int
 }
 
-// Retriever assembles the memory context for a turn: all preferences, top-K facts and
-// episodes (hybrid FTS5 + cosine via RRF) for the current query, and the last N trace
-// events — then renders that into the llm.Message history sent to the model. It owns no
-// trace-journal writes or promotion/consolidation logic — see TraceStore and
-// MemoryConsolidator for those.
+// Retriever assembles the memory context for a turn: all preferences, the live trace
+// window (plus a rolling summary of whatever's been compacted out of it), and top-K
+// facts/episodes (hybrid FTS5 + cosine via RRF) for the current query — then renders
+// that into the llm.Message history sent to the model. It owns no trace-journal writes,
+// window compaction, or promotion/consolidation logic — see TraceStore, WindowCompactor,
+// and MemoryConsolidator for those.
 type Retriever struct {
 	trace    *repositories.TraceRepo
 	prefs    *repositories.PreferenceRepo
@@ -59,10 +61,15 @@ type RetrievedMemory struct {
 	Facts       []models.Fact
 	Episodes    []models.Episode
 	RecentTrace []models.TraceEvent
+	// RollingSummary condenses whatever was evicted from the live window by
+	// WindowCompactor, if anything has been yet. Empty for a dialog that hasn't
+	// crossed the compaction high-water mark.
+	RollingSummary string
 }
 
-// Retrieve performs scoped retrieval for the given query: all preferences,
-// top-K facts (hybrid FTS5 + cosine via RRF), and the last N trace events.
+// Retrieve performs scoped retrieval for the given query: all preferences, the live
+// trace window (whatever WindowCompactor hasn't folded into a rolling summary yet),
+// and top-K facts/episodes (hybrid FTS5 + cosine via RRF).
 func (r *Retriever) Retrieve(ctx context.Context, mctx TurnContext, query string) (RetrievedMemory, error) {
 	var out RetrievedMemory
 
@@ -72,7 +79,13 @@ func (r *Retriever) Retrieve(ctx context.Context, mctx TurnContext, query string
 	}
 	out.Preferences = prefs
 
-	recent, err := r.trace.GetRecentTurns(mctx.UserID, mctx.DialogID, r.cfg.RecentTurns)
+	windowStart, rollingSummary, err := r.trace.GetCompactionState(mctx.UserID, mctx.DialogID)
+	if err != nil {
+		return out, fmt.Errorf("get compaction state: %w", err)
+	}
+	out.RollingSummary = rollingSummary
+
+	recent, err := r.trace.GetEventsFrom(mctx.UserID, mctx.DialogID, windowStart)
 	if err != nil {
 		return out, fmt.Errorf("get recent trace: %w", err)
 	}
@@ -265,6 +278,15 @@ func (r *Retriever) AssemblePrompt(systemHeader string, retrieved RetrievedMemor
 
 	messages := []llm.Message{
 		{Role: llm.RoleSystem, Content: sys.String()},
+	}
+	// RollingSummary only changes when WindowCompactor actually advances (every
+	// BatchSize turns), not every turn, so it stays part of the same stable,
+	// cache-friendly prefix as the system header/preferences above.
+	if retrieved.RollingSummary != "" {
+		messages = append(messages, llm.Message{
+			Role:    llm.RoleSystem,
+			Content: "## Earlier in this conversation (summarized)\n" + retrieved.RollingSummary,
+		})
 	}
 	// RecentTrace always starts at a user_msg (GetRecentTurns bounds the window by whole
 	// turns), so there's no partial leading tool-call group to trim here.

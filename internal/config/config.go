@@ -23,7 +23,14 @@ type MemoryThresholds struct {
 type MemoryRetrieval struct {
 	FactsTopK    int `yaml:"facts_top_k"`
 	EpisodesTopK int `yaml:"episodes_top_k"`
-	RecentTurns  int `yaml:"recent_turns"`
+	// RecentTurns is the low-water mark for the live trace-replay window: how many
+	// turns WindowCompactor keeps after a compaction pass.
+	RecentTurns int `yaml:"recent_turns"`
+	// CompactionBatchSize is how many turns WindowCompactor evicts at once, once the
+	// window exceeds RecentTurns+CompactionBatchSize — batching the eviction (instead
+	// of one turn per new turn) is what keeps the replayed prefix stable long enough
+	// for a prefix-based provider cache to actually help.
+	CompactionBatchSize int `yaml:"compaction_batch_size"`
 }
 
 type MemoryEpisode struct {
@@ -97,6 +104,9 @@ func applyMemoryDefaults(m *MemoryConfig) {
 	}
 	if m.Retrieval.RecentTurns == 0 {
 		m.Retrieval.RecentTurns = 6
+	}
+	if m.Retrieval.CompactionBatchSize == 0 {
+		m.Retrieval.CompactionBatchSize = 6
 	}
 	if m.Episode.MinTurns == 0 {
 		m.Episode.MinTurns = 3

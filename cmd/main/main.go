@@ -89,8 +89,12 @@ func main() {
 		services.RetrievalConfig{
 			FactsTopK:    appConfig.Memory.Retrieval.FactsTopK,
 			EpisodesTopK: appConfig.Memory.Retrieval.EpisodesTopK,
-			RecentTurns:  appConfig.Memory.Retrieval.RecentTurns,
 		},
+	)
+	windowCompactor := services.NewWindowCompactor(
+		traceRepo, summarizer,
+		appConfig.Memory.Retrieval.RecentTurns,
+		appConfig.Memory.Retrieval.CompactionBatchSize,
 	)
 	consolidator := services.NewMemoryConsolidator(
 		prefRepo, factRepo, embedder, extractor,
@@ -129,6 +133,7 @@ func main() {
 		Trace:            traceStore,
 		Episodes:         episodeStore,
 		MemoryPlugin:     memoryPlugin,
+		Compactor:        windowCompactor,
 		ReminderTools:    reminderTools,
 		WebSearchService: webSearchService,
 		DefaultModel:     appConfig.DefaultModel.ModelId,

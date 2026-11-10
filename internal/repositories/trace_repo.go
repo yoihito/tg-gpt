@@ -153,48 +153,112 @@ func (r *TraceRepo) GetAllForDialog(userID, dialogID int64) ([]models.TraceEvent
 	return scanTraceEvents(rows)
 }
 
-// GetRecentTurns returns every event from the start of the `numTurns`-most-recent turn
-// onward (oldest first), where a turn is delimited by a user_msg event — the only event
-// type a turn ever starts with. This bounds the window by whole turns rather than raw
-// event count, so a turn with several tool calls (which appends a model_msg per round
-// plus a tool_result per call) still comes back complete instead of straddling the
-// window boundary. Returns the entire dialog if it has fewer than numTurns turns.
-func (r *TraceRepo) GetRecentTurns(userID, dialogID int64, numTurns int) ([]models.TraceEvent, error) {
-	if numTurns <= 0 {
-		return nil, nil
-	}
-
-	var minTurnIndex int64
-	hasBoundary := true
-	err := r.db.QueryRow(
-		`SELECT turn_index FROM trace_events
-		 WHERE user_id = ? AND dialog_id = ? AND event_type = ?
-		 ORDER BY turn_index DESC
-		 LIMIT 1 OFFSET ?`,
-		userID, dialogID, models.EventTypeUserMsg, numTurns-1,
-	).Scan(&minTurnIndex)
-	if err == sql.ErrNoRows {
-		hasBoundary = false
-	} else if err != nil {
-		return nil, fmt.Errorf("find turn boundary: %w", err)
-	}
-
-	query := `SELECT id, user_id, dialog_id, turn_index, event_type, payload, tg_message_id, model, created_at
-	          FROM trace_events WHERE user_id = ? AND dialog_id = ?`
-	args := []any{userID, dialogID}
-	if hasBoundary {
-		query += ` AND turn_index >= ?`
-		args = append(args, minTurnIndex)
-	}
-	query += ` ORDER BY turn_index ASC`
-
-	rows, err := r.db.Query(query, args...)
+// GetEventsFrom returns every event for (user_id, dialog_id) with turn_index >=
+// fromTurnIndex, oldest first. Passing 0 (the default for a dialog with no compaction
+// state yet) returns the whole dialog, since turn_index starts at 0.
+func (r *TraceRepo) GetEventsFrom(userID, dialogID, fromTurnIndex int64) ([]models.TraceEvent, error) {
+	rows, err := r.db.Query(
+		`SELECT id, user_id, dialog_id, turn_index, event_type, payload, tg_message_id, model, created_at
+		 FROM trace_events WHERE user_id = ? AND dialog_id = ? AND turn_index >= ?
+		 ORDER BY turn_index ASC`,
+		userID, dialogID, fromTurnIndex,
+	)
 	if err != nil {
-		return nil, fmt.Errorf("query recent turns: %w", err)
+		return nil, fmt.Errorf("query events from: %w", err)
 	}
 	defer rows.Close()
-
 	return scanTraceEvents(rows)
+}
+
+// GetEventsInRange returns every event for (user_id, dialog_id) with
+// fromTurnIndex <= turn_index < toTurnIndexExclusive, oldest first — the batch a
+// compaction pass is about to fold into its rolling summary.
+func (r *TraceRepo) GetEventsInRange(userID, dialogID, fromTurnIndex, toTurnIndexExclusive int64) ([]models.TraceEvent, error) {
+	rows, err := r.db.Query(
+		`SELECT id, user_id, dialog_id, turn_index, event_type, payload, tg_message_id, model, created_at
+		 FROM trace_events WHERE user_id = ? AND dialog_id = ? AND turn_index >= ? AND turn_index < ?
+		 ORDER BY turn_index ASC`,
+		userID, dialogID, fromTurnIndex, toTurnIndexExclusive,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query events in range: %w", err)
+	}
+	defer rows.Close()
+	return scanTraceEvents(rows)
+}
+
+// CountUserTurns counts user_msg events (each one starts a turn) at or after
+// fromTurnIndex — i.e. how many turns are currently in the live window.
+func (r *TraceRepo) CountUserTurns(userID, dialogID, fromTurnIndex int64) (int64, error) {
+	var count int64
+	err := r.db.QueryRow(
+		`SELECT COUNT(*) FROM trace_events
+		 WHERE user_id = ? AND dialog_id = ? AND event_type = ? AND turn_index >= ?`,
+		userID, dialogID, models.EventTypeUserMsg, fromTurnIndex,
+	).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count user turns: %w", err)
+	}
+	return count, nil
+}
+
+// FindNthUserMsgTurnIndex returns the turn_index of the n-th (0-indexed) user_msg event
+// at or after fromTurnIndex. ok is false if the dialog has n or fewer turns from there —
+// callers use that to mean "nothing to evict yet".
+func (r *TraceRepo) FindNthUserMsgTurnIndex(userID, dialogID, fromTurnIndex int64, n int) (int64, bool, error) {
+	var turnIndex int64
+	err := r.db.QueryRow(
+		`SELECT turn_index FROM trace_events
+		 WHERE user_id = ? AND dialog_id = ? AND event_type = ? AND turn_index >= ?
+		 ORDER BY turn_index ASC
+		 LIMIT 1 OFFSET ?`,
+		userID, dialogID, models.EventTypeUserMsg, fromTurnIndex, n,
+	).Scan(&turnIndex)
+	if err == sql.ErrNoRows {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("find nth user_msg turn_index: %w", err)
+	}
+	return turnIndex, true, nil
+}
+
+// GetCompactionState returns the live window's start turn_index and the rolling summary
+// of whatever was compacted before it, for (user_id, dialog_id). A dialog with no
+// compaction row yet (never crossed the high-water mark) returns (0, "", nil) — the
+// same as "replay from the beginning".
+func (r *TraceRepo) GetCompactionState(userID, dialogID int64) (int64, string, error) {
+	var windowStart int64
+	var summary string
+	err := r.db.QueryRow(
+		`SELECT window_start_turn_index, rolling_summary FROM dialog_compaction WHERE user_id = ? AND dialog_id = ?`,
+		userID, dialogID,
+	).Scan(&windowStart, &summary)
+	if err == sql.ErrNoRows {
+		return 0, "", nil
+	}
+	if err != nil {
+		return 0, "", fmt.Errorf("get compaction state: %w", err)
+	}
+	return windowStart, summary, nil
+}
+
+// AdvanceCompaction records that everything before newWindowStart has been folded into
+// newSummary, so future replays start there instead of from the beginning.
+func (r *TraceRepo) AdvanceCompaction(userID, dialogID, newWindowStart int64, newSummary string) error {
+	_, err := r.db.Exec(
+		`INSERT INTO dialog_compaction (user_id, dialog_id, window_start_turn_index, rolling_summary, updated_at)
+		 VALUES (?, ?, ?, ?, strftime('%s', 'now'))
+		 ON CONFLICT (user_id, dialog_id) DO UPDATE SET
+		   window_start_turn_index = excluded.window_start_turn_index,
+		   rolling_summary = excluded.rolling_summary,
+		   updated_at = excluded.updated_at`,
+		userID, dialogID, newWindowStart, newSummary,
+	)
+	if err != nil {
+		return fmt.Errorf("advance compaction: %w", err)
+	}
+	return nil
 }
 
 // PopLatestExchange removes and returns the most recent user_msg event and any subsequent

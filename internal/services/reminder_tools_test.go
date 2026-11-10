@@ -52,8 +52,9 @@ func newReminderTestRepos(t *testing.T) reminderTestRepos {
 }
 
 const (
-	reminderTestUserID = int64(9001)
-	reminderTestChatID = int64(4001)
+	reminderTestUserID   = int64(9001)
+	reminderTestChatID   = int64(4001)
+	reminderTestDialogID = int64(777)
 )
 
 func TestReminderToolsCreateOneShotReminderPersists(t *testing.T) {
@@ -61,7 +62,7 @@ func TestReminderToolsCreateOneShotReminderPersists(t *testing.T) {
 	tools := NewReminderTools(repos.reminderRepo, repos.prefRepo)
 
 	before := time.Now()
-	resp, err := tools.HandleToolCall(reminderTestUserID, llm.ToolCall{
+	resp, err := tools.HandleToolCall(reminderTestUserID, reminderTestDialogID, llm.ToolCall{
 		Name:      "create_one_shot_reminder",
 		Arguments: `{"time_expression":"in 10 minutes","message":"take out the trash","timezone":"UTC"}`,
 	})
@@ -91,13 +92,16 @@ func TestReminderToolsCreateOneShotReminderPersists(t *testing.T) {
 	if r.RemindAt.Before(wantEarliest) || r.RemindAt.After(wantLatest) {
 		t.Fatalf("remind_at %v outside expected window [%v, %v]", r.RemindAt, wantEarliest, wantLatest)
 	}
+	if r.DialogID != reminderTestDialogID {
+		t.Fatalf("dialog_id: got %d want %d", r.DialogID, reminderTestDialogID)
+	}
 }
 
 func TestReminderToolsCreateOneShotReminderRejectsInvalidTimezone(t *testing.T) {
 	repos := newReminderTestRepos(t)
 	tools := NewReminderTools(repos.reminderRepo, repos.prefRepo)
 
-	resp, err := tools.HandleToolCall(reminderTestUserID, llm.ToolCall{
+	resp, err := tools.HandleToolCall(reminderTestUserID, reminderTestDialogID, llm.ToolCall{
 		Name:      "create_one_shot_reminder",
 		Arguments: `{"time_expression":"in 10 minutes","message":"x","timezone":"Not/AZone"}`,
 	})
@@ -120,7 +124,7 @@ func TestReminderToolsCreateRecurringReminderPersists(t *testing.T) {
 	repos := newReminderTestRepos(t)
 	tools := NewReminderTools(repos.reminderRepo, repos.prefRepo)
 
-	resp, err := tools.HandleToolCall(reminderTestUserID, llm.ToolCall{
+	resp, err := tools.HandleToolCall(reminderTestUserID, reminderTestDialogID, llm.ToolCall{
 		Name: "create_recurring_reminder",
 		Arguments: `{"message":"stand up meeting","timezone":"UTC","frequency":"weekly",` +
 			`"interval":2,"start_at":"2026-06-25T09:00:00"}`,
@@ -150,6 +154,50 @@ func TestReminderToolsCreateRecurringReminderPersists(t *testing.T) {
 	if !r.RemindAt.Equal(wantStart) {
 		t.Fatalf("remind_at: got %v want %v", r.RemindAt, wantStart)
 	}
+	if r.DialogID != reminderTestDialogID {
+		t.Fatalf("dialog_id: got %d want %d", r.DialogID, reminderTestDialogID)
+	}
+}
+
+func TestReminderToolsCreateRecurringReminderSupportsHourly(t *testing.T) {
+	repos := newReminderTestRepos(t)
+	tools := NewReminderTools(repos.reminderRepo, repos.prefRepo)
+
+	resp, err := tools.HandleToolCall(reminderTestUserID, reminderTestDialogID, llm.ToolCall{
+		Name: "create_recurring_reminder",
+		Arguments: `{"message":"check news","timezone":"UTC","frequency":"hourly",` +
+			`"interval":3,"start_at":"2026-06-25T09:00:00","action_type":"prompt","action_prompt":"check for news"}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(resp, "Recurring scheduled action set") {
+		t.Fatalf("unexpected response: %q", resp)
+	}
+
+	reminders, err := repos.reminderRepo.GetActiveRemindersForUser(reminderTestUserID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reminders) != 1 {
+		t.Fatalf("expected 1 active reminder, got %d", len(reminders))
+	}
+	r := reminders[0]
+	if !r.IsRecurring || r.RecurrenceType == nil || *r.RecurrenceType != models.RecurrenceTypeHourly {
+		t.Fatalf("unexpected recurrence: %#v", r)
+	}
+	if r.RecurrenceInterval != 3 {
+		t.Fatalf("recurrence interval: got %d", r.RecurrenceInterval)
+	}
+
+	next := r.CalculateNextOccurrence(time.UTC)
+	if next == nil {
+		t.Fatal("expected a next occurrence")
+	}
+	wantNext := r.RemindAt.Add(3 * time.Hour)
+	if !next.Equal(wantNext) {
+		t.Fatalf("next occurrence: got %v want %v", *next, wantNext)
+	}
 }
 
 func TestReminderToolsListRemindersFormatsActiveReminders(t *testing.T) {
@@ -171,7 +219,7 @@ func TestReminderToolsListRemindersFormatsActiveReminders(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	resp, err := tools.HandleToolCall(reminderTestUserID, llm.ToolCall{Name: "list_reminders"})
+	resp, err := tools.HandleToolCall(reminderTestUserID, reminderTestDialogID, llm.ToolCall{Name: "list_reminders"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -195,7 +243,7 @@ func TestReminderToolsCancelReminderRemovesFromActiveList(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	resp, err := tools.HandleToolCall(reminderTestUserID, llm.ToolCall{
+	resp, err := tools.HandleToolCall(reminderTestUserID, reminderTestDialogID, llm.ToolCall{
 		Name:      "cancel_reminder",
 		Arguments: fmt.Sprintf(`{"reminder_id":"%d"}`, id),
 	})
@@ -219,7 +267,7 @@ func TestReminderToolsCancelReminderRejectsUnknownID(t *testing.T) {
 	repos := newReminderTestRepos(t)
 	tools := NewReminderTools(repos.reminderRepo, repos.prefRepo)
 
-	_, err := tools.HandleToolCall(reminderTestUserID, llm.ToolCall{
+	_, err := tools.HandleToolCall(reminderTestUserID, reminderTestDialogID, llm.ToolCall{
 		Name:      "cancel_reminder",
 		Arguments: `{"reminder_id":"999999"}`,
 	})

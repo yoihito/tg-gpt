@@ -259,6 +259,64 @@ func TestTextServiceIntegrationRetryReplacesLastExchange(t *testing.T) {
 	}
 }
 
+func TestTextServiceIntegrationRunScheduledActionNotifiesViaTool(t *testing.T) {
+	h := newTextServiceIntegrationHarness(t, [][]llm.StreamEvent{
+		{
+			{ToolCalls: []llm.ToolCall{{
+				ID:        "call_1",
+				Index:     0,
+				Name:      "notify_user",
+				Arguments: `{"message":"breaking news!"}`,
+			}}},
+		},
+		{{TextDelta: "Notified the user."}},
+	})
+
+	reminder := models.Reminder{
+		ID: 1, UserID: h.user.Id, DialogID: testDialogID,
+		Message: "check news", ActionType: models.ReminderActionPrompt, ActionPrompt: "check for news",
+	}
+	notified, message, err := h.textService.RunScheduledAction(context.Background(), h.user, reminder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !notified {
+		t.Fatal("expected notified=true after the model called notify_user")
+	}
+	if message != "breaking news!" {
+		t.Fatalf("message: got %q", message)
+	}
+
+	events := h.traceEvents(t, testDialogID)
+	var sawToolResult bool
+	for _, e := range events {
+		if e.EventType == models.EventTypeToolResult {
+			sawToolResult = true
+		}
+	}
+	if !sawToolResult {
+		t.Fatal("expected the notify_user call to be recorded in the origin thread's trace")
+	}
+}
+
+func TestTextServiceIntegrationRunScheduledActionSkipsWhenNoToolCall(t *testing.T) {
+	h := newTextServiceIntegrationHarness(t, [][]llm.StreamEvent{
+		{{TextDelta: "Nothing new since last check."}},
+	})
+
+	reminder := models.Reminder{
+		ID: 1, UserID: h.user.Id, DialogID: testDialogID,
+		Message: "check news", ActionType: models.ReminderActionPrompt, ActionPrompt: "check for news",
+	}
+	notified, message, err := h.textService.RunScheduledAction(context.Background(), h.user, reminder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if notified {
+		t.Fatalf("expected notified=false when the model never called notify_user, got message %q", message)
+	}
+}
+
 type textServiceIntegrationHarness struct {
 	db          *database.DB
 	user        models.User
@@ -317,7 +375,6 @@ func newTextServiceIntegrationHarness(t *testing.T, streams [][]llm.StreamEvent)
 	retriever := NewRetriever(traceRepo, prefRepo, factRepo, episodeRepo, embedder, RetrievalConfig{
 		FactsTopK:    3,
 		EpisodesTopK: 3,
-		RecentTurns:  10,
 	})
 	consolidator := NewMemoryConsolidator(prefRepo, factRepo, embedder, extractor, ConsolidationConfig{
 		FactConfidenceMin:   0.8,

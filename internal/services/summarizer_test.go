@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/openai/openai-go/v3"
@@ -98,6 +99,72 @@ func TestSummarizerSendsOriginalImages(t *testing.T) {
 				t.Fatalf("got %#v, want %#v", request.Input[0].Content, tc.want)
 			}
 		})
+	}
+}
+
+func TestCompactIncludesPreviousSummaryAndNewChunk(t *testing.T) {
+	var request struct {
+		Instructions string `json:"instructions"`
+		Input        []struct {
+			Content []summaryInputPart `json:"content"`
+		} `json:"input"`
+	}
+	received := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received <- json.NewDecoder(r.Body).Decode(&request)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_compact","object":"response","status":"completed","output":[{"id":"msg_compact","type":"message","role":"assistant","content":[{"type":"output_text","text":"  Updated running summary.  "}]}]}`))
+	}))
+	defer server.Close()
+	client := openai.NewClient(option.WithAPIKey("test"), option.WithBaseURL(server.URL+"/v1"))
+
+	events := []models.TraceEvent{
+		summaryEvent(t, models.EventTypeUserMsg, models.UserMsgPayload{Content: "what's the weather"}),
+		summaryEvent(t, models.EventTypeModelMsg, models.ModelMsgPayload{Content: "sunny"}),
+	}
+	summary, err := NewSummarizer(&client, "test-model").Compact(context.Background(), "User lives in Krakow.", events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-received; err != nil {
+		t.Fatal(err)
+	}
+	if summary != "Updated running summary." {
+		t.Fatalf("unexpected summary: %q", summary)
+	}
+	if request.Instructions != compactionSystemPrompt {
+		t.Fatal("compaction system prompt lost")
+	}
+	if len(request.Input) != 1 {
+		t.Fatalf("unexpected input: %#v", request.Input)
+	}
+	content := request.Input[0].Content
+	if len(content) < 2 {
+		t.Fatalf("expected previous summary and new chunk in input: %#v", content)
+	}
+	if !strings.Contains(content[0].Text, "User lives in Krakow.") {
+		t.Fatalf("expected previous summary in first content part: %#v", content[0])
+	}
+	foundChunkHeader := false
+	for _, part := range content {
+		if strings.Contains(part.Text, "New conversation chunk to fold in") {
+			foundChunkHeader = true
+		}
+	}
+	if !foundChunkHeader {
+		t.Fatalf("expected the new-chunk header, got: %#v", content)
+	}
+}
+
+func TestCompactSkipsEmptyTranscriptReturnsPreviousSummary(t *testing.T) {
+	// A nil client ensures an empty/invalid transcript returns before any API request.
+	summarizer := NewSummarizer(nil, "test")
+	summary, err := summarizer.Compact(context.Background(), "previous summary", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary != "previous summary" {
+		t.Fatalf("expected previous summary to pass through unchanged, got %q", summary)
 	}
 }
 
