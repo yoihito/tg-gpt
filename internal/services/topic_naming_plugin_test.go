@@ -3,9 +3,11 @@ package services
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -44,14 +46,25 @@ func (f *fakeTopicEditor) EditTopic(chat *tele.Chat, topic *tele.Topic) error {
 }
 
 func newFakeTopicNamer(t *testing.T, canned string) *TopicNamer {
+	namer, _ := newFakeTopicNamerCapturing(t, canned)
+	return namer
+}
+
+// newFakeTopicNamerCapturing is newFakeTopicNamer plus a channel of the raw request
+// bodies the fake server received, so tests can assert on what text was actually sent
+// to the model.
+func newFakeTopicNamerCapturing(t *testing.T, canned string) (*TopicNamer, chan string) {
 	t.Helper()
+	bodies := make(chan string, 10)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		bodies <- string(body)
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, `{"id":"resp","object":"response","status":"completed","output":[{"id":"msg","type":"message","role":"assistant","content":[{"type":"output_text","text":%q}]}]}`, canned)
 	}))
 	t.Cleanup(server.Close)
 	client := openai.NewClient(option.WithAPIKey("test"), option.WithBaseURL(server.URL+"/v1"))
-	return NewTopicNamer(&client, "test-cheap-model")
+	return NewTopicNamer(&client, "test-cheap-model"), bodies
 }
 
 func newTopicPluginTestTraceStore(t *testing.T) *TraceStore {
@@ -85,7 +98,7 @@ func TestTopicNamingPluginRenamesTopicOnFirstTurn(t *testing.T) {
 	// Simulate TurnDispatcher having already attached this turn's single message.
 	appendUserMsg(t, trace.trace, topicPluginTestUserID, topicPluginTestDialogID, "Help me plan a trip to Lisbon")
 
-	namer := newFakeTopicNamer(t, "Trip to Lisbon")
+	namer, bodies := newFakeTopicNamerCapturing(t, "Trip to Lisbon")
 	editor := newFakeTopicEditor()
 	plugin := NewTopicNamingPlugin(trace, namer, editor)
 
@@ -96,9 +109,7 @@ func TestTopicNamingPluginRenamesTopicOnFirstTurn(t *testing.T) {
 			{Message: llm.Message{Role: llm.RoleUser, Content: "Help me plan a trip to Lisbon"}},
 		},
 	}
-	if err := plugin.BeforeTurn(context.Background(), rc); err != nil {
-		t.Fatal(err)
-	}
+	plugin.AfterTurn(context.Background(), rc, "Sure, here's a 3-day Lisbon itinerary.")
 
 	select {
 	case call := <-editor.calls:
@@ -113,6 +124,16 @@ func TestTopicNamingPluginRenamesTopicOnFirstTurn(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for EditTopic to be called")
+	}
+
+	var body string
+	select {
+	case body = <-bodies:
+	default:
+		t.Fatal("expected the namer to have been called")
+	}
+	if !strings.Contains(body, "Help me plan a trip to Lisbon") || !strings.Contains(body, "3-day Lisbon itinerary") {
+		t.Fatalf("expected both the user message and assistant reply in the namer input, got: %s", body)
 	}
 }
 
@@ -134,9 +155,7 @@ func TestTopicNamingPluginSkipsWhenNotFirstTurn(t *testing.T) {
 			{Message: llm.Message{Role: llm.RoleUser, Content: "second message"}},
 		},
 	}
-	if err := plugin.BeforeTurn(context.Background(), rc); err != nil {
-		t.Fatal(err)
-	}
+	plugin.AfterTurn(context.Background(), rc, "some reply")
 
 	select {
 	case call := <-editor.calls:
@@ -158,9 +177,7 @@ func TestTopicNamingPluginSkipsGeneralTopic(t *testing.T) {
 			{Message: llm.Message{Role: llm.RoleUser, Content: "hello"}},
 		},
 	}
-	if err := plugin.BeforeTurn(context.Background(), rc); err != nil {
-		t.Fatal(err)
-	}
+	plugin.AfterTurn(context.Background(), rc, "hi there")
 
 	select {
 	case call := <-editor.calls:

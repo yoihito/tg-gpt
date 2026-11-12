@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
@@ -76,7 +77,30 @@ func TestNameTopicTruncatesToTelegramLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(name) != telegramTopicNameLimit {
-		t.Fatalf("expected name truncated to %d chars, got %d", telegramTopicNameLimit, len(name))
+	if utf8.RuneCountInString(name) != telegramTopicNameLimit {
+		t.Fatalf("expected name truncated to %d runes, got %d", telegramTopicNameLimit, utf8.RuneCountInString(name))
+	}
+}
+
+func TestNameTopicTruncatesMultiByteRunesWithoutCorruption(t *testing.T) {
+	// Each "日" is 3 bytes in UTF-8, so a byte-based truncation at
+	// telegramTopicNameLimit would very likely split one in half.
+	long := strings.Repeat("日", telegramTopicNameLimit+50)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"id":"resp_multibyte","object":"response","status":"completed","output":[{"id":"msg_multibyte","type":"message","role":"assistant","content":[{"type":"output_text","text":%q}]}]}`, long)
+	}))
+	defer server.Close()
+	client := openai.NewClient(option.WithAPIKey("test"), option.WithBaseURL(server.URL+"/v1"))
+
+	name, err := NewTopicNamer(&client, "test-cheap-model").NameTopic(context.Background(), "ramble")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !utf8.ValidString(name) {
+		t.Fatalf("truncated name is not valid UTF-8: %q", name)
+	}
+	if utf8.RuneCountInString(name) != telegramTopicNameLimit {
+		t.Fatalf("expected name truncated to %d runes, got %d", telegramTopicNameLimit, utf8.RuneCountInString(name))
 	}
 }

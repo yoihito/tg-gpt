@@ -47,9 +47,15 @@ var _ AfterTurnHook = (*WindowCompactor)(nil)
 // has it once the turn (and all its iterations) are done. Later iterations overwrite
 // earlier ones on purpose: by the time the turn ends, this holds the size of the request
 // that produced the final response — the most representative measurement of how big
-// this dialog's context currently is.
+// this dialog's context currently is. usage.InputTokens == 0 means this iteration never
+// reached the provider (Runner's iteration-cap/vision-unsupported abort path finalizes
+// with a zero-value Usage) — ignored rather than overwriting a real prior measurement
+// with it, since the abort path fires only after real iterations already ran and is
+// exactly when the context is largest, the last turn compaction should skip.
 func (w *WindowCompactor) AfterModelCall(ctx context.Context, rc *RunContext, content string, toolCalls []llm.ToolCall, usage llm.Usage) error {
-	rc.LastInputTokens = usage.InputTokens
+	if usage.InputTokens > 0 {
+		rc.LastInputTokens = usage.InputTokens
+	}
 	return nil
 }
 
