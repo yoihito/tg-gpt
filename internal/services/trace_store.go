@@ -156,6 +156,20 @@ func (t *TraceStore) AppendToolResult(
 	})
 }
 
+// IsFirstTurn reports whether the dialog's entire user_msg history consists of exactly
+// attachedCount messages — i.e. whether the batch just attached (TurnDispatcher attaches
+// before calling RunAttachedTurn) is the dialog's very first turn. Safe without extra
+// locking: TurnDispatcher serializes all writes for a given (user, dialog) through its
+// own per-dialog goroutine, so nothing else can append more user_msg events for this
+// dialog between attach and this check.
+func (t *TraceStore) IsFirstTurn(userID, dialogID int64, attachedCount int) (bool, error) {
+	total, err := t.trace.CountUserTurns(userID, dialogID, 0)
+	if err != nil {
+		return false, err
+	}
+	return total == int64(attachedCount), nil
+}
+
 // RecordReminderFire records a fired reminder as a synthetic user/model exchange in
 // the trace so subsequent conversation has context that the reminder went off.
 func (t *TraceStore) RecordReminderFire(

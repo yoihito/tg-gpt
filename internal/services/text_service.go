@@ -25,6 +25,7 @@ type TextServiceDeps struct {
 	Episodes            *EpisodeStore
 	MemoryPlugin        *MemoryPlugin
 	ConsolidationPlugin *ConsolidationPlugin
+	TopicNamingPlugin   *TopicNamingPlugin
 	Compactor           *WindowCompactor
 	ReminderTools       *ReminderTools
 	WebSearchService    *WebSearchService
@@ -52,10 +53,12 @@ func NewTextService(deps TextServiceDeps) *TextService {
 	if deps.Compactor != nil {
 		basePlugins = append(basePlugins, deps.Compactor)
 	}
-	chatPlugins := basePlugins
+	chatPlugins := append([]Plugin{}, basePlugins...)
 	if deps.ConsolidationPlugin != nil {
-		chatPlugins = append([]Plugin{}, basePlugins...)
 		chatPlugins = append(chatPlugins, deps.ConsolidationPlugin)
+	}
+	if deps.TopicNamingPlugin != nil {
+		chatPlugins = append(chatPlugins, deps.TopicNamingPlugin)
 	}
 	h.runner = NewRunner(deps.Client, chatPlugins...)
 	h.scheduledActionRunner = NewRunner(deps.Client, basePlugins...)

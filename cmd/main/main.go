@@ -110,6 +110,7 @@ func main() {
 	)
 	memoryPlugin := services.NewMemoryPlugin(traceStore, retriever)
 	consolidationPlugin := services.NewConsolidationPlugin(consolidator)
+	topicNamer := services.NewTopicNamer(llmClientProxy.OpenaiClient, appConfig.Memory.Extractor.Model)
 
 	memoryService := services.NewMemoryService(prefRepo, consolidator, episodeStore)
 
@@ -124,6 +125,8 @@ func main() {
 		return
 	}
 
+	topicNamingPlugin := services.NewTopicNamingPlugin(traceStore, topicNamer, b)
+
 	reminderTools := services.NewReminderTools(reminderRepo, prefRepo)
 	reminderScheduler := services.NewReminderScheduler(reminderRepo, userRepo, prefRepo, traceStore, b)
 	webSearchService := services.NewWebSearchService(os.Getenv("TAVILY_API_KEY"))
@@ -135,6 +138,7 @@ func main() {
 		Episodes:            episodeStore,
 		MemoryPlugin:        memoryPlugin,
 		ConsolidationPlugin: consolidationPlugin,
+		TopicNamingPlugin:   topicNamingPlugin,
 		Compactor:           windowCompactor,
 		ReminderTools:       reminderTools,
 		WebSearchService:    webSearchService,
