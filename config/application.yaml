@@ -21,7 +21,7 @@ memory:
   retrieval:
     facts_top_k: 5
     episodes_top_k: 2
-    recent_turns: 6
-    compaction_batch_size: 6
+    compaction_low_water_tokens: 3000
+    compaction_high_water_tokens: 6000
   episode:
     min_turns: 3

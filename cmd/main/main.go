@@ -93,8 +93,8 @@ func main() {
 	)
 	windowCompactor := services.NewWindowCompactor(
 		traceRepo, summarizer,
-		appConfig.Memory.Retrieval.RecentTurns,
-		appConfig.Memory.Retrieval.CompactionBatchSize,
+		appConfig.Memory.Retrieval.CompactionLowWaterTokens,
+		appConfig.Memory.Retrieval.CompactionHighWaterTokens,
 	)
 	consolidator := services.NewMemoryConsolidator(
 		prefRepo, factRepo, embedder, extractor,

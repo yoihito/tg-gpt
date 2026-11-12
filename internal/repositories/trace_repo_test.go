@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"vadimgribanov.com/tg-gpt/internal/database"
-	"vadimgribanov.com/tg-gpt/internal/llm"
 	"vadimgribanov.com/tg-gpt/internal/models"
 )
 
@@ -40,63 +39,12 @@ func mustAppendTraceEvent(t *testing.T, repo *TraceRepo, userID, dialogID int64,
 	}
 }
 
-// TestFindNthUserMsgTurnIndexLocatesWholeTurnBoundary is the regression test for the
-// "bot loses context of the previous message" bug: an earlier version of this window
-// capped by raw event count, so a tool-heavy turn (one model_msg per round plus one
-// tool_result per call) could push the previous turn's exchange out of the window
-// entirely, or leave only a partial tail of it. The 0th user_msg at-or-after a given
-// point must still land exactly on a turn boundary regardless of how many events that
-// turn contains.
-func TestFindNthUserMsgTurnIndexLocatesWholeTurnBoundary(t *testing.T) {
-	const userID, dialogID = int64(1), int64(1)
-	repo := newTestTraceRepo(t, userID)
-
-	// Turn 1: three tool calls in one round — 6 events by itself.
-	mustAppendTraceEvent(t, repo, userID, dialogID, models.EventTypeUserMsg, models.UserMsgPayload{Content: "turn1 user"})
-	mustAppendTraceEvent(t, repo, userID, dialogID, models.EventTypeModelMsg, models.ModelMsgPayload{
-		Content: "",
-		ToolCalls: []llm.ToolCall{
-			{ID: "c1", Name: "save_memory"},
-			{ID: "c2", Name: "web_search"},
-			{ID: "c3", Name: "save_fact"},
-		},
-	})
-	mustAppendTraceEvent(t, repo, userID, dialogID, models.EventTypeToolResult, models.ToolResultPayload{ToolCallID: "c1"})
-	mustAppendTraceEvent(t, repo, userID, dialogID, models.EventTypeToolResult, models.ToolResultPayload{ToolCallID: "c2"})
-	mustAppendTraceEvent(t, repo, userID, dialogID, models.EventTypeToolResult, models.ToolResultPayload{ToolCallID: "c3"})
-	mustAppendTraceEvent(t, repo, userID, dialogID, models.EventTypeModelMsg, models.ModelMsgPayload{Content: "turn1 answer"})
-
-	// Turn 2: the message currently being answered.
-	mustAppendTraceEvent(t, repo, userID, dialogID, models.EventTypeUserMsg, models.UserMsgPayload{Content: "turn2 user"})
-
-	turnIndex, ok, err := repo.FindNthUserMsgTurnIndex(userID, dialogID, 0, 1)
-	if err != nil {
-		t.Fatalf("FindNthUserMsgTurnIndex: %v", err)
-	}
-	if !ok {
-		t.Fatal("expected a second turn to exist")
-	}
-
-	got, err := repo.GetEventsFrom(userID, dialogID, turnIndex)
-	if err != nil {
-		t.Fatalf("GetEventsFrom: %v", err)
-	}
-	if len(got) != 1 || got[0].EventType != models.EventTypeUserMsg {
-		t.Fatalf("expected exactly turn2's user_msg, got %d events: %#v", len(got), got)
-	}
-	var payload models.UserMsgPayload
-	if err := json.Unmarshal(got[0].Payload, &payload); err != nil {
-		t.Fatalf("unmarshal event: %v", err)
-	}
-	if payload.Content != "turn2 user" {
-		t.Fatalf("expected the boundary to land on turn2, got %q", payload.Content)
-	}
-}
-
 // TestGetEventsFromExcludesEventsBeforeTheGivenTurnIndex confirms the window is bounded
-// — it must not return events before fromTurnIndex.
+// — it must not return events before fromTurnIndex. turn_index is per-event and
+// monotonic, so turn2's user_msg (the 3rd event appended) is at turn_index 2.
 func TestGetEventsFromExcludesEventsBeforeTheGivenTurnIndex(t *testing.T) {
 	const userID, dialogID = int64(1), int64(1)
+	const turn2UserMsgTurnIndex = int64(2)
 	repo := newTestTraceRepo(t, userID)
 
 	mustAppendTraceEvent(t, repo, userID, dialogID, models.EventTypeUserMsg, models.UserMsgPayload{Content: "turn1 user"})
@@ -104,15 +52,7 @@ func TestGetEventsFromExcludesEventsBeforeTheGivenTurnIndex(t *testing.T) {
 	mustAppendTraceEvent(t, repo, userID, dialogID, models.EventTypeUserMsg, models.UserMsgPayload{Content: "turn2 user"})
 	mustAppendTraceEvent(t, repo, userID, dialogID, models.EventTypeModelMsg, models.ModelMsgPayload{Content: "turn2 answer"})
 
-	turnIndex, ok, err := repo.FindNthUserMsgTurnIndex(userID, dialogID, 0, 1)
-	if err != nil {
-		t.Fatalf("FindNthUserMsgTurnIndex: %v", err)
-	}
-	if !ok {
-		t.Fatal("expected a second turn to exist")
-	}
-
-	got, err := repo.GetEventsFrom(userID, dialogID, turnIndex)
+	got, err := repo.GetEventsFrom(userID, dialogID, turn2UserMsgTurnIndex)
 	if err != nil {
 		t.Fatalf("GetEventsFrom: %v", err)
 	}
@@ -146,24 +86,9 @@ func TestGetEventsFromReturnsWholeDialogWhenFromIsZero(t *testing.T) {
 	}
 }
 
-func TestFindNthUserMsgTurnIndexNotOKWhenFewerTurnsExist(t *testing.T) {
-	const userID, dialogID = int64(1), int64(1)
-	repo := newTestTraceRepo(t, userID)
-
-	mustAppendTraceEvent(t, repo, userID, dialogID, models.EventTypeUserMsg, models.UserMsgPayload{Content: "only user msg"})
-	mustAppendTraceEvent(t, repo, userID, dialogID, models.EventTypeModelMsg, models.ModelMsgPayload{Content: "only answer"})
-
-	_, ok, err := repo.FindNthUserMsgTurnIndex(userID, dialogID, 0, 5)
-	if err != nil {
-		t.Fatalf("FindNthUserMsgTurnIndex: %v", err)
-	}
-	if ok {
-		t.Fatal("expected ok=false when fewer turns exist than requested")
-	}
-}
-
 func TestCountUserTurnsCountsOnlyUserMsgEventsFromGivenIndex(t *testing.T) {
 	const userID, dialogID = int64(1), int64(1)
+	const turn2UserMsgTurnIndex = int64(2)
 	repo := newTestTraceRepo(t, userID)
 
 	mustAppendTraceEvent(t, repo, userID, dialogID, models.EventTypeUserMsg, models.UserMsgPayload{Content: "turn1 user"})
@@ -179,39 +104,12 @@ func TestCountUserTurnsCountsOnlyUserMsgEventsFromGivenIndex(t *testing.T) {
 		t.Fatalf("expected 2 turns from the start, got %d", count)
 	}
 
-	turnIndex, ok, err := repo.FindNthUserMsgTurnIndex(userID, dialogID, 0, 1)
-	if err != nil || !ok {
-		t.Fatalf("FindNthUserMsgTurnIndex: ok=%v err=%v", ok, err)
-	}
-	count, err = repo.CountUserTurns(userID, dialogID, turnIndex)
+	count, err = repo.CountUserTurns(userID, dialogID, turn2UserMsgTurnIndex)
 	if err != nil {
 		t.Fatalf("CountUserTurns: %v", err)
 	}
 	if count != 1 {
 		t.Fatalf("expected 1 turn from turn2 onward, got %d", count)
-	}
-}
-
-func TestGetEventsInRangeExcludesUpperBound(t *testing.T) {
-	const userID, dialogID = int64(1), int64(1)
-	repo := newTestTraceRepo(t, userID)
-
-	mustAppendTraceEvent(t, repo, userID, dialogID, models.EventTypeUserMsg, models.UserMsgPayload{Content: "turn1 user"})
-	mustAppendTraceEvent(t, repo, userID, dialogID, models.EventTypeModelMsg, models.ModelMsgPayload{Content: "turn1 answer"})
-	mustAppendTraceEvent(t, repo, userID, dialogID, models.EventTypeUserMsg, models.UserMsgPayload{Content: "turn2 user"})
-	mustAppendTraceEvent(t, repo, userID, dialogID, models.EventTypeModelMsg, models.ModelMsgPayload{Content: "turn2 answer"})
-
-	turnIndex, ok, err := repo.FindNthUserMsgTurnIndex(userID, dialogID, 0, 1)
-	if err != nil || !ok {
-		t.Fatalf("FindNthUserMsgTurnIndex: ok=%v err=%v", ok, err)
-	}
-
-	got, err := repo.GetEventsInRange(userID, dialogID, 0, turnIndex)
-	if err != nil {
-		t.Fatalf("GetEventsInRange: %v", err)
-	}
-	if len(got) != 2 {
-		t.Fatalf("expected exactly turn1's 2 events (turn2 excluded), got %d: %#v", len(got), got)
 	}
 }
 

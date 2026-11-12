@@ -62,6 +62,11 @@ type RunContext struct {
 	Inputs       []UserInput
 	History      []llm.Message
 	SystemPrompt string
+	// LastInputTokens is the provider-reported InputTokens from the most recent
+	// AfterModelCall this turn — the real prompt size for whatever was just sent, not
+	// an estimate. WindowCompactor reads this in AfterTurn to decide whether the live
+	// trace-replay window has grown past its token budget.
+	LastInputTokens int64
 }
 
 // dispatch calls fn on every plugin implementing hook interface H, stopping at (and

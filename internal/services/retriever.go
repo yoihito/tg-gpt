@@ -279,17 +279,18 @@ func (r *Retriever) AssemblePrompt(systemHeader string, retrieved RetrievedMemor
 	messages := []llm.Message{
 		{Role: llm.RoleSystem, Content: sys.String()},
 	}
-	// RollingSummary only changes when WindowCompactor actually advances (every
-	// BatchSize turns), not every turn, so it stays part of the same stable,
-	// cache-friendly prefix as the system header/preferences above.
+	// RollingSummary only changes when WindowCompactor actually advances (once the
+	// window's real token size crosses its high-water mark), not every turn, so it
+	// stays part of the same stable, cache-friendly prefix as the system
+	// header/preferences above.
 	if retrieved.RollingSummary != "" {
 		messages = append(messages, llm.Message{
 			Role:    llm.RoleSystem,
 			Content: "## Earlier in this conversation (summarized)\n" + retrieved.RollingSummary,
 		})
 	}
-	// RecentTrace always starts at a user_msg (GetRecentTurns bounds the window by whole
-	// turns), so there's no partial leading tool-call group to trim here.
+	// RecentTrace always starts at a user_msg (GetEventsFrom's windowStart is always a
+	// user_msg's turn_index), so there's no partial leading tool-call group to trim here.
 	messages = appendTraceMessages(messages, retrieved.RecentTrace)
 	return messages
 }

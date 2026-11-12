@@ -71,16 +71,22 @@ func appendUserModelTurn(t *testing.T, repo *repositories.TraceRepo, userID, dia
 	}
 }
 
-func TestMaybeCompactNoopBelowHighWaterMark(t *testing.T) {
+// turnText is a fixed-length filler string so every appended turn contributes the same,
+// easy-to-reason-about estimateTokens() value in these tests.
+const turnText = "0123456789012345678901234567890123456789" // 40 chars -> estimateTokens == 10
+
+func TestMaybeCompactNoopWhenCurrentInputTokensBelowHighWaterMark(t *testing.T) {
 	repo := newCompactorTestTraceRepo(t)
 	summarizer, _ := newFakeSummarizer(t, "should not be used")
-	compactor := NewWindowCompactor(repo, summarizer, 6, 6)
+	compactor := NewWindowCompactor(repo, summarizer, 50, 100)
 
-	for i := 0; i < 11; i++ { // lowWater+batchSize == 12, so 11 turns must stay untouched
-		appendUserModelTurn(t, repo, compactorTestUserID, compactorTestDialogID, fmt.Sprintf("q%d", i), fmt.Sprintf("a%d", i))
+	for i := 0; i < 20; i++ {
+		appendUserModelTurn(t, repo, compactorTestUserID, compactorTestDialogID, turnText, turnText)
 	}
 
-	compactor.MaybeCompact(context.Background(), compactorTestUserID, compactorTestDialogID)
+	// currentInputTokens itself is below the high-water mark, regardless of how much
+	// content is sitting in the live window.
+	compactor.MaybeCompact(context.Background(), compactorTestUserID, compactorTestDialogID, 100)
 
 	windowStart, summary, err := repo.GetCompactionState(compactorTestUserID, compactorTestDialogID)
 	if err != nil {
@@ -91,16 +97,74 @@ func TestMaybeCompactNoopBelowHighWaterMark(t *testing.T) {
 	}
 }
 
-func TestMaybeCompactEvictsOldestBatchOnceOverHighWaterMark(t *testing.T) {
+func TestMaybeCompactNoopWhenWindowContentAlreadyBelowLowWaterMark(t *testing.T) {
 	repo := newCompactorTestTraceRepo(t)
-	summarizer, bodies := newFakeSummarizer(t, "Folded summary of the oldest 6 turns.")
-	compactor := NewWindowCompactor(repo, summarizer, 6, 6)
+	summarizer, _ := newFakeSummarizer(t, "should not be used")
+	// highWater is tiny so the trigger always fires; lowWater is huge so the window's
+	// own (small) content never looks worth evicting.
+	compactor := NewWindowCompactor(repo, summarizer, 10000, 1)
 
-	for i := 0; i < 13; i++ { // crosses lowWater(6)+batchSize(6)=12
-		appendUserModelTurn(t, repo, compactorTestUserID, compactorTestDialogID, fmt.Sprintf("q%d", i), fmt.Sprintf("a%d", i))
+	appendUserModelTurn(t, repo, compactorTestUserID, compactorTestDialogID, turnText, turnText)
+	appendUserModelTurn(t, repo, compactorTestUserID, compactorTestDialogID, turnText, turnText)
+
+	compactor.MaybeCompact(context.Background(), compactorTestUserID, compactorTestDialogID, 999999)
+
+	windowStart, summary, err := repo.GetCompactionState(compactorTestUserID, compactorTestDialogID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if windowStart != 0 || summary != "" {
+		t.Fatalf("expected no compaction when the window itself is small, got (%d, %q)", windowStart, summary)
+	}
+}
+
+func TestMaybeCompactAlwaysKeepsAtLeastTheMostRecentTurn(t *testing.T) {
+	repo := newCompactorTestTraceRepo(t)
+	summarizer, bodies := newFakeSummarizer(t, "should not be used")
+	compactor := NewWindowCompactor(repo, summarizer, 1, 1)
+
+	appendUserModelTurn(t, repo, compactorTestUserID, compactorTestDialogID, turnText, turnText)
+
+	compactor.MaybeCompact(context.Background(), compactorTestUserID, compactorTestDialogID, 999999)
+
+	select {
+	case <-bodies:
+		t.Fatal("expected the summarizer not to be called with only one turn in the window")
+	default:
+	}
+	windowStart, summary, err := repo.GetCompactionState(compactorTestUserID, compactorTestDialogID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if windowStart != 0 || summary != "" {
+		t.Fatalf("expected no compaction with a single turn, got (%d, %q)", windowStart, summary)
+	}
+}
+
+func TestMaybeCompactEvictsOldestTurnsUntilUnderLowWaterMark(t *testing.T) {
+	repo := newCompactorTestTraceRepo(t)
+	summarizer, bodies := newFakeSummarizer(t, "Folded summary of the oldest turns.")
+	tokensPerTurn := estimateTokens(turnText) * 2 // user + model message
+	const totalTurns = 8
+	const lowWaterTokens = int64(50)
+	compactor := NewWindowCompactor(repo, summarizer, int(lowWaterTokens), 1)
+
+	for i := 0; i < totalTurns; i++ {
+		appendUserModelTurn(t, repo, compactorTestUserID, compactorTestDialogID, turnText, turnText)
 	}
 
-	compactor.MaybeCompact(context.Background(), compactorTestUserID, compactorTestDialogID)
+	// Walk the same eviction rule MaybeCompact uses to compute how many of the
+	// totalTurns turns it should evict, so the test doesn't hardcode a number that
+	// would silently go stale if turnText or lowWaterTokens above changes.
+	remaining := tokensPerTurn * totalTurns
+	evicted := 0
+	for evicted < totalTurns-1 && remaining > lowWaterTokens {
+		remaining -= tokensPerTurn
+		evicted++
+	}
+	wantRemainingTurns := int64(totalTurns - evicted)
+
+	compactor.MaybeCompact(context.Background(), compactorTestUserID, compactorTestDialogID, 999999)
 
 	select {
 	case <-bodies:
@@ -112,16 +176,16 @@ func TestMaybeCompactEvictsOldestBatchOnceOverHighWaterMark(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if summary != "Folded summary of the oldest 6 turns." {
+	if summary != "Folded summary of the oldest turns." {
 		t.Fatalf("unexpected rolling summary: %q", summary)
 	}
 
-	remaining, err := repo.CountUserTurns(compactorTestUserID, compactorTestDialogID, windowStart)
+	remainingTurns, err := repo.CountUserTurns(compactorTestUserID, compactorTestDialogID, windowStart)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if remaining != 7 { // 13 - 6 evicted
-		t.Fatalf("expected 7 turns left in the live window, got %d", remaining)
+	if remainingTurns != wantRemainingTurns {
+		t.Fatalf("expected %d turns left in the live window, got %d", wantRemainingTurns, remainingTurns)
 	}
 
 	// The evicted range (everything before windowStart) must now be excluded from a
@@ -136,20 +200,20 @@ func TestMaybeCompactEvictsOldestBatchOnceOverHighWaterMark(t *testing.T) {
 			userTurnsInReplay++
 		}
 	}
-	if userTurnsInReplay != 7 {
-		t.Fatalf("expected replay to contain exactly the 7 remaining turns, got %d", userTurnsInReplay)
+	if int64(userTurnsInReplay) != wantRemainingTurns {
+		t.Fatalf("expected replay to contain exactly the %d remaining turns, got %d", wantRemainingTurns, userTurnsInReplay)
 	}
 }
 
 func TestMaybeCompactCarriesPreviousSummaryForwardOnNextEviction(t *testing.T) {
 	repo := newCompactorTestTraceRepo(t)
 	summarizer, bodies := newFakeSummarizer(t, "first summary")
-	compactor := NewWindowCompactor(repo, summarizer, 6, 6)
+	compactor := NewWindowCompactor(repo, summarizer, 50, 1)
 
-	for i := 0; i < 13; i++ { // crosses the high-water mark once (lowWater+batchSize=12)
-		appendUserModelTurn(t, repo, compactorTestUserID, compactorTestDialogID, fmt.Sprintf("q%d", i), fmt.Sprintf("a%d", i))
+	for i := 0; i < 8; i++ {
+		appendUserModelTurn(t, repo, compactorTestUserID, compactorTestDialogID, turnText, turnText)
 	}
-	compactor.MaybeCompact(context.Background(), compactorTestUserID, compactorTestDialogID)
+	compactor.MaybeCompact(context.Background(), compactorTestUserID, compactorTestDialogID, 999999)
 	select {
 	case <-bodies:
 	default:
@@ -157,12 +221,12 @@ func TestMaybeCompactCarriesPreviousSummaryForwardOnNextEviction(t *testing.T) {
 	}
 
 	summarizer2, bodies2 := newFakeSummarizer(t, "second summary")
-	compactor2 := NewWindowCompactor(repo, summarizer2, 6, 6)
+	compactor2 := NewWindowCompactor(repo, summarizer2, 50, 1)
 
-	for i := 13; i < 26; i++ { // another 13 turns pushes it over the mark a second time
-		appendUserModelTurn(t, repo, compactorTestUserID, compactorTestDialogID, fmt.Sprintf("q%d", i), fmt.Sprintf("a%d", i))
+	for i := 0; i < 8; i++ { // enough new turns to cross the low-water mark again
+		appendUserModelTurn(t, repo, compactorTestUserID, compactorTestDialogID, turnText, turnText)
 	}
-	compactor2.MaybeCompact(context.Background(), compactorTestUserID, compactorTestDialogID)
+	compactor2.MaybeCompact(context.Background(), compactorTestUserID, compactorTestDialogID, 999999)
 
 	var body string
 	select {

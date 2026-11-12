@@ -170,23 +170,6 @@ func (r *TraceRepo) GetEventsFrom(userID, dialogID, fromTurnIndex int64) ([]mode
 	return scanTraceEvents(rows)
 }
 
-// GetEventsInRange returns every event for (user_id, dialog_id) with
-// fromTurnIndex <= turn_index < toTurnIndexExclusive, oldest first — the batch a
-// compaction pass is about to fold into its rolling summary.
-func (r *TraceRepo) GetEventsInRange(userID, dialogID, fromTurnIndex, toTurnIndexExclusive int64) ([]models.TraceEvent, error) {
-	rows, err := r.db.Query(
-		`SELECT id, user_id, dialog_id, turn_index, event_type, payload, tg_message_id, model, created_at
-		 FROM trace_events WHERE user_id = ? AND dialog_id = ? AND turn_index >= ? AND turn_index < ?
-		 ORDER BY turn_index ASC`,
-		userID, dialogID, fromTurnIndex, toTurnIndexExclusive,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("query events in range: %w", err)
-	}
-	defer rows.Close()
-	return scanTraceEvents(rows)
-}
-
 // CountUserTurns counts user_msg events (each one starts a turn) at or after
 // fromTurnIndex — i.e. how many turns are currently in the live window.
 func (r *TraceRepo) CountUserTurns(userID, dialogID, fromTurnIndex int64) (int64, error) {
@@ -200,27 +183,6 @@ func (r *TraceRepo) CountUserTurns(userID, dialogID, fromTurnIndex int64) (int64
 		return 0, fmt.Errorf("count user turns: %w", err)
 	}
 	return count, nil
-}
-
-// FindNthUserMsgTurnIndex returns the turn_index of the n-th (0-indexed) user_msg event
-// at or after fromTurnIndex. ok is false if the dialog has n or fewer turns from there —
-// callers use that to mean "nothing to evict yet".
-func (r *TraceRepo) FindNthUserMsgTurnIndex(userID, dialogID, fromTurnIndex int64, n int) (int64, bool, error) {
-	var turnIndex int64
-	err := r.db.QueryRow(
-		`SELECT turn_index FROM trace_events
-		 WHERE user_id = ? AND dialog_id = ? AND event_type = ? AND turn_index >= ?
-		 ORDER BY turn_index ASC
-		 LIMIT 1 OFFSET ?`,
-		userID, dialogID, models.EventTypeUserMsg, fromTurnIndex, n,
-	).Scan(&turnIndex)
-	if err == sql.ErrNoRows {
-		return 0, false, nil
-	}
-	if err != nil {
-		return 0, false, fmt.Errorf("find nth user_msg turn_index: %w", err)
-	}
-	return turnIndex, true, nil
 }
 
 // GetCompactionState returns the live window's start turn_index and the rolling summary
